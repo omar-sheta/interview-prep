@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyc
+
+# Environment
+.env
+.env.local
+.env.*.local
+.venv/
+venv/
+ENV/
+
+# Qdrant local data
+qdrant_data/
+
+# Model cache (optional, large files)
+# .cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+.npm/
+

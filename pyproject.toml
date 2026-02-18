@@ -1,0 +1,42 @@
+[tool.poetry]
+name = "interview-agent-server"
+version = "0.1.0"
+description = "SOTA Interview Agent - LangGraph Backend"
+authors = ["Developer"]
+readme = "README.md"
+packages = [{include = "server"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+# Core Web/API
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.32.0"}
+python-socketio = "^5.11.0"
+python-multipart = "^0.0.12"
+# Agent Framework
+langgraph = "^0.2.0"
+langchain-core = "^0.3.0"
+langchain-ollama = "^0.2.0"
+pydantic = "^2.9.0"
+# AI/ML (Apple Silicon Optimized)
+mlx-lm = "^0.20.0"
+mlx-whisper = "^0.4.0"
+soundfile = "^0.12.1"
+numpy = "^2.0.0"
+huggingface-hub = "^0.26.0"
+# PDF Parsing
+pypdf = "^4.0.0"
+# Audio VAD
+webrtcvad = "^2.0.10"
+# Database
+qdrant-client = "^1.12.0"
+# Utils
+pydantic-settings = "^2.6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+httpx = "^0.28.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

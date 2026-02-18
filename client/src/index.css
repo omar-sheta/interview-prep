@@ -1,0 +1,297 @@
+@import "tailwindcss";
+
+/* ============== Hive & Bees Theme Configuration ============== */
+:root {
+  /* Orange Primary Palette */
+  --primary: #F97316;
+  /* Orange 500 */
+  --primary-dark: #EA580C;
+  /* Orange 600 */
+  --primary-light: #FB923C;
+  /* Orange 400 */
+
+  /* Honey Gold Accents */
+  --honey: #FBBF24;
+  /* Amber 400 */
+  --honey-dark: #F59E0B;
+  /* Amber 500 */
+  --honey-light: #FCD34D;
+  /* Amber 300 */
+
+  /* Dark Hive Backgrounds */
+  --background-dark: #0A0A0A;
+  /* Near black */
+  --surface-dark: #121212;
+  /* Dark surface */
+  --surface-elevated: #1A1A1A;
+  /* Elevated surface */
+  --border-dark: rgba(249, 115, 22, 0.15);
+  /* Orange tinted border */
+  --border-subtle: rgba(255, 255, 255, 0.08);
+
+  /* Status Colors */
+  --accent-success: #22C55E;
+  --accent-warn: #FBBF24;
+  --accent-danger: #EF4444;
+}
+
+/* ============== Base Styles ============== */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--background-dark);
+  color: #FAFAFA;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ============== Material Symbols Icons ============== */
+.material-symbols-outlined {
+  font-family: 'Material Symbols Outlined' !important;
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-feature-settings: 'liga';
+  font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ============== Glass Panel - Hive Style ============== */
+.glass-panel {
+  background: rgba(18, 18, 18, 0.85);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  border: 1px solid rgba(249, 115, 22, 0.12);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(251, 191, 36, 0.05);
+}
+
+.glass-card {
+  background: rgba(26, 26, 26, 0.7);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(249, 115, 22, 0.1);
+}
+
+/* ============== Neon Text - Orange Glow ============== */
+.neon-text {
+  text-shadow: 0 0 10px rgba(249, 115, 22, 0.5);
+}
+
+/* ============== Text Shine Effect ============== */
+.text-shine {
+  background: linear-gradient(135deg, #FBBF24, #F97316, #FB923C);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ============== Conic Ring Progress - Orange ============== */
+.conic-ring {
+  background: conic-gradient(var(--primary) calc(var(--progress) * 1%), rgba(255, 255, 255, 0.05) 0);
+  border-radius: 50%;
+}
+
+/* ============== Tech Border Corners (Legacy - Removed) ============== */
+/* .tech-border-corner { ... } */
+
+/* ============== Scanlines Background (Legacy - Removed) ============== */
+.scanlines {
+  display: none;
+}
+
+/* ============== Orb Effects - Hive Orange ============== */
+.orb-glow {
+  background: radial-gradient(circle at center, rgba(249, 115, 22, 0.4) 0%, rgba(249, 115, 22, 0.1) 40%, transparent 70%);
+}
+
+.orb-core {
+  background: conic-gradient(from 180deg at 50% 50%, #EA580C 0deg, #F97316 120deg, #FBBF24 240deg, #EA580C 360deg);
+  filter: blur(40px);
+}
+
+/* ============== Fade Mask ============== */
+.fade-mask-top {
+  mask-image: linear-gradient(to bottom, transparent 0%, black 30%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 30%);
+}
+
+/* ============== Animations ============== */
+@keyframes blob {
+  0% {
+    transform: translate(0px, 0px) scale(1);
+  }
+
+  33% {
+    transform: translate(30px, -50px) scale(1.1);
+  }
+
+  66% {
+    transform: translate(-20px, 20px) scale(0.9);
+  }
+
+  100% {
+    transform: translate(0px, 0px) scale(1);
+  }
+}
+
+@keyframes breathe {
+
+  0%,
+  100% {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.8;
+    transform: scale(1.05);
+  }
+}
+
+@keyframes pulse-slow {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes sweep {
+  0% {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-blob {
+  animation: blob 10s infinite;
+}
+
+.animate-breathe {
+  animation: breathe 4s ease-in-out infinite;
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.animate-spin-slow {
+  animation: spin-slow 10s linear infinite;
+}
+
+.animation-delay-2000 {
+  animation-delay: 2s;
+}
+
+.animation-delay-4000 {
+  animation-delay: 4s;
+}
+
+/* ============== Details Animation ============== */
+details>summary {
+  list-style: none;
+}
+
+details>summary::-webkit-details-marker {
+  display: none;
+}
+
+details[open] summary~* {
+  animation: sweep 0.3s ease-in-out;
+}
+
+/* ============== Node Hover Effects ============== */
+.node {
+  transition: all 0.3s ease;
+}
+
+.node:hover {
+  transform: scale(1.2);
+  box-shadow: 0 0 15px var(--primary);
+  background-color: var(--primary);
+  z-index: 10;
+}
+
+/* ============== Custom Scrollbar - Hive Style ============== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background-dark);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(249, 115, 22, 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--primary);
+}
+
+/* ============== Selection - Honey Gold ============== */
+::selection {
+  background: var(--honey);
+  color: black;
+}
+
+/* ============== Transcript Display ============== */
+.transcript-text {
+  font-size: 1.75rem;
+  font-weight: 500;
+  color: #ffffff;
+  text-align: center;
+  line-height: 1.5;
+  margin: 0;
+  text-shadow:
+    0 2px 20px rgba(0, 0, 0, 0.8),
+    0 4px 40px rgba(0, 194, 178, 0.15);
+  letter-spacing: 0.01em;
+}
+
+@media (min-width: 768px) {
+  .transcript-text {
+    font-size: 2rem;
+  }
+}
