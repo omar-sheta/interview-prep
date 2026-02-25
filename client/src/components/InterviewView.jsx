@@ -1,544 +1,765 @@
-/**
- * Interview Session View - Redesigned
- * Split Screen Focus Interface (Question | Response)
- * Light Mode / Apple-like Aesthetic
- */
-
-import { useState, useEffect, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useInterviewStore from '@/store/useInterviewStore';
-import OrbVisualizer from './OrbVisualizer';
 import {
+    ThemeProvider,
+    CssBaseline,
+    Box,
+    Container,
+    Paper,
+    Stack,
+    Typography,
+    Button,
+    Chip,
+    TextField,
+    CircularProgress,
+    Tabs,
+    Tab,
+    Fade,
+} from '@mui/material';
+import {
+    ArrowBack,
+    Lightbulb,
+    LightbulbOutlined,
+    VolumeUp,
+    VolumeOff,
+    Send,
+    SkipNext,
+    Timer,
+    GraphicEq,
     Mic,
     MicOff,
-    Keyboard,
-    Send,
-    Lightbulb,
-    ArrowBack,
-    Timer,
-    Stop,
-    CheckCircle,
-    FiberManualRecord
+    EditNote,
 } from '@mui/icons-material';
-import {
-    Box,
-    Typography,
-    Paper,
-    IconButton,
-    Button,
-    TextField,
-    Chip,
-    LinearProgress,
-    Divider,
-    ThemeProvider,
-    createTheme,
-    CssBaseline,
-    Container,
-    Grid,
-    Stack,
-    Fab
-} from '@mui/material';
+import { createHiveTheme } from '@/theme/hiveTheme';
+import HiveTopNav from '@/components/ui/HiveTopNav';
 
-// --- Hive & Bees Dark Theme for Interview Mode ---
-const interviewTheme = createTheme({
-    palette: {
-        mode: 'dark',
-        background: { default: '#0A0A0A', paper: '#121212' },
-        primary: { main: '#F97316', light: '#FB923C', dark: '#EA580C' },
-        secondary: { main: '#FBBF24' },
-        error: { main: '#EF4444' },
-        success: { main: '#22C55E' },
-        text: { primary: '#FAFAFA', secondary: '#A3A3A3' },
-        divider: 'rgba(249, 115, 22, 0.15)',
-    },
-    typography: {
-        fontFamily: 'Inter, -apple-system, sans-serif',
-        h3: { fontWeight: 700, letterSpacing: '-0.5px', lineHeight: 1.2, color: '#FAFAFA' },
-        h4: { fontWeight: 700, letterSpacing: '-0.5px', color: '#FAFAFA' },
-        h6: { fontWeight: 600, color: '#FAFAFA' },
-        body1: { lineHeight: 1.6, color: '#E5E5E5' }
-    },
-    shape: { borderRadius: 16 },
-    components: {
-        MuiPaper: {
-            styleOverrides: {
-                root: {
-                    backgroundImage: 'none',
-                    backgroundColor: '#1A1A1A',
-                    border: '1px solid rgba(249, 115, 22, 0.1)',
-                },
-            },
-        },
-        MuiChip: {
-            styleOverrides: {
-                outlined: {
-                    borderColor: 'rgba(249, 115, 22, 0.3)',
-                },
-            },
-        },
-        MuiButton: {
-            styleOverrides: {
-                contained: {
-                    backgroundColor: '#F97316',
-                    '&:hover': { backgroundColor: '#EA580C' },
-                },
-            },
-        },
-    },
-});
+const DEFAULT_SILENCE_AUTO_STOP_SECONDS = 5.0;
+const DEFAULT_SILENCE_RMS_THRESHOLD = 0.008;
 
-// --- Main View ---
+function formatTime(totalSeconds) {
+    const s = Math.max(0, Math.round(totalSeconds));
+    const min = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+}
+
+function floatTo16BitPCM(float32Array) {
+    const out = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i += 1) {
+        const sample = Math.max(-1, Math.min(1, float32Array[i]));
+        out[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+    return new Uint8Array(out.buffer);
+}
+
+function bytesToBase64(bytes) {
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return window.btoa(binary);
+}
+
+function normalizeHintList(value, limit = 3) {
+    if (!Array.isArray(value)) return [];
+    return value
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+        .slice(0, limit);
+}
 
 export default function InterviewView() {
     const {
-        isRecording,
         currentQuestion,
-        transcript,
-        lastTranscript,
-        answerEvaluation,
-        submitInterviewAnswer,
-        endInterview,
-        skipQuestion,
-        coachingHint,
-        interviewActive,
         questionNumber,
         totalQuestions,
+        transcript,
+        coachingHint,
+        answerSubmitPending,
         requestHint,
+        toggleCoaching,
+        clearCoachingHint,
+        skipQuestion,
+        endInterview,
+        submitInterviewAnswer,
+        sendAudioChunk,
+        forceTranscribe,
         setRecording,
+        ttsAudioQueue,
+        popAudio,
+        darkMode,
+        recordingThresholds,
+        interviewMode,
+        interviewFeedbackTiming,
+        coachingEnabled,
+        interviewerPersona,
     } = useInterviewStore();
 
-    const [mode, setMode] = useState('voice'); // 'voice' | 'text'
+    const [draft, setDraft] = useState('');
     const [elapsedTime, setElapsedTime] = useState(0);
-    const [isProcessing, setIsProcessing] = useState(false);
-    const [textInput, setTextInput] = useState('');
+    const [showTipsPanel, setShowTipsPanel] = useState(false);
+    const [showHintDetails, setShowHintDetails] = useState(false);
+    const [inputMode, setInputMode] = useState('record');
+    const [isMicRecording, setIsMicRecording] = useState(false);
+    const [isMicStarting, setIsMicStarting] = useState(false);
+    const [micError, setMicError] = useState('');
+    const [questionAudioEnabled, setQuestionAudioEnabled] = useState(true);
+    const [questionAudioBlocked, setQuestionAudioBlocked] = useState(false);
+    const [questionAudioPlaying, setQuestionAudioPlaying] = useState(false);
+    const [pendingQuestionAudio, setPendingQuestionAudio] = useState(null);
 
-    // Audio Context Refs
-    const audioContextRef = useRef(null);
-    const analyserRef = useRef(null);
-    const processorRef = useRef(null);
+    const isRecordingRef = useRef(false);
     const streamRef = useRef(null);
-    const scrollRef = useRef(null);
+    const audioContextRef = useRef(null);
+    const sourceNodeRef = useRef(null);
+    const processorNodeRef = useRef(null);
+    const muteGainNodeRef = useRef(null);
+    const recordingEpochRef = useRef(0);
+    const questionAudioRef = useRef(null);
+    const autoHintQuestionRef = useRef(0);
+    const silenceAutoStopSeconds = Math.max(
+        1,
+        Math.min(20, Number(recordingThresholds?.silence_auto_stop_seconds ?? DEFAULT_SILENCE_AUTO_STOP_SECONDS))
+    );
+    const silenceRmsThreshold = Math.max(
+        0.001,
+        Math.min(0.05, Number(recordingThresholds?.silence_rms_threshold ?? DEFAULT_SILENCE_RMS_THRESHOLD))
+    );
+    const silenceAutoStopMs = Math.round(silenceAutoStopSeconds * 1000);
+    const isCoachSession = Boolean(coachingEnabled || interviewMode === 'coaching');
+    const gradingModeLabel = interviewFeedbackTiming === 'live' ? 'Live score reveal' : 'Final report reveal';
 
-    // Timer
     useEffect(() => {
-        if (!interviewActive) return;
-        const interval = setInterval(() => setElapsedTime(p => p + 1), 1000);
-        return () => clearInterval(interval);
-    }, [interviewActive]);
+        const timer = setInterval(() => setElapsedTime((prev) => prev + 1), 1000);
+        return () => clearInterval(timer);
+    }, []);
 
-    const formatTime = (seconds) => {
-        const mins = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    };
-
-    // Auto-scroll transcript
-    useEffect(() => {
-        if (scrollRef.current) {
-            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const releaseAudioNodes = useCallback(() => {
+        if (processorNodeRef.current) {
+            processorNodeRef.current.onaudioprocess = null;
+            processorNodeRef.current.disconnect();
+            processorNodeRef.current = null;
         }
-    }, [transcript, lastTranscript]);
+        if (sourceNodeRef.current) {
+            sourceNodeRef.current.disconnect();
+            sourceNodeRef.current = null;
+        }
+        if (muteGainNodeRef.current) {
+            muteGainNodeRef.current.disconnect();
+            muteGainNodeRef.current = null;
+        }
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach((track) => track.stop());
+            streamRef.current = null;
+        }
+        if (audioContextRef.current) {
+            audioContextRef.current.close().catch(() => {});
+            audioContextRef.current = null;
+        }
+    }, []);
 
-    // Audio Handlers
-    const startAudio = async () => {
+    const stopRecording = useCallback((flushTranscript = false) => {
+        // Invalidate any in-flight start sequence immediately.
+        recordingEpochRef.current += 1;
+        isRecordingRef.current = false;
+        setIsMicRecording(false);
+        setIsMicStarting(false);
+        setRecording(false);
+        releaseAudioNodes();
+
+        if (flushTranscript) {
+            // Small delay helps last buffered chunk reach server before forced transcription.
+            setTimeout(() => forceTranscribe(), 140);
+        }
+    }, [forceTranscribe, releaseAudioNodes, setRecording]);
+
+    const startRecording = useCallback(async () => {
+        if (isRecordingRef.current || isMicStarting) return;
+        if (!navigator.mediaDevices?.getUserMedia) {
+            setMicError('Microphone access is not supported in this browser.');
+            return;
+        }
+
+        const epoch = recordingEpochRef.current + 1;
+        recordingEpochRef.current = epoch;
+
         try {
-            audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: 16000,
-            });
-            if (audioContextRef.current.state === 'suspended') {
-                await audioContextRef.current.resume();
-            }
+            setMicError('');
+            setIsMicStarting(true);
 
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     echoCancellation: true,
                     noiseSuppression: true,
                     autoGainControl: true,
-                }
+                    channelCount: 1,
+                },
             });
-            streamRef.current = stream;
 
-            const source = audioContextRef.current.createMediaStreamSource(stream);
-            const analyser = audioContextRef.current.createAnalyser();
-            analyser.fftSize = 256;
-            analyserRef.current = analyser;
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            const audioContext = new AudioCtx();
+            await audioContext.resume();
 
-            const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
-            processorRef.current = processor;
+            // If user already stopped before startup completed, abort this start cleanly.
+            if (recordingEpochRef.current !== epoch) {
+                stream.getTracks().forEach((track) => track.stop());
+                audioContext.close().catch(() => {});
+                return;
+            }
 
-            processor.onaudioprocess = (e) => {
-                const state = useInterviewStore.getState();
-                if (!state.isRecording) return;
+            const source = audioContext.createMediaStreamSource(stream);
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+            const muteGain = audioContext.createGain();
+            muteGain.gain.value = 0;
+            let lastVoiceDetectedAt = performance.now();
+            let silenceTriggered = false;
 
-                const inputData = e.inputBuffer.getChannelData(0);
-                let l = inputData.length;
-                const buf = new Int16Array(l);
-                while (l--) {
-                    buf[l] = Math.min(1, Math.max(-1, inputData[l])) * 0x7FFF;
+            processor.onaudioprocess = (event) => {
+                if (!isRecordingRef.current || recordingEpochRef.current !== epoch) return;
+                const input = event.inputBuffer.getChannelData(0);
+
+                let sumSquares = 0;
+                for (let i = 0; i < input.length; i += 1) {
+                    sumSquares += input[i] * input[i];
+                }
+                const rms = Math.sqrt(sumSquares / Math.max(1, input.length));
+                const now = performance.now();
+                if (rms >= silenceRmsThreshold) {
+                    lastVoiceDetectedAt = now;
+                } else if (!silenceTriggered && (now - lastVoiceDetectedAt) >= silenceAutoStopMs) {
+                    silenceTriggered = true;
+                    stopRecording(true);
+                    return;
                 }
 
-                let binary = '';
-                const bytes = new Uint8Array(buf.buffer);
-                const len = bytes.byteLength;
-                for (let i = 0; i < len; i++) {
-                    binary += String.fromCharCode(bytes[i]);
-                }
-                const base64 = window.btoa(binary);
-
-                const socket = state.socket;
-                if (socket && socket.connected) {
-                    socket.emit('user_audio_chunk', {
-                        audio: base64,
-                        sample_rate: audioContextRef.current.sampleRate
-                    });
-                }
+                const pcmBytes = floatTo16BitPCM(input);
+                if (!pcmBytes.length) return;
+                sendAudioChunk(bytesToBase64(pcmBytes), audioContext.sampleRate);
             };
 
-            source.connect(analyser);
-            analyser.connect(processor);
-            processor.connect(audioContextRef.current.destination);
+            source.connect(processor);
+            processor.connect(muteGain);
+            muteGain.connect(audioContext.destination);
 
+            streamRef.current = stream;
+            audioContextRef.current = audioContext;
+            sourceNodeRef.current = source;
+            processorNodeRef.current = processor;
+            muteGainNodeRef.current = muteGain;
+
+            isRecordingRef.current = true;
+            setIsMicRecording(true);
             setRecording(true);
-        } catch (error) {
-            console.error("Mic Error:", error);
-            alert("Could not access microphone.");
+            setIsMicStarting(false);
+        } catch (err) {
+            console.error('Microphone start error:', err);
+            setMicError('Could not access microphone. Check browser permission and device input.');
+            if (recordingEpochRef.current === epoch) {
+                stopRecording(false);
+            }
         }
-    };
+    }, [isMicStarting, sendAudioChunk, setRecording, silenceAutoStopMs, silenceRmsThreshold, stopRecording]);
 
-    const stopAudio = () => {
-        if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
-        if (processorRef.current) processorRef.current.disconnect();
-        if (audioContextRef.current) audioContextRef.current.close();
-        setRecording(false);
-    };
-
-    const handleToggleMic = () => {
-        if (isRecording) {
-            stopAudio();
-        } else {
-            startAudio();
+    const stopQuestionAudio = useCallback(() => {
+        const audio = questionAudioRef.current;
+        if (audio) {
+            audio.pause();
+            audio.src = '';
+            questionAudioRef.current = null;
         }
-    };
-
-    const handleSendText = () => {
-        if (!textInput.trim()) return;
-        setIsProcessing(true);
-        submitInterviewAnswer(textInput, elapsedTime);
-        setTextInput('');
-        setIsProcessing(false);
-    };
-
-    const handleCompleteAnswer = () => {
-        stopAudio();
-        submitInterviewAnswer(transcript || lastTranscript || "", elapsedTime);
-    };
-
-    // Cleanup on unmount
-    useEffect(() => {
-        return () => {
-            stopAudio();
-        };
+        setQuestionAudioPlaying(false);
     }, []);
 
-    const displayTranscript = transcript || lastTranscript || "";
+    const playQuestionAudio = useCallback(async (audioBase64) => {
+        if (!audioBase64) return false;
+        stopQuestionAudio();
+
+        const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
+        audio.preload = 'auto';
+        questionAudioRef.current = audio;
+        setQuestionAudioPlaying(true);
+
+        audio.onended = () => {
+            if (questionAudioRef.current === audio) {
+                questionAudioRef.current = null;
+            }
+            setQuestionAudioPlaying(false);
+        };
+
+        audio.onerror = () => {
+            if (questionAudioRef.current === audio) {
+                questionAudioRef.current = null;
+            }
+            setQuestionAudioPlaying(false);
+        };
+
+        try {
+            await audio.play();
+            return true;
+        } catch (err) {
+            if (questionAudioRef.current === audio) {
+                questionAudioRef.current = null;
+            }
+            setQuestionAudioPlaying(false);
+            return false;
+        }
+    }, [stopQuestionAudio]);
+
+    useEffect(() => {
+        if (!questionAudioEnabled || questionAudioPlaying) return;
+
+        const nextAudio = pendingQuestionAudio || popAudio();
+        if (!nextAudio) return;
+
+        let isMounted = true;
+        playQuestionAudio(nextAudio).then((started) => {
+            if (!isMounted) return;
+            if (started) {
+                setQuestionAudioBlocked(false);
+                setPendingQuestionAudio(null);
+            } else {
+                setQuestionAudioBlocked(true);
+                setPendingQuestionAudio(nextAudio);
+            }
+        });
+
+        return () => {
+            isMounted = false;
+        };
+    }, [pendingQuestionAudio, playQuestionAudio, popAudio, questionAudioEnabled, questionAudioPlaying, ttsAudioQueue]);
+
+    useEffect(() => {
+        if (!questionAudioBlocked || !questionAudioEnabled || !pendingQuestionAudio) return;
+
+        let cancelled = false;
+        const tryPlay = async () => {
+            if (cancelled) return;
+            const started = await playQuestionAudio(pendingQuestionAudio);
+            if (cancelled) return;
+            if (started) {
+                setQuestionAudioBlocked(false);
+                setPendingQuestionAudio(null);
+            }
+        };
+
+        const onUserInteract = () => {
+            void tryPlay();
+        };
+
+        window.addEventListener('pointerdown', onUserInteract);
+        window.addEventListener('keydown', onUserInteract);
+        return () => {
+            cancelled = true;
+            window.removeEventListener('pointerdown', onUserInteract);
+            window.removeEventListener('keydown', onUserInteract);
+        };
+    }, [pendingQuestionAudio, playQuestionAudio, questionAudioBlocked, questionAudioEnabled]);
+
+    useEffect(() => {
+        if (coachingEnabled) {
+            setShowTipsPanel((prev) => prev || true);
+            return;
+        }
+        setShowTipsPanel(false);
+        setShowHintDetails(false);
+        clearCoachingHint();
+    }, [coachingEnabled, clearCoachingHint]);
+
+    useEffect(() => {
+        const qNumber = Number(questionNumber || 0);
+        if (!coachingEnabled || !showTipsPanel || qNumber <= 1) return;
+        if (autoHintQuestionRef.current === qNumber) return;
+
+        autoHintQuestionRef.current = qNumber;
+        const timer = setTimeout(() => requestHint(), 280);
+        return () => clearTimeout(timer);
+    }, [coachingEnabled, questionNumber, requestHint, showTipsPanel]);
+
+    useEffect(() => () => stopRecording(false), [stopRecording]);
+    useEffect(() => () => stopQuestionAudio(), [stopQuestionAudio]);
+
+    const handleToggleHintsPanel = () => {
+        if (showTipsPanel) {
+            setShowTipsPanel(false);
+            setShowHintDetails(false);
+            toggleCoaching(false);
+            clearCoachingHint();
+            return;
+        }
+        setShowTipsPanel(true);
+        setShowHintDetails(false);
+        toggleCoaching(true);
+        requestHint();
+    };
+
+    const handleSubmit = () => {
+        if (answerSubmitPending) return;
+
+        if (inputMode === 'type') {
+            const answer = draft.trim();
+            if (!answer) return;
+            submitInterviewAnswer(answer, elapsedTime);
+            setDraft('');
+            return;
+        }
+
+        if (isMicRecording) {
+            stopRecording(true);
+        } else {
+            forceTranscribe();
+        }
+        submitInterviewAnswer('', elapsedTime);
+    };
+
+    const handleSkip = () => {
+        if (answerSubmitPending) return;
+        if (isMicRecording || isMicStarting) stopRecording(false);
+        stopQuestionAudio();
+        setDraft('');
+        skipQuestion();
+    };
+
+    const handleModeChange = (_, nextMode) => {
+        if (!nextMode) return;
+        if (nextMode === 'type' && (isMicRecording || isMicStarting)) {
+            stopRecording(false);
+        }
+        setInputMode(nextMode);
+    };
+
+    const transcriptText = String(transcript || '').trim();
+    const submitDisabled = inputMode === 'type'
+        ? (!draft.trim() || answerSubmitPending)
+        : (answerSubmitPending || (!transcriptText && !isMicRecording));
+    const hintLevel = Number(coachingHint?.level || 0);
+    const hintMessage = String(coachingHint?.message || '').trim();
+    const hintNextStep = String(coachingHint?.next_step || '').trim();
+    const hintFramework = String(coachingHint?.framework || '').trim();
+    const hintStarter = String(coachingHint?.starter || '').trim();
+    const hintAvoid = String(coachingHint?.avoid || '').trim();
+    const hintMustMention = normalizeHintList(coachingHint?.must_mention, 3);
+    const hintsActionLabel = showTipsPanel ? 'Hide Hints' : 'Show Hints';
+    const personaLabel = ({
+        friendly: 'Friendly',
+        strict: 'Strict',
+        rapid_fire: 'Rapid-Fire',
+        skeptical: 'Skeptical',
+    }[String(interviewerPersona || '').trim().toLowerCase()] || 'Friendly');
+    const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
+
+    const handleEndSession = () => {
+        if (isMicRecording || isMicStarting) {
+            stopRecording(false);
+        }
+        stopQuestionAudio();
+        endInterview();
+    };
+
+    const handleToggleQuestionAudio = () => {
+        const next = !questionAudioEnabled;
+        setQuestionAudioEnabled(next);
+        if (!next) {
+            stopQuestionAudio();
+            setQuestionAudioBlocked(false);
+        }
+    };
+
+    const handleRetryQuestionAudio = async () => {
+        if (!pendingQuestionAudio) return;
+        const started = await playQuestionAudio(pendingQuestionAudio);
+        if (started) {
+            setQuestionAudioBlocked(false);
+            setPendingQuestionAudio(null);
+            return;
+        }
+        setQuestionAudioBlocked(true);
+    };
 
     return (
-        <ThemeProvider theme={interviewTheme}>
+        <ThemeProvider theme={theme}>
             <CssBaseline />
-            <Box sx={{ height: '100vh', bgcolor: '#0A0A0A', display: 'flex', flexDirection: 'column' }}>
-
-                {/* Top Bar */}
-                <Paper
-                    elevation={0}
+            <Box sx={{ minHeight: '100vh', bgcolor: 'background.default', pb: { xs: 3, md: 5 } }}>
+                <HiveTopNav active="interview" />
+                <Container
+                    maxWidth={false}
                     sx={{
-                        p: 2,
-                        borderBottom: '1px solid rgba(249, 115, 22, 0.15)',
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        borderRadius: 0,
-                        bgcolor: '#121212'
+                        width: '100%',
+                        maxWidth: 1040,
+                        mx: 'auto',
+                        px: { xs: 2, md: 3 },
+                        pt: { xs: 2.5, md: 4 },
                     }}
                 >
-                    <Stack direction="row" alignItems="center" spacing={2}>
-                        <Typography variant="h6" fontWeight="800" sx={{ background: 'linear-gradient(135deg, #FBBF24, #F97316)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>HIVE Interview</Typography>
-                        <Chip
-                            label="Live Session"
-                            color="error"
-                            size="small"
-                            icon={<FiberManualRecord sx={{ fontSize: 12 }} />}
-                            sx={{ '& .MuiChip-icon': { color: 'inherit' } }}
-                        />
-                    </Stack>
-
-                    <Chip
-                        icon={<Timer />}
-                        label={formatTime(elapsedTime)}
-                        variant="outlined"
-                        sx={{ fontFamily: 'monospace', fontWeight: 600, minWidth: 100, borderColor: 'rgba(249, 115, 22, 0.3)', color: '#FBBF24' }}
-                    />
-
-                    <Button
-                        color="error"
-                        variant="text"
-                        onClick={() => { stopAudio(); endInterview(); }}
-                        startIcon={<ArrowBack />}
-                    >
-                        End Session
-                    </Button>
-                </Paper>
-
-                <Container maxWidth="xl" sx={{ flexGrow: 1, py: 4, overflow: 'hidden' }}>
-                    <Grid container spacing={4} sx={{ height: '100%' }}>
-
-                        {/* LEFT: The Question (Focus) */}
-                        <Grid item xs={12} md={6}>
-                            <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-                                <Typography variant="overline" sx={{ color: '#FBBF24', fontWeight: 'bold' }}>
-                                    QUESTION {questionNumber || 1} OF {totalQuestions || 3}
-                                </Typography>
-
-                                <motion.div
-                                    key={currentQuestion?.text}
-                                    initial={{ opacity: 0, y: 10 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    transition={{ duration: 0.5 }}
+                    <Stack spacing={2.2}>
+                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
+                            <Stack spacing={1.2} sx={{ mb: 1.2 }}>
+                                <Stack
+                                    direction={{ xs: 'column', sm: 'row' }}
+                                    justifyContent="space-between"
+                                    alignItems={{ xs: 'flex-start', sm: 'center' }}
+                                    spacing={1}
                                 >
-                                    <Typography variant="h3" sx={{ mt: 2, mb: 4, color: '#FAFAFA' }}>
-                                        {currentQuestion?.text || "Waiting for interviewer..."}
+                                    <Typography variant="overline" sx={{ color: 'secondary.main', letterSpacing: '0.08em' }}>
+                                        Question {questionNumber || 1} of {totalQuestions || 1}
                                     </Typography>
-                                </motion.div>
-
-                                <Stack direction="row" spacing={1} sx={{ mb: 4 }}>
                                     <Chip
-                                        label={currentQuestion?.category || "General"}
-                                        variant="outlined"
                                         size="small"
-                                        sx={{ borderColor: 'rgba(249, 115, 22, 0.3)', color: '#FB923C' }}
-                                    />
-                                    <Chip
-                                        label={currentQuestion?.difficulty || "Medium"}
+                                        icon={<Timer sx={{ fontSize: 15 }} />}
+                                        label={formatTime(elapsedTime)}
                                         variant="outlined"
-                                        size="small"
-                                        sx={{ borderColor: 'rgba(251, 191, 36, 0.3)', color: '#FBBF24' }}
                                     />
                                 </Stack>
-
-                                {/* AI Coach Tip - Honey themed */}
-                                <Paper
-                                    sx={{
-                                        p: 3,
-                                        bgcolor: 'rgba(251, 191, 36, 0.1)',
-                                        border: '1px solid rgba(251, 191, 36, 0.3)',
-                                        borderRadius: 2
-                                    }}
-                                    elevation={0}
+                            </Stack>
+                            <Typography variant="h5" sx={{ lineHeight: 1.35, maxWidth: 900 }}>
+                                {currentQuestion?.text || 'Waiting for next question...'}
+                            </Typography>
+                            <Typography variant="body2" sx={{ mt: 1, color: 'text.secondary' }}>
+                                {(isCoachSession ? 'Coach mode' : 'Mock mode')} • {personaLabel} interviewer • {gradingModeLabel} • {(currentQuestion?.category || 'General')} • {String(currentQuestion?.difficulty || 'medium')}
+                            </Typography>
+                            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mt: 1.25 }}>
+                                <Button
+                                    variant="outlined"
+                                    color={questionAudioEnabled ? 'primary' : 'inherit'}
+                                    startIcon={questionAudioEnabled ? <VolumeUp /> : <VolumeOff />}
+                                    onClick={handleToggleQuestionAudio}
+                                    size="small"
                                 >
-                                    <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
-                                        <Lightbulb sx={{ color: '#FBBF24', fontSize: 20 }} />
-                                        <Typography variant="subtitle2" fontWeight="bold" sx={{ color: '#FBBF24' }}>
-                                            AI Coach Tip
-                                        </Typography>
-                                    </Stack>
-                                    <Typography variant="body2" sx={{ color: '#FCD34D' }}>
-                                        {coachingHint?.message || "Click 'Get Hint' if you need help structuring your answer."}
+                                    {questionAudioEnabled ? 'Voice On' : 'Voice Off'}
+                                </Button>
+                                <Button
+                                    variant={showTipsPanel ? 'contained' : 'outlined'}
+                                    color={showTipsPanel ? 'secondary' : 'inherit'}
+                                    startIcon={showTipsPanel ? <Lightbulb /> : <LightbulbOutlined />}
+                                    onClick={handleToggleHintsPanel}
+                                    size="small"
+                                >
+                                    {hintsActionLabel}
+                                </Button>
+                                <Button
+                                    variant="text"
+                                    color="warning"
+                                    startIcon={<ArrowBack />}
+                                    onClick={handleEndSession}
+                                    size="small"
+                                >
+                                    End
+                                </Button>
+                            </Stack>
+                            {questionAudioBlocked && questionAudioEnabled && (
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1.2 }}>
+                                    <Typography variant="caption" sx={{ color: 'warning.main' }}>
+                                        Browser blocked auto-play for question audio.
                                     </Typography>
-                                </Paper>
-
-                                {/* Action Buttons - Get Hint & Skip */}
-                                <Stack direction="row" spacing={2} sx={{ mt: 3 }}>
                                     <Button
+                                        size="small"
                                         variant="outlined"
-                                        startIcon={<Lightbulb />}
-                                        onClick={requestHint}
-                                        sx={{
-                                            flex: 1,
-                                            borderColor: '#FBBF24',
-                                            color: '#FBBF24',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(251, 191, 36, 0.1)',
-                                                borderColor: '#FCD34D'
-                                            }
-                                        }}
+                                        startIcon={<VolumeUp />}
+                                        onClick={handleRetryQuestionAudio}
                                     >
-                                        Get Hint
-                                    </Button>
-                                    <Button
-                                        variant="outlined"
-                                        onClick={skipQuestion}
-                                        sx={{
-                                            flex: 1,
-                                            borderColor: 'rgba(249, 115, 22, 0.5)',
-                                            color: '#FB923C',
-                                            '&:hover': {
-                                                bgcolor: 'rgba(249, 115, 22, 0.1)',
-                                                borderColor: '#F97316'
-                                            }
-                                        }}
-                                    >
-                                        Skip Question →
+                                        Play Prompt Audio
                                     </Button>
                                 </Stack>
-                            </Box>
-                        </Grid>
+                            )}
+                        </Paper>
 
-                        {/* RIGHT: The Response (Transcript & Audio) */}
-                        <Grid item xs={12} md={6}>
-                            <Paper
-                                elevation={0}
-                                sx={{
-                                    height: '100%',
-                                    bgcolor: '#1A1A1A',
-                                    borderRadius: 4,
-                                    border: '1px solid rgba(249, 115, 22, 0.15)',
-                                    p: 4,
-                                    display: 'flex',
-                                    flexDirection: 'column'
-                                }}
-                            >
-                                {/* Mode Switcher */}
-                                <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 3 }}>
-                                    <Typography variant="h6" fontWeight="bold" sx={{ color: '#FAFAFA' }}>
-                                        {mode === 'voice' ? 'Live Transcript' : 'Type Your Answer'}
-                                    </Typography>
-                                    <Stack direction="row" spacing={1}>
-                                        <IconButton
-                                            color={mode === 'voice' ? 'primary' : 'default'}
-                                            onClick={() => setMode('voice')}
-                                            size="small"
-                                            sx={{ bgcolor: mode === 'voice' ? 'rgba(249, 115, 22, 0.15)' : 'transparent', color: mode === 'voice' ? '#F97316' : '#A3A3A3' }}
-                                        >
-                                            <Mic />
-                                        </IconButton>
-                                        <IconButton
-                                            color={mode === 'text' ? 'primary' : 'default'}
-                                            onClick={() => setMode('text')}
-                                            size="small"
-                                            sx={{ bgcolor: mode === 'text' ? 'rgba(249, 115, 22, 0.15)' : 'transparent', color: mode === 'text' ? '#F97316' : '#A3A3A3' }}
-                                        >
-                                            <Keyboard />
-                                        </IconButton>
-                                    </Stack>
-                                </Stack>
-
-                                {mode === 'voice' ? (
-                                    <>
-                                        {/* Scrolling Transcript Area */}
-                                        <Box
-                                            ref={scrollRef}
-                                            sx={{
-                                                flexGrow: 1,
-                                                overflowY: 'auto',
-                                                mb: 4,
-                                                bgcolor: '#121212',
-                                                p: 3,
-                                                borderRadius: 2,
-                                                minHeight: 200,
-                                                border: '1px solid rgba(249, 115, 22, 0.1)'
-                                            }}
-                                        >
-                                            <Typography
-                                                variant="body1"
-                                                sx={{
-                                                    lineHeight: 1.8,
-                                                    color: displayTranscript ? '#FAFAFA' : '#525252',
-                                                    fontStyle: displayTranscript ? 'normal' : 'italic'
-                                                }}
-                                            >
-                                                {displayTranscript || "Start speaking... your transcript will appear here."}
+                        {showTipsPanel && (
+                            <Fade in timeout={160}>
+                                <Paper sx={{ p: { xs: 1.6, md: 2 } }}>
+                                    <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
+                                        <Box>
+                                            <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                                                {isCoachSession ? 'Coach Hint' : 'Hint'}
+                                            </Typography>
+                                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                {hintMessage || 'Ask for a hint when you need guidance.'}
                                             </Typography>
                                         </Box>
-
-                                        {/* Recording indicator */}
-                                        {isRecording && (
-                                            <LinearProgress
-                                                sx={{ mb: 2, borderRadius: 1, height: 4, bgcolor: 'rgba(249, 115, 22, 0.1)', '& .MuiLinearProgress-bar': { bgcolor: '#F97316' } }}
-                                            />
-                                        )}
-
-                                        {/* Mic Controls */}
-                                        <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 3 }}>
-                                            <Fab
-                                                size="large"
-                                                onClick={handleToggleMic}
-                                                sx={{
-                                                    width: 72,
-                                                    height: 72,
-                                                    bgcolor: isRecording ? '#EF4444' : '#F97316',
-                                                    '&:hover': { bgcolor: isRecording ? '#DC2626' : '#EA580C' }
-                                                }}
-                                            >
-                                                {isRecording ? <Stop sx={{ fontSize: 32, color: 'white' }} /> : <Mic sx={{ fontSize: 32, color: 'white' }} />}
-                                            </Fab>
-
-                                            {displayTranscript && (
-                                                <Button
-                                                    variant="contained"
-                                                    color="success"
-                                                    size="large"
-                                                    onClick={handleCompleteAnswer}
-                                                    startIcon={<CheckCircle />}
-                                                    sx={{ borderRadius: 100, px: 4 }}
-                                                >
-                                                    Submit Answer
-                                                </Button>
-                                            )}
-                                        </Box>
-
-                                        <Typography variant="caption" sx={{ textAlign: 'center', mt: 2, color: '#A3A3A3' }}>
-                                            {isRecording ? "Recording... speak clearly" : "Tap to start speaking"}
-                                        </Typography>
-                                    </>
-                                ) : (
-                                    <>
-                                        {/* Text Input Mode */}
-                                        <Box sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
-                                            <TextField
-                                                fullWidth
-                                                multiline
-                                                rows={8}
-                                                placeholder="Type your answer here..."
-                                                variant="outlined"
-                                                value={textInput}
-                                                onChange={(e) => setTextInput(e.target.value)}
-                                                sx={{
-                                                    flexGrow: 1,
-                                                    '& .MuiOutlinedInput-root': {
-                                                        borderRadius: 2,
-                                                        bgcolor: '#121212',
-                                                        height: '100%',
-                                                        color: '#FAFAFA',
-                                                        '& fieldset': { borderColor: 'rgba(249, 115, 22, 0.2)' },
-                                                        '&:hover fieldset': { borderColor: 'rgba(249, 115, 22, 0.4)' },
-                                                        '&.Mui-focused fieldset': { borderColor: '#F97316' },
-                                                    }
-                                                }}
-                                            />
-                                        </Box>
-
-                                        <Box sx={{ display: 'flex', justifyContent: 'flex-end', mt: 3 }}>
-                                            <Button
-                                                variant="contained"
-                                                size="large"
-                                                disabled={!textInput.trim() || isProcessing}
-                                                onClick={handleSendText}
-                                                endIcon={<Send />}
-                                                sx={{
-                                                    borderRadius: 100,
-                                                    px: 4,
-                                                    bgcolor: '#F97316',
-                                                    '&:hover': { bgcolor: '#EA580C' }
-                                                }}
-                                            >
-                                                Submit Answer
+                                        <Stack direction="row" spacing={0.6} useFlexGap flexWrap="wrap" alignItems="center">
+                                            {hintLevel > 0 && <Chip size="small" label={`L${hintLevel}`} color="secondary" variant="outlined" />}
+                                            <Button size="small" variant="outlined" onClick={requestHint}>
+                                                Refresh
                                             </Button>
-                                        </Box>
-                                    </>
-                                )}
-                            </Paper>
-                        </Grid>
+                                            <Button size="small" variant="text" onClick={() => setShowHintDetails((prev) => !prev)}>
+                                                {showHintDetails ? 'Less' : 'Details'}
+                                            </Button>
+                                        </Stack>
+                                    </Stack>
 
-                    </Grid>
+                                    {hintNextStep && (
+                                        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                            <strong>Next:</strong> {hintNextStep}
+                                        </Typography>
+                                    )}
+
+                                    {showHintDetails && (
+                                        <Paper elevation={0} sx={{ mt: 1, p: 1.1, borderStyle: 'dashed' }}>
+                                            {hintFramework && (
+                                                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}>
+                                                    Framework: {hintFramework}
+                                                </Typography>
+                                            )}
+                                            {hintStarter && (
+                                                <Typography variant="body2" sx={{ mb: 0.7 }}>
+                                                    <strong>Starter:</strong> "{hintStarter}"
+                                                </Typography>
+                                            )}
+                                            {hintMustMention.length > 0 && (
+                                                <Stack direction="row" spacing={0.6} useFlexGap flexWrap="wrap" sx={{ mb: 0.7 }}>
+                                                    {hintMustMention.map((point) => (
+                                                        <Chip key={point} size="small" label={point} variant="outlined" />
+                                                    ))}
+                                                </Stack>
+                                            )}
+                                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                <strong>Avoid:</strong> {hintAvoid || 'Stay concrete and include one clear outcome.'}
+                                            </Typography>
+                                        </Paper>
+                                    )}
+                                </Paper>
+                            </Fade>
+                        )}
+
+                        {!showTipsPanel && !isCoachSession && (
+                            <Paper sx={{ p: 1.2, bgcolor: darkMode ? 'rgba(245,158,11,0.05)' : 'rgba(249,115,22,0.05)' }}>
+                                <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} alignItems={{ sm: 'center' }}>
+                                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                        Need help? Enable hints for one focused coaching prompt.
+                                    </Typography>
+                                    <Button
+                                        size="small"
+                                        variant="outlined"
+                                        color="secondary"
+                                        startIcon={<LightbulbOutlined />}
+                                        onClick={handleToggleHintsPanel}
+                                    >
+                                        Enable Coach Hints
+                                    </Button>
+                                </Stack>
+                            </Paper>
+                        )}
+
+                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
+                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1} sx={{ mb: 1.1 }}>
+                                <Typography variant="h6">Your Answer</Typography>
+                                <Tabs
+                                    value={inputMode}
+                                    onChange={handleModeChange}
+                                    textColor="secondary"
+                                    indicatorColor="secondary"
+                                    sx={{ minHeight: 34, '& .MuiTab-root': { minHeight: 34, px: 1.6 } }}
+                                >
+                                    <Tab icon={<GraphicEq sx={{ fontSize: 18 }} />} iconPosition="start" value="record" label="Record" />
+                                    <Tab icon={<EditNote sx={{ fontSize: 18 }} />} iconPosition="start" value="type" label="Type" />
+                                </Tabs>
+                            </Stack>
+
+                            {inputMode === 'record' ? (
+                                <Stack spacing={1.2}>
+                                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ sm: 'center' }}>
+                                        <Button
+                                            variant={isMicRecording ? 'contained' : 'outlined'}
+                                            color={isMicRecording ? 'error' : 'primary'}
+                                            startIcon={isMicRecording ? <MicOff /> : <Mic />}
+                                            onClick={isMicRecording ? () => stopRecording(true) : startRecording}
+                                            disabled={isMicStarting}
+                                        >
+                                            {isMicStarting
+                                                ? 'Starting...'
+                                                : isMicRecording
+                                                    ? 'Stop Recording'
+                                                    : 'Start Recording'}
+                                        </Button>
+                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                            {isMicRecording ? 'Listening' : isMicStarting ? 'Starting mic' : 'Recorder idle'} • Auto-stop after {silenceAutoStopSeconds.toFixed(1)}s of silence
+                                        </Typography>
+                                    </Stack>
+
+                                    {micError && (
+                                        <Typography variant="body2" color="error">
+                                            {micError}
+                                        </Typography>
+                                    )}
+
+                                    <Paper
+                                        elevation={0}
+                                        sx={{
+                                            p: 1.2,
+                                            minHeight: 140,
+                                            maxHeight: 220,
+                                            overflowY: 'auto',
+                                            bgcolor: 'rgba(249, 115, 22, 0.06)',
+                                            border: '1px solid rgba(249, 115, 22, 0.2)',
+                                            position: 'relative',
+                                        }}
+                                    >
+                                        {!transcriptText && !micError && (
+                                            <Stack
+                                                spacing={0.8}
+                                                alignItems="center"
+                                                justifyContent="center"
+                                                sx={{
+                                                    position: 'absolute',
+                                                    inset: 0,
+                                                    pointerEvents: 'none',
+                                                    color: 'rgba(107, 114, 128, 0.35)',
+                                                }}
+                                            >
+                                                <Mic sx={{ fontSize: 34 }} />
+                                                <Typography variant="caption" sx={{ letterSpacing: '0.05em' }}>
+                                                    Live transcript waits for your voice
+                                                </Typography>
+                                            </Stack>
+                                        )}
+                                        <Typography
+                                            variant="body2"
+                                            sx={{
+                                                color: transcriptText ? 'text.primary' : 'text.secondary',
+                                                whiteSpace: 'pre-wrap',
+                                                overflowWrap: 'anywhere',
+                                                position: 'relative',
+                                                zIndex: 1,
+                                            }}
+                                        >
+                                            {transcriptText}
+                                        </Typography>
+                                    </Paper>
+                                </Stack>
+                            ) : (
+                                <TextField
+                                    fullWidth
+                                    multiline
+                                    minRows={8}
+                                    value={draft}
+                                    onChange={(e) => setDraft(e.target.value)}
+                                    placeholder="Type your answer..."
+                                />
+                            )}
+
+                            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} justifyContent="space-between" sx={{ mt: 1.4 }}>
+                                <Button
+                                    variant="outlined"
+                                    startIcon={<SkipNext />}
+                                    onClick={handleSkip}
+                                    disabled={answerSubmitPending}
+                                >
+                                    Skip Question
+                                </Button>
+                                <Button
+                                    variant="contained"
+                                    startIcon={answerSubmitPending ? <CircularProgress size={14} color="inherit" /> : <Send />}
+                                    onClick={handleSubmit}
+                                    disabled={submitDisabled}
+                                >
+                                    {answerSubmitPending
+                                        ? 'Submitting...'
+                                        : inputMode === 'record'
+                                            ? 'Submit Transcript'
+                                            : 'Submit Answer'}
+                                </Button>
+                            </Stack>
+                        </Paper>
+                    </Stack>
                 </Container>
             </Box>
         </ThemeProvider>

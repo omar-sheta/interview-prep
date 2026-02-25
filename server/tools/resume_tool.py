@@ -21,8 +21,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 def clean_json_output(text: str) -> str:
     """
     Clean LLM output to extract valid JSON.
-    Handles common LLM errors like markdown blocks, trailing commas, comments.
+    Handles common LLM errors like markdown blocks, trailing commas, comments,
+    and qwen3-style <think>...</think> reasoning blocks.
     """
+    # Strip <think>...</think> blocks (qwen3 reasoning traces)
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text)
+
     # Remove markdown code blocks
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)
@@ -49,21 +53,36 @@ def parse_json_safely(text: str) -> Optional[dict]:
     """
     Attempt to parse JSON with multiple fallback strategies.
     """
+    if not text:
+        return None
+
     # First, clean the text
     cleaned = clean_json_output(text)
-    
+
+    # Fix malformed keys like: " "text": ... or ""text":
+    fixed_keys = re.sub(r'"\s+"([A-Za-z_][A-Za-z0-9_]*)"\s*:', r'"\1":', cleaned)
+    fixed_keys = re.sub(r'""([A-Za-z_][A-Za-z0-9_]*)"\s*:', r'"\1":', fixed_keys)
+
+    candidates = [
+        cleaned,
+        fixed_keys,
+        fixed_keys.replace("'", '"'),
+    ]
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    # Last resort: attempt structural repair for minor JSON corruption.
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+        from json_repair import repair_json
+        repaired = repair_json(fixed_keys)
+        return json.loads(repaired)
+    except Exception:
         pass
-    
-    # Try with additional fixes
-    try:
-        fixed = cleaned.replace("'", '"')
-        return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
-    
+
     return None
 
 

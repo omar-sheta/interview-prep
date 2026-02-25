@@ -48,22 +48,28 @@ Be specific and realistic based on current industry standards."""
 
 async def infer_job_requirements(
     job_title: str,
-    company: str = "a top tech company"
+    company: str = "a top tech company",
+    job_description: str = ""
 ) -> dict[str, Any]:
     """
-    Infer job requirements from a job title and company.
-    Uses LLM to generate realistic skill requirements.
-    
-    Args:
-        job_title: The target job title (e.g., "Senior Software Engineer")
-        company: The company name (e.g., "Google", "Meta")
-        
-    Returns:
-        Structured job requirements dictionary
+    Infer job requirements from a job title, company, and optional job description.
+    If a job description is provided, the LLM extracts requirements from it directly.
+    Otherwise it infers them from the title and company.
     """
     chat_model = get_chat_model()
-    
-    prompt = f"""As a Senior Recruiter, analyze the requirements for:
+
+    if job_description and job_description.strip():
+        prompt = f"""As a Senior Recruiter, extract the requirements from this ACTUAL job description:
+
+Job Title: {job_title}
+Company: {company}
+
+JOB DESCRIPTION:
+{job_description[:2000]}
+
+Extract the must-have skills, nice-to-have skills, and core responsibilities from this real posting."""
+    else:
+        prompt = f"""As a Senior Recruiter, analyze the requirements for:
 Job Title: {job_title}
 Company: {company}
 
@@ -81,6 +87,11 @@ Consider the company's tech stack and culture if known."""
     
     # Extract JSON from response
     try:
+        # Strip <think>...</think> blocks (qwen3 reasoning traces)
+        response_text = re.sub(r'<think>[\s\S]*?</think>', '', response_text).strip()
+        # Remove trailing commas before } or ]
+        response_text = re.sub(r',(\s*[\}\]])', r'\1', response_text)
+
         json_match = re.search(r'\{[\s\S]*\}', response_text)
         if json_match:
             parsed = json.loads(json_match.group())

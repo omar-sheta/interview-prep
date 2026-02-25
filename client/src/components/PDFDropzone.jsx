@@ -4,7 +4,7 @@
  */
 
 import { useCallback, useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion as Motion, AnimatePresence } from 'framer-motion';
 
 export default function PDFDropzone({ onUpload, isLoading = false }) {
     const [isDragging, setIsDragging] = useState(false);
@@ -56,7 +56,7 @@ export default function PDFDropzone({ onUpload, isLoading = false }) {
     }, [handleFile]);
 
     return (
-        <motion.div
+        <Motion.div
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -76,7 +76,7 @@ export default function PDFDropzone({ onUpload, isLoading = false }) {
         >
             <div className="flex flex-col items-center justify-center p-4 text-center w-full h-full">
                 {/* Icon */}
-                <motion.div
+                <Motion.div
                     className={`w-12 h-12 rounded-full border flex items-center justify-center mb-3 transition-all ${isDragging
                         ? 'bg-[#00c2b2]/20 border-[#00c2b2]/50 scale-110'
                         : fileName
@@ -93,7 +93,7 @@ export default function PDFDropzone({ onUpload, isLoading = false }) {
                         }`}>
                         {fileName ? 'check_circle' : 'upload_file'}
                     </span>
-                </motion.div>
+                </Motion.div>
 
                 {/* Text */}
                 <p className={`text-sm font-medium mb-1 ${fileName ? 'text-emerald-400' : isDragging ? 'text-[#00c2b2]' : 'text-gray-300'
@@ -111,16 +111,16 @@ export default function PDFDropzone({ onUpload, isLoading = false }) {
             {/* Error */}
             <AnimatePresence>
                 {error && (
-                    <motion.p
+                    <Motion.p
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                         exit={{ opacity: 0 }}
                         className="absolute -bottom-6 left-0 right-0 text-center text-xs text-red-400"
                     >
                         {error}
-                    </motion.p>
+                    </Motion.p>
                 )}
             </AnimatePresence>
-        </motion.div>
+        </Motion.div>
     );
 }

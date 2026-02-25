@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import useInterviewStore from '@/store/useInterviewStore';
 import {
@@ -14,15 +14,18 @@ import {
     createTheme,
     ThemeProvider,
     CssBaseline,
-    InputAdornment
+    InputAdornment,
+    IconButton,
+    Tooltip
 } from '@mui/material';
-import { motion } from 'framer-motion';
+import { DarkMode, LightMode } from '@mui/icons-material';
 import { Key, User, Mail } from 'lucide-react';
 
-// --- Hive & Bees Dark Theme ---
-const localTheme = createTheme({
+function createAuthTheme(mode) {
+    const isDark = mode === 'dark';
+    return createTheme({
     palette: {
-        mode: 'dark',
+        mode,
         primary: {
             main: '#F97316',
             light: '#FB923C',
@@ -32,12 +35,12 @@ const localTheme = createTheme({
             main: '#FBBF24',
         },
         background: {
-            default: '#0A0A0A',
-            paper: '#121212',
+            default: isDark ? '#0A0A0A' : '#FFFBF0',
+            paper: isDark ? '#121212' : '#FFFFFF',
         },
         text: {
-            primary: '#FAFAFA',
-            secondary: '#A3A3A3',
+            primary: isDark ? '#FAFAFA' : '#1F2937',
+            secondary: isDark ? '#A3A3A3' : '#6B7280',
         },
     },
     typography: {
@@ -47,19 +50,44 @@ const localTheme = createTheme({
         borderRadius: 16,
     },
 });
+}
 
 const SignupScreen = () => {
     const navigate = useNavigate();
     // Destructure logout to force clean session
-    const { signup, logout } = useInterviewStore();
+    const { signup, logout, darkMode, toggleDarkMode } = useInterviewStore();
     const [isLoading, setIsLoading] = useState(false);
     const [form, setForm] = useState({ name: '', email: '', password: '' });
     const [error, setError] = useState('');
+    const theme = useMemo(() => createAuthTheme(darkMode ? 'dark' : 'light'), [darkMode]);
+    const ui = darkMode
+        ? {
+            pageBg: 'linear-gradient(135deg, #0A0A0A 0%, #1A1A1A 50%, #0A0A0A 100%)',
+            orb1: 'rgba(249, 115, 22, 0.08)',
+            orb2: 'rgba(251, 191, 36, 0.06)',
+            cardBg: 'rgba(26, 26, 26, 0.9)',
+            cardBorder: '1px solid rgba(249, 115, 22, 0.15)',
+            textMain: '#FAFAFA',
+            textSub: '#A3A3A3',
+            inputBg: '#1A1A1A',
+            inputText: '#FAFAFA',
+        }
+        : {
+            pageBg: 'linear-gradient(135deg, #FFFDF4 0%, #FFF7E6 45%, #FFFDF4 100%)',
+            orb1: 'rgba(249, 115, 22, 0.12)',
+            orb2: 'rgba(251, 191, 36, 0.1)',
+            cardBg: 'rgba(255, 255, 255, 0.92)',
+            cardBorder: '1px solid rgba(249, 115, 22, 0.2)',
+            textMain: '#1F2937',
+            textSub: '#6B7280',
+            inputBg: '#FFFFFF',
+            inputText: '#111827',
+        };
 
     // Force logout on mount to ensure we are creating a NEW account
     useEffect(() => {
         logout();
-    }, []); // Only on mount
+    }, [logout]); // Only on mount
 
     const handleChange = (event) => {
         const { name, value } = event.target;
@@ -79,7 +107,7 @@ const SignupScreen = () => {
         try {
             setIsLoading(true);
             await signup(form.name, form.email, form.password);
-            navigate('/dashboard');
+            navigate('/');
         } catch (err) {
             console.error(err);
             setError(err.message || 'Signup failed. Please try again.');
@@ -88,7 +116,7 @@ const SignupScreen = () => {
     };
 
     return (
-        <ThemeProvider theme={localTheme}>
+        <ThemeProvider theme={theme}>
             <CssBaseline />
             <Box
                 sx={{
@@ -97,11 +125,18 @@ const SignupScreen = () => {
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    background: 'linear-gradient(135deg, #0A0A0A 0%, #1A1A1A 50%, #0A0A0A 100%)',
+                    background: ui.pageBg,
                     position: 'relative',
                     overflow: 'hidden',
                 }}
             >
+                <Box sx={{ position: 'absolute', top: 14, right: 14, zIndex: 3 }}>
+                    <Tooltip title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+                        <IconButton onClick={toggleDarkMode} sx={{ color: ui.textMain }}>
+                            {darkMode ? <LightMode /> : <DarkMode />}
+                        </IconButton>
+                    </Tooltip>
+                </Box>
                 {/* Orange glow decoration */}
                 <Box
                     sx={{
@@ -111,7 +146,7 @@ const SignupScreen = () => {
                         width: 400,
                         height: 400,
                         borderRadius: '50%',
-                        background: 'rgba(249, 115, 22, 0.08)',
+                        background: ui.orb1,
                         filter: 'blur(100px)',
                     }}
                 />
@@ -123,26 +158,22 @@ const SignupScreen = () => {
                         width: 500,
                         height: 500,
                         borderRadius: '50%',
-                        background: 'rgba(251, 191, 36, 0.06)',
+                        background: ui.orb2,
                         filter: 'blur(120px)',
                     }}
                 />
 
                 <Container maxWidth="xs" sx={{ position: 'relative', zIndex: 1 }}>
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.5 }}
-                    >
+                    <Box>
                         <Card
                             elevation={0}
                             sx={{
                                 p: 2,
                                 borderRadius: 4,
                                 boxShadow: '0 20px 60px -12px rgba(0,0,0,0.6), inset 0 1px 0 rgba(251, 191, 36, 0.05)',
-                                background: 'rgba(26, 26, 26, 0.9)',
+                                background: ui.cardBg,
                                 backdropFilter: 'blur(16px)',
-                                border: '1px solid rgba(249, 115, 22, 0.15)',
+                                border: ui.cardBorder,
                             }}
                         >
                             <CardContent sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', pt: 4, pb: 4 }}>
@@ -155,10 +186,10 @@ const SignupScreen = () => {
                                     sx={{ height: 56, mb: 2, objectFit: 'contain' }}
                                 />
 
-                                <Typography variant="h5" fontWeight="700" sx={{ color: '#FAFAFA', mb: 1 }}>
+                                <Typography variant="h5" fontWeight="700" sx={{ color: ui.textMain, mb: 1 }}>
                                     Create Account
                                 </Typography>
-                                <Typography variant="body2" sx={{ color: '#A3A3A3', mb: 4 }}>
+                                <Typography variant="body2" sx={{ color: ui.textSub, mb: 4 }}>
                                     Master your technical interviews
                                 </Typography>
 
@@ -176,13 +207,13 @@ const SignupScreen = () => {
                                         disabled={isLoading}
                                         sx={{
                                             '& .MuiOutlinedInput-root': {
-                                                backgroundColor: '#1A1A1A',
+                                                backgroundColor: ui.inputBg,
                                                 borderRadius: 3,
                                                 '& fieldset': { borderColor: 'rgba(249, 115, 22, 0.2)' },
                                                 '&:hover fieldset': { borderColor: 'rgba(249, 115, 22, 0.4)' },
                                                 '&.Mui-focused fieldset': { borderColor: '#F97316' },
                                             },
-                                            '& .MuiInputBase-input': { py: 1.5, px: 2, color: '#FAFAFA' },
+                                            '& .MuiInputBase-input': { py: 1.5, px: 2, color: ui.inputText },
                                         }}
                                         InputProps={{
                                             endAdornment: (
@@ -205,13 +236,13 @@ const SignupScreen = () => {
                                         disabled={isLoading}
                                         sx={{
                                             '& .MuiOutlinedInput-root': {
-                                                backgroundColor: '#1A1A1A',
+                                                backgroundColor: ui.inputBg,
                                                 borderRadius: 3,
                                                 '& fieldset': { borderColor: 'rgba(249, 115, 22, 0.2)' },
                                                 '&:hover fieldset': { borderColor: 'rgba(249, 115, 22, 0.4)' },
                                                 '&.Mui-focused fieldset': { borderColor: '#F97316' },
                                             },
-                                            '& .MuiInputBase-input': { py: 1.5, px: 2, color: '#FAFAFA' },
+                                            '& .MuiInputBase-input': { py: 1.5, px: 2, color: ui.inputText },
                                         }}
                                         InputProps={{
                                             endAdornment: (
@@ -235,13 +266,13 @@ const SignupScreen = () => {
                                         disabled={isLoading}
                                         sx={{
                                             '& .MuiOutlinedInput-root': {
-                                                backgroundColor: '#1A1A1A',
+                                                backgroundColor: ui.inputBg,
                                                 borderRadius: 3,
                                                 '& fieldset': { borderColor: 'rgba(249, 115, 22, 0.2)' },
                                                 '&:hover fieldset': { borderColor: 'rgba(249, 115, 22, 0.4)' },
                                                 '&.Mui-focused fieldset': { borderColor: '#F97316' },
                                             },
-                                            '& .MuiInputBase-input': { py: 1.5, px: 2, color: '#FAFAFA' },
+                                            '& .MuiInputBase-input': { py: 1.5, px: 2, color: ui.inputText },
                                         }}
                                         InputProps={{
                                             endAdornment: (
@@ -284,7 +315,7 @@ const SignupScreen = () => {
                                     </Button>
 
                                     <Box sx={{ textAlign: 'center', mt: 2 }}>
-                                        <Typography variant="caption" sx={{ color: '#A3A3A3' }}>
+                                        <Typography variant="caption" sx={{ color: ui.textSub }}>
                                             Already have an account?{' '}
                                             <Link to="/login" style={{ color: '#F97316', fontWeight: 600, textDecoration: 'none' }}>
                                                 Log In
@@ -294,7 +325,7 @@ const SignupScreen = () => {
                                 </Box>
                             </CardContent>
                         </Card>
-                    </motion.div>
+                    </Box>
                 </Container>
             </Box>
         </ThemeProvider>

@@ -94,6 +94,19 @@ class QuestionCache:
         except Exception as e:
             print(f"⚠️ Failed to delete from DB cache: {e}")
 
+    def delete_user_keys(self, user_id: str):
+        """Remove all cache entries for a user from memory and DB."""
+        prefix = f"{user_id}_"
+        keys_to_delete = [k for k in self._cache.keys() if k.startswith(prefix)]
+        for key in keys_to_delete:
+            del self._cache[key]
+
+        try:
+            db = self._get_db()
+            db.delete_cached_questions_for_user(user_id)
+        except Exception as e:
+            print(f"⚠️ Failed to clear user cache from DB: {e}")
+
     def clear(self):
         """Clear in-memory cache only (DB persists)."""
         self._cache = {}

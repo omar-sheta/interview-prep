@@ -18,6 +18,15 @@ const APP_STATES = {
     COMPLETE: 'COMPLETE',
 };
 
+const ALLOWED_PIPER_STYLES = new Set(['interviewer', 'balanced', 'fast']);
+const normalizePiperStyle = (style, fallback = 'interviewer') => {
+    const fallbackNormalized = ALLOWED_PIPER_STYLES.has(String(fallback || '').trim().toLowerCase())
+        ? String(fallback || '').trim().toLowerCase()
+        : 'interviewer';
+    const normalized = String(style || '').trim().toLowerCase();
+    return ALLOWED_PIPER_STYLES.has(normalized) ? normalized : fallbackNormalized;
+};
+
 // Socket.IO instance managed in state
 const useInterviewStore = create(
     persist(
@@ -28,10 +37,12 @@ const useInterviewStore = create(
             connectionError: null,
             userId: null,  // User ID from server
             userEmail: null,  // User email for authentication
+            sessionToken: null, // Server-issued auth token
 
             // App state
             appState: APP_STATES.IDLE,
             onboardingComplete: false, // Tracks if user has logged in/completed onboarding
+            darkMode: false,
 
             // Career Analysis (PERSISTED)
             mindmap: '',
@@ -45,6 +56,12 @@ const useInterviewStore = create(
             // Last analysis metadata (PERSISTED)
             targetRole: '',
             targetCompany: '',
+            jobDescription: '',
+            questionCountOverride: null,
+            interviewerPersona: 'friendly',
+            piperStyle: 'interviewer',
+            evaluationThresholds: {},
+            recordingThresholds: {},
             focusAreas: [],
             lastAnalysisTime: null,
             suggestedSessions: [],
@@ -61,23 +78,38 @@ const useInterviewStore = create(
             // Interview Practice State (not persisted)
             interviewActive: false,
             interviewMode: 'practice', // 'practice' | 'coaching'
+            interviewFeedbackTiming: 'end_only', // 'end_only' | 'live'
             currentQuestion: null,
             questionNumber: 0,
             totalQuestions: 0,
             answerEvaluation: null,
-            coachingEnabled: true,
+            coachingEnabled: false,
             coachingHint: null,
             allEvaluations: [],
             interviewSummary: null,
+            answerSubmitPending: false,
 
             // Thinking terminal (not persisted)
             thinkingLog: [],
 
+            // History (not persisted)
+            interviewHistory: [],
+            historyLoading: false,
+            deletingSessionIds: {},
+            selectedSession: null,
+            selectedSessionLoading: false,
+            currentSessionId: null,
+            retryAttemptsByQuestion: {},
+            retrySubmitting: {},
+            retryErrors: {},
+
             // ============== Actions ==============
+            toggleDarkMode: () => set((state) => ({ darkMode: !state.darkMode })),
+            setDarkMode: (enabled) => set({ darkMode: Boolean(enabled) }),
 
             // Connect to Socket.IO Server
             connect: () => {
-                let { socket, userId } = get();
+                let { socket, userId, sessionToken } = get();
                 // Prevent multiple socket instances - check if socket exists AND is either connected or connecting
                 if (socket && (socket.connected || socket.io.engine)) return;
 
@@ -89,7 +121,7 @@ const useInterviewStore = create(
                     set({ socket: null });
                 }
 
-                // Bootstrap userId from localStorage if not in store (bridges legacy flows)
+                // Bootstrap userId/sessionToken from localStorage if not in store (bridges legacy flows)
                 if (!userId || userId === 'anonymous') {
                     const fallbackId = localStorage.getItem('user_id');
                     if (fallbackId && fallbackId !== 'anonymous') {
@@ -99,11 +131,31 @@ const useInterviewStore = create(
                     }
                 }
 
-                console.log('🔌 Connecting with userId:', userId);
+                if (!sessionToken) {
+                    const fallbackToken = localStorage.getItem('session_token');
+                    if (fallbackToken) {
+                        console.log('🔐 Bootstrapped session token from localStorage');
+                        set({ sessionToken: fallbackToken });
+                        sessionToken = fallbackToken;
+                    }
+                }
 
-                const newSocket = io('http://localhost:8000', {
+                // Prevent stale user binding when no valid token is available.
+                if (!sessionToken && userId && userId !== 'anonymous') {
+                    set({ userId: null, onboardingComplete: false });
+                    userId = null;
+                }
+
+                // Direct backend socket by default for local dev reliability.
+                // Override with VITE_SOCKET_URL when needed.
+                const socketUrl = (import.meta.env.VITE_SOCKET_URL || 'http://127.0.0.1:8000').trim();
+                const socketEndpoint = socketUrl || 'http://127.0.0.1:8000';
+                const newSocket = io(socketEndpoint, {
+                    path: '/socket.io',
                     transports: ['websocket'],
-                    query: userId && userId !== 'anonymous' ? { user_id: userId } : {}
+                    upgrade: false,
+                    timeout: 10000,
+                    auth: sessionToken ? { session_token: sessionToken } : {},
                 });
 
                 // Security Guard Helper
@@ -123,16 +175,16 @@ const useInterviewStore = create(
                     set({ isConnected: true, connectionError: null });
                     get().addThinking('🔌 Connected to Interview Agent');
 
-                    // Restore session if we have a user ID
-                    const { userId } = get();
-                    if (userId) {
-                        get().addThinking(`🔄 Restoring session for ${userId}...`);
-                        newSocket.emit('restore_session', { user_id: userId });
+                    // Restore authenticated session if we have a token
+                    const { sessionToken } = get();
+                    if (sessionToken) {
+                        get().addThinking('🔄 Restoring authenticated session...');
+                        newSocket.emit('restore_session', { session_token: sessionToken });
                     }
                 });
 
                 newSocket.on('connected', (data) => {
-                    if (data.user_id && data.user_id !== 'anonymous') {
+                    if (data.authenticated && data.user_id && data.user_id !== 'anonymous') {
                         set({ userId: data.user_id });
                         get().addThinking(`👤 User ID: ${data.user_id}`);
                     }
@@ -140,28 +192,146 @@ const useInterviewStore = create(
 
                 newSocket.on('auth_success', (data) => {
                     if (data.user?.user_id) {
-                        set({ userId: data.user.user_id });
+                        const prefs = data.preferences || {};
+                        const nextState = {
+                            userId: data.user.user_id,
+                            targetRole: prefs.target_role || '',
+                            targetCompany: prefs.target_company || '',
+                            jobDescription: prefs.job_description || '',
+                            questionCountOverride:
+                                prefs.question_count_override !== undefined && prefs.question_count_override !== null
+                                    ? Number(prefs.question_count_override)
+                                    : null,
+                            interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
+                            piperStyle: normalizePiperStyle(prefs.piper_style, 'interviewer'),
+                            evaluationThresholds: (prefs.evaluation_thresholds && typeof prefs.evaluation_thresholds === 'object') ? prefs.evaluation_thresholds : {},
+                            recordingThresholds: (prefs.recording_thresholds && typeof prefs.recording_thresholds === 'object') ? prefs.recording_thresholds : {},
+                            focusAreas: prefs.focus_areas || [],
+                            // Clear prior-user analysis/session state; backend will emit career_analysis if one exists.
+                            mindmap: '',
+                            readinessScore: 0,
+                            skillMapping: null,
+                            bridgeRoles: [],
+                            jobRequirements: null,
+                            resumeData: null,
+                            suggestedSessions: [],
+                            practicePlan: null,
+                            lastAnalysisTime: null,
+                            analysisProgress: '',
+                            appState: APP_STATES.IDLE,
+                            interviewActive: false,
+                            currentQuestion: null,
+                            questionNumber: 0,
+                            totalQuestions: 0,
+                            answerEvaluation: null,
+                            coachingHint: null,
+                            allEvaluations: [],
+                            interviewSummary: null,
+                            currentSessionId: null,
+                            retryAttemptsByQuestion: {},
+                            retrySubmitting: {},
+                            retryErrors: {},
+                            interviewHistory: [],
+                            selectedSession: null,
+                        };
+                        if (data.session_token) {
+                            nextState.sessionToken = data.session_token;
+                            localStorage.setItem('session_token', data.session_token);
+                        }
+                        set(nextState);
                         get().addThinking(`✅ Authenticated as ${data.user.email}`);
                     }
+                });
+
+                newSocket.on('auth_error', (data) => {
+                    const msg = data?.error || 'Authentication error';
+                    if (msg.toLowerCase().includes('token')) {
+                        localStorage.removeItem('session_token');
+                        set({
+                            sessionToken: null,
+                            userId: null,
+                            onboardingComplete: false,
+                            historyLoading: false,
+                            deletingSessionIds: {},
+                            selectedSessionLoading: false,
+                        });
+                    } else {
+                        // Ensure UI can recover from protected-event auth failures.
+                        set({ historyLoading: false, deletingSessionIds: {}, selectedSessionLoading: false });
+                    }
+                    get().addThinking(`❌ ${msg}`);
                 });
 
                 newSocket.on('session_restored', (data) => {
                     get().addThinking(`✅ Session restored for ${data.user.email}`);
                     const prefs = data.preferences || {};
+                    const nextState = {
+                        userId: data.user?.user_id || get().userId,
+                    };
+                    if (data.session_token) {
+                        nextState.sessionToken = data.session_token;
+                        localStorage.setItem('session_token', data.session_token);
+                    }
                     set({
+                        ...nextState,
                         targetRole: prefs.target_role || '',
                         targetCompany: prefs.target_company || '',
-                        focusAreas: prefs.focus_areas || []
+                        jobDescription: prefs.job_description || '',
+                        questionCountOverride:
+                            prefs.question_count_override !== undefined && prefs.question_count_override !== null
+                                ? Number(prefs.question_count_override)
+                                : null,
+                        interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
+                        piperStyle: normalizePiperStyle(prefs.piper_style, get().piperStyle || 'interviewer'),
+                        evaluationThresholds: (prefs.evaluation_thresholds && typeof prefs.evaluation_thresholds === 'object') ? prefs.evaluation_thresholds : {},
+                        recordingThresholds: (prefs.recording_thresholds && typeof prefs.recording_thresholds === 'object') ? prefs.recording_thresholds : {},
+                        focusAreas: prefs.focus_areas || [],
+                        // Reset analysis/session snapshot; server may repopulate via career_analysis.
+                        mindmap: '',
+                        readinessScore: 0,
+                        skillMapping: null,
+                        bridgeRoles: [],
+                        jobRequirements: null,
+                        resumeData: null,
+                        suggestedSessions: [],
+                        practicePlan: null,
+                        lastAnalysisTime: null,
+                        analysisProgress: '',
+                        appState: APP_STATES.IDLE,
+                        interviewActive: false,
+                        currentQuestion: null,
+                        questionNumber: 0,
+                        totalQuestions: 0,
+                        answerEvaluation: null,
+                        coachingHint: null,
+                        allEvaluations: [],
+                        interviewSummary: null,
+                        currentSessionId: null,
+                        retryAttemptsByQuestion: {},
+                        retrySubmitting: {},
+                        retryErrors: {},
+                        interviewHistory: [],
+                        selectedSession: null,
                     });
                 });
 
                 newSocket.on('disconnect', () => {
-                    set({ isConnected: false });
+                    set({
+                        isConnected: false,
+                        historyLoading: false,
+                        deletingSessionIds: {},
+                        selectedSessionLoading: false,
+                    });
                     get().addThinking('🔌 Disconnected from server');
                 });
 
                 newSocket.on('connect_error', (error) => {
-                    set({ connectionError: error.message });
+                    set({
+                        connectionError: error.message,
+                        historyLoading: false,
+                        deletingSessionIds: {},
+                        selectedSessionLoading: false,
+                    });
                     get().addThinking(`❌ Connection error: ${error.message}`);
                 });
 
@@ -175,14 +345,19 @@ const useInterviewStore = create(
                 onSafe('career_analysis', (data) => {
                     const analysis = data.analysis;
                     if (analysis) {
+                        const topLevelSkillGaps = Array.isArray(analysis.skill_gaps) ? analysis.skill_gaps : [];
+                        const analysisSkillMapping = analysis.analysis_data?.skill_mapping;
+                        const mergedSkillMapping = topLevelSkillGaps.length > 0
+                            ? {
+                                ...(analysisSkillMapping || {}),
+                                missing: topLevelSkillGaps,
+                            }
+                            : analysisSkillMapping;
                         get().addThinking('✅ Career analysis loaded');
                         set({
                             mindmap: analysis.analysis_data?.mindmap || analysis.analysis_data?.mindmap_code,
                             readinessScore: analysis.readiness_score,
-                            skillMapping: analysis.skill_gaps ? {
-                                missing: analysis.skill_gaps,
-                                ...analysis.analysis_data?.skill_mapping
-                            } : analysis.analysis_data?.skill_mapping,
+                            skillMapping: mergedSkillMapping,
                             bridgeRoles: analysis.bridge_roles,
                             jobRequirements: analysis.analysis_data?.job_requirements,
                             resumeData: analysis.analysis_data?.resume_data,
@@ -190,10 +365,25 @@ const useInterviewStore = create(
                             practicePlan: analysis.practice_plan || analysis.analysis_data?.practice_plan || null,
                             targetRole: analysis.job_title,
                             targetCompany: analysis.company,
+                            jobDescription: analysis.job_description || analysis.analysis_data?.job_description || get().jobDescription || '',
                             lastAnalysisTime: analysis.created_at || Date.now(),
                             analysisProgress: 'Analysis Complete!',
                             appState: APP_STATES.MAP_READY
                         });
+                    } else {
+                        set((state) => ({
+                            mindmap: '',
+                            readinessScore: 0,
+                            skillMapping: null,
+                            bridgeRoles: [],
+                            jobRequirements: null,
+                            resumeData: null,
+                            suggestedSessions: [],
+                            practicePlan: null,
+                            lastAnalysisTime: null,
+                            analysisProgress: '',
+                            appState: state.interviewActive ? state.appState : APP_STATES.IDLE,
+                        }));
                     }
                 });
 
@@ -208,10 +398,19 @@ const useInterviewStore = create(
                 onSafe('interview_started', (data) => {
                     set({
                         interviewActive: true,
+                        currentSessionId: data.session_id || null,
                         totalQuestions: data.total_questions,
                         currentQuestionIndex: 0,
-                        interviewMode: data.mode,
-                        appState: APP_STATES.INTERVIEWING
+                        interviewMode: data.mode || 'practice',
+                        interviewFeedbackTiming: data.feedback_timing || 'end_only',
+                        interviewerPersona: String(data.interviewer_persona || get().interviewerPersona || 'friendly').trim().toLowerCase() || 'friendly',
+                        piperStyle: normalizePiperStyle(data.piper_style, get().piperStyle || 'interviewer'),
+                        coachingEnabled: !!data.coaching_enabled,
+                        appState: APP_STATES.INTERVIEWING,
+                        answerSubmitPending: false,
+                        retryAttemptsByQuestion: {},
+                        retrySubmitting: {},
+                        retryErrors: {},
                     });
                 });
 
@@ -222,7 +421,9 @@ const useInterviewStore = create(
                         totalQuestions: data.total_questions || get().totalQuestions,
                         transcript: '',
                         answerEvaluation: null,
-                        coachingHint: null
+                        coachingHint: null,
+                        answerSubmitPending: false,
+                        ttsAudioQueue: [],
                     });
                     get().addThinking(`❓ Question ${data.question_number}: ${data.question.text}`);
 
@@ -247,6 +448,14 @@ const useInterviewStore = create(
                     get().addThinking(`📝 Evaluation: ${data.evaluation.score}/10`);
                 });
 
+                onSafe('coaching_toggled', (data) => {
+                    const enabled = !!data?.enabled;
+                    set((state) => ({
+                        coachingEnabled: enabled,
+                        coachingHint: enabled ? state.coachingHint : null,
+                    }));
+                });
+
                 onSafe('evaluation_token', (data) => {
                     set({ currentTokens: get().currentTokens + data.token });
                 });
@@ -254,11 +463,280 @@ const useInterviewStore = create(
                 onSafe('interview_complete', (data) => {
                     set({
                         interviewActive: false,
+                        currentSessionId: data.session_id || get().currentSessionId,
                         interviewSummary: data.summary,
                         allEvaluations: data.evaluations,
-                        appState: APP_STATES.COMPLETE
+                        appState: APP_STATES.COMPLETE,
+                        answerSubmitPending: false,
                     });
                     get().addThinking('🏁 Interview session complete');
+                });
+
+                onSafe('interview_error', (data) => {
+                    set({ answerSubmitPending: false });
+                    if (data?.error) get().addThinking(`❌ ${data.error}`);
+                });
+
+                // TTS audio for interview questions
+                onSafe('tts_audio', (data) => {
+                    if (data.audio) {
+                        const qIdx = Number.isInteger(data.question_index)
+                            ? Number(data.question_index)
+                            : null;
+                        // Ignore stale question audio that arrives for an old question.
+                        if (qIdx !== null) {
+                            const currentQ = Number(get().questionNumber || 0);
+                            if (currentQ > 0 && qIdx !== (currentQ - 1)) {
+                                return;
+                            }
+                        }
+                        set((state) => ({
+                            ttsAudioQueue: [...state.ttsAudioQueue, data.audio]
+                        }));
+                        get().addThinking('🔊 Playing interviewer audio');
+                    }
+                });
+
+                onSafe('tts_error', (data) => {
+                    const err = data?.error || 'TTS unavailable';
+                    get().addThinking(`🔇 ${err}`);
+                });
+
+                // History events
+                onSafe('interview_history', (data) => {
+                    set({ interviewHistory: data.history || [], historyLoading: false });
+                    get().addThinking(`📚 Loaded ${(data.history || []).length} past sessions`);
+                });
+
+                onSafe('session_deleted', (data) => {
+                    const deletedId = String(data?.session_id || '').trim();
+                    set((state) => {
+                        const nextDeleting = { ...state.deletingSessionIds };
+                        if (deletedId) delete nextDeleting[deletedId];
+                        return {
+                            historyLoading: false,
+                            deletingSessionIds: nextDeleting,
+                            selectedSession:
+                                deletedId && state.selectedSession?.session_id === deletedId
+                                    ? null
+                                    : state.selectedSession,
+                            currentSessionId:
+                                deletedId && state.currentSessionId === deletedId
+                                    ? null
+                                    : state.currentSessionId,
+                        };
+                    });
+                    get().addThinking('🗑️ Session deleted');
+                });
+
+                onSafe('session_delete_error', (data) => {
+                    const failedId = String(data?.session_id || '').trim();
+                    set((state) => {
+                        const nextDeleting = { ...state.deletingSessionIds };
+                        if (failedId) {
+                            delete nextDeleting[failedId];
+                        } else {
+                            for (const key of Object.keys(nextDeleting)) delete nextDeleting[key];
+                        }
+                        return {
+                            historyLoading: false,
+                            deletingSessionIds: nextDeleting,
+                        };
+                    });
+                    get().addThinking(`❌ ${data?.error || 'Failed to delete session'}`);
+                });
+
+                onSafe('session_details', (data) => {
+                    set({ selectedSession: data.session, selectedSessionLoading: false });
+                    get().addThinking(`📄 Loaded session details`);
+                });
+
+                onSafe('session_details_error', (data) => {
+                    set({ selectedSessionLoading: false });
+                    get().addThinking(`❌ ${data.error}`);
+                });
+
+                onSafe('workspace_reset', () => {
+                    set((state) => ({
+                        mindmap: '',
+                        readinessScore: 0,
+                        skillMapping: null,
+                        bridgeRoles: [],
+                        jobRequirements: null,
+                        resumeData: null,
+                        analysisProgress: '',
+                        suggestedSessions: [],
+                        practicePlan: null,
+                        appState: state.interviewActive ? state.appState : APP_STATES.IDLE,
+                    }));
+                    get().addThinking('🧹 Workspace reset complete');
+                });
+
+                onSafe('configuration_cleared', () => {
+                    set({
+                        targetRole: '',
+                        targetCompany: '',
+                        jobDescription: '',
+                        questionCountOverride: null,
+                        interviewerPersona: 'friendly',
+                        piperStyle: 'interviewer',
+                        focusAreas: [],
+                        lastAnalysisTime: null,
+                        mindmap: '',
+                        readinessScore: 0,
+                        skillMapping: null,
+                        bridgeRoles: [],
+                        jobRequirements: null,
+                        resumeData: null,
+                        suggestedSessions: [],
+                        practicePlan: null,
+                        analysisProgress: '',
+                        appState: APP_STATES.IDLE,
+                    });
+                    get().addThinking('🧹 Configuration cleared');
+                });
+
+                onSafe('history_deleted', () => {
+                    set({
+                        interviewHistory: [],
+                        historyLoading: false,
+                        deletingSessionIds: {},
+                        selectedSession: null,
+                        selectedSessionLoading: false,
+                    });
+                    get().addThinking('🗑️ Interview history deleted');
+                });
+
+                onSafe('all_data_reset', () => {
+                    set({
+                        interviewHistory: [],
+                        historyLoading: false,
+                        deletingSessionIds: {},
+                        selectedSession: null,
+                        selectedSessionLoading: false,
+                        currentSessionId: null,
+                        retryAttemptsByQuestion: {},
+                        retrySubmitting: {},
+                        retryErrors: {},
+                        targetRole: '',
+                        targetCompany: '',
+                        jobDescription: '',
+                        questionCountOverride: null,
+                        interviewerPersona: 'friendly',
+                        piperStyle: 'interviewer',
+                        focusAreas: [],
+                        lastAnalysisTime: null,
+                        mindmap: '',
+                        readinessScore: 0,
+                        skillMapping: null,
+                        bridgeRoles: [],
+                        jobRequirements: null,
+                        resumeData: null,
+                        suggestedSessions: [],
+                        practicePlan: null,
+                        analysisProgress: '',
+                        appState: APP_STATES.IDLE,
+                    });
+                    get().addThinking('♻️ All data reset complete');
+                });
+
+                onSafe('user_preferences', (data) => {
+                    const prefs = data?.preferences || {};
+                    set({
+                        targetRole: prefs.target_role || '',
+                        targetCompany: prefs.target_company || '',
+                        jobDescription: prefs.job_description || '',
+                        questionCountOverride:
+                            prefs.question_count_override !== undefined && prefs.question_count_override !== null
+                                ? Number(prefs.question_count_override)
+                                : null,
+                        interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
+                        piperStyle: normalizePiperStyle(prefs.piper_style, get().piperStyle || 'interviewer'),
+                        evaluationThresholds: (prefs.evaluation_thresholds && typeof prefs.evaluation_thresholds === 'object') ? prefs.evaluation_thresholds : {},
+                        recordingThresholds: (prefs.recording_thresholds && typeof prefs.recording_thresholds === 'object') ? prefs.recording_thresholds : {},
+                        focusAreas: prefs.focus_areas || [],
+                    });
+                });
+
+                onSafe('retry_attempts', (data) => {
+                    const sessionId = data?.session_id;
+                    const questionNumber = Number(data?.question_number);
+                    if (!sessionId || !questionNumber) return;
+                    const key = `${sessionId}:${questionNumber}`;
+                    set((state) => ({
+                        retryAttemptsByQuestion: {
+                            ...state.retryAttemptsByQuestion,
+                            [key]: Array.isArray(data.attempts) ? data.attempts : [],
+                        },
+                    }));
+                });
+
+                onSafe('retry_evaluated', (data) => {
+                    const sessionId = data?.session_id;
+                    const questionNumber = Number(data?.question_number);
+                    if (!sessionId || !questionNumber) return;
+                    const key = `${sessionId}:${questionNumber}`;
+                    const attempt = data?.attempt;
+                    const promoted = Boolean(data?.promoted_to_primary);
+                    set((state) => {
+                        const currentAttempts = state.retryAttemptsByQuestion[key] || [];
+                        const nextAttempts = attempt
+                            ? [...currentAttempts.filter((a) => a?.retry_id !== attempt.retry_id), attempt]
+                            : currentAttempts;
+                        const nextEvaluations = Array.isArray(state.allEvaluations)
+                            ? [...state.allEvaluations]
+                            : [];
+                        const qIndex = questionNumber - 1;
+                        if (
+                            promoted &&
+                            attempt &&
+                            qIndex >= 0 &&
+                            qIndex < nextEvaluations.length &&
+                            nextEvaluations[qIndex]
+                        ) {
+                            nextEvaluations[qIndex] = {
+                                ...nextEvaluations[qIndex],
+                                answer: attempt.answer_text || nextEvaluations[qIndex].answer,
+                                evaluation: attempt.evaluation || nextEvaluations[qIndex].evaluation,
+                            };
+                        }
+
+                        const nextSummary = state.interviewSummary
+                            ? { ...state.interviewSummary }
+                            : null;
+                        if (nextSummary && typeof data?.session_average_score === 'number') {
+                            nextSummary.average_score = data.session_average_score;
+                        }
+
+                        return {
+                            retryAttemptsByQuestion: {
+                                ...state.retryAttemptsByQuestion,
+                                [key]: nextAttempts.sort(
+                                    (a, b) => Number(a?.attempt_number || 0) - Number(b?.attempt_number || 0)
+                                ),
+                            },
+                            allEvaluations: nextEvaluations,
+                            interviewSummary: nextSummary,
+                            retrySubmitting: { ...state.retrySubmitting, [key]: false },
+                            retryErrors: { ...state.retryErrors, [key]: '' },
+                        };
+                    });
+                });
+
+                onSafe('retry_error', (data) => {
+                    const sessionId = data?.session_id;
+                    const questionNumber = Number(data?.question_number);
+                    const error = data?.error || 'Retry request failed';
+                    if (!sessionId || !questionNumber) {
+                        get().addThinking(`❌ ${error}`);
+                        return;
+                    }
+                    const key = `${sessionId}:${questionNumber}`;
+                    set((state) => ({
+                        retrySubmitting: { ...state.retrySubmitting, [key]: false },
+                        retryErrors: { ...state.retryErrors, [key]: error },
+                    }));
+                    get().addThinking(`❌ ${error}`);
                 });
 
                 set({ socket: newSocket });
@@ -275,39 +753,57 @@ const useInterviewStore = create(
             },
 
             // Start career analysis
-            startCareerAnalysis: (resumeBase64, jobTitle, company = '') => {
+            startCareerAnalysis: (resumeBase64, jobTitle, company = '', jobDescription = '') => {
                 console.log('🚀 Starting career analysis...', { jobTitle, company });
 
                 // Clear old data before starting new analysis
                 get().resetForNewAnalysis();
 
-                const { socket } = get();
-                if (!socket?.connected) {
-                    console.log('⏳ Socket not connected, connecting first...');
-                    get().connect();
-                    // Wait slightly for connection, then emit
-                    setTimeout(() => {
-                        const s = get().socket;
-                        if (s?.connected) {
-                            console.log('✅ Socket connected, emitting start_career_analysis');
-                            s.emit('start_career_analysis', {
-                                resume: resumeBase64,  // Backend expects 'resume'
-                                job_title: jobTitle,   // Backend expects 'job_title'
-                                company: company
-                            });
-                        } else {
-                            console.error('❌ Socket still not connected after timeout');
-                        }
-                    }, 500);
+                // Store job description in state for interview use
+                set({ jobDescription: jobDescription || '' });
+
+                const payload = {
+                    resume: resumeBase64,
+                    job_title: jobTitle,
+                    company: company,
+                    job_description: jobDescription
+                };
+
+                const emitStart = () => {
+                    const s = get().socket;
+                    if (!s?.connected) return false;
+                    s.emit('start_career_analysis', payload);
+                    return true;
+                };
+
+                if (emitStart()) {
+                    console.log('✅ Socket connected, emitting start_career_analysis');
                     return;
                 }
 
-                console.log('✅ Socket already connected, emitting start_career_analysis');
-                socket.emit('start_career_analysis', {
-                    resume: resumeBase64,  // Backend expects 'resume'
-                    job_title: jobTitle,   // Backend expects 'job_title'
-                    company: company
-                });
+                console.log('⏳ Socket not connected, connecting and retrying...');
+                get().connect();
+                const startedAt = Date.now();
+                const maxWaitMs = 8000;
+
+                const waitForSocket = () => {
+                    if (emitStart()) {
+                        console.log('✅ Socket connected, emitting start_career_analysis');
+                        return;
+                    }
+                    if (Date.now() - startedAt >= maxWaitMs) {
+                        console.error('❌ Failed to start analysis: socket connection timeout');
+                        set({
+                            analysisProgress: 'Error: Unable to connect to server. Please try again.',
+                            appState: APP_STATES.IDLE
+                        });
+                        get().addThinking('❌ Failed to start analysis: connection timeout');
+                        return;
+                    }
+                    setTimeout(waitForSocket, 250);
+                };
+
+                waitForSocket();
             },
 
             // Start interview mode
@@ -318,12 +814,12 @@ const useInterviewStore = create(
             },
 
             // Send audio chunk
-            sendAudioChunk: (audioBase64) => {
+            sendAudioChunk: (audioBase64, sampleRate = 16000) => {
                 const { socket } = get();
                 if (!socket?.connected) return;
                 socket.emit('user_audio_chunk', {
                     audio: audioBase64,
-                    sample_rate: 16000,
+                    sample_rate: sampleRate,
                 });
             },
 
@@ -362,8 +858,14 @@ const useInterviewStore = create(
                 return first;
             },
 
-            // Set recording state
-            setRecording: (isRecording) => set({ isRecording }),
+            // Set recording state and sync to server so backend can gate audio chunks.
+            setRecording: (isRecording) => {
+                const { socket } = get();
+                if (socket?.connected) {
+                    socket.emit('set_recording_state', { recording: !!isRecording });
+                }
+                set({ isRecording: !!isRecording });
+            },
 
             // Add thinking log entry
             addThinking: (message) => {
@@ -391,24 +893,40 @@ const useInterviewStore = create(
                 analysisProgress: '',
                 targetRole: '',
                 targetCompany: '',
+                jobDescription: '',
+                questionCountOverride: null,
+                interviewerPersona: 'friendly',
+                piperStyle: 'interviewer',
+                evaluationThresholds: {},
+                recordingThresholds: {},
                 lastAnalysisTime: null,
                 suggestedSessions: [],
                 practicePlan: null,
                 // Interview state
                 interviewActive: false,
+                interviewMode: 'practice',
+                interviewFeedbackTiming: 'end_only',
                 currentQuestion: null,
                 questionNumber: 0,
                 totalQuestions: 0,
                 answerEvaluation: null,
+                coachingEnabled: false,
                 coachingHint: null,
                 allEvaluations: [],
                 interviewSummary: null,
+                answerSubmitPending: false,
+                selectedSession: null,
+                currentSessionId: null,
+                retryAttemptsByQuestion: {},
+                retrySubmitting: {},
+                retryErrors: {},
                 thinkingLog: [],
             }),
 
             // Reset for new analysis (clears old CV/job data before new upload)
             resetForNewAnalysis: () => {
                 console.log('🔄 Resetting for new analysis...');
+                const { targetRole, targetCompany, jobDescription, questionCountOverride, interviewerPersona, piperStyle } = get();
                 set({
                     appState: APP_STATES.ANALYZING,
                     mindmap: '',
@@ -418,19 +936,35 @@ const useInterviewStore = create(
                     jobRequirements: null,
                     resumeData: null,
                     analysisProgress: 'Starting new analysis...',
-                    targetRole: '',
-                    targetCompany: '',
+                    // Keep configuration fields stable while regenerating analysis.
+                    targetRole: targetRole || '',
+                    targetCompany: targetCompany || '',
+                    jobDescription: jobDescription || '',
+                    questionCountOverride: questionCountOverride ?? null,
+                    interviewerPersona: interviewerPersona || 'friendly',
+                    piperStyle: normalizePiperStyle(piperStyle, 'interviewer'),
+                    evaluationThresholds: {},
+                    recordingThresholds: {},
                     lastAnalysisTime: null,
                     suggestedSessions: [],
                     practicePlan: null,
                     // Also clear any interview state
                     interviewActive: false,
+                    interviewMode: 'practice',
+                    interviewFeedbackTiming: 'end_only',
                     currentQuestion: null,
                     questionNumber: 0,
                     answerEvaluation: null,
+                    coachingEnabled: false,
                     coachingHint: null,
                     allEvaluations: [],
                     interviewSummary: null,
+                    answerSubmitPending: false,
+                    selectedSession: null,
+                    currentSessionId: null,
+                    retryAttemptsByQuestion: {},
+                    retrySubmitting: {},
+                    retryErrors: {},
                 });
             },
 
@@ -442,12 +976,21 @@ const useInterviewStore = create(
                 ttsAudioQueue: [],
                 isRecording: false,
                 interviewActive: false,
+                interviewMode: 'practice',
+                interviewFeedbackTiming: 'end_only',
                 currentQuestion: null,
                 questionNumber: 0,
                 answerEvaluation: null,
+                coachingEnabled: false,
                 coachingHint: null,
                 allEvaluations: [],
                 interviewSummary: null,
+                answerSubmitPending: false,
+                selectedSession: null,
+                currentSessionId: null,
+                retryAttemptsByQuestion: {},
+                retrySubmitting: {},
+                retryErrors: {},
             }),
 
             // Alias for reset - used by SessionReport
@@ -480,11 +1023,15 @@ const useInterviewStore = create(
                             set({
                                 userId: data.user.user_id,
                                 userEmail: data.user.email,
-                                onboardingComplete: true
+                                onboardingComplete: true,
+                                sessionToken: data.session_token || get().sessionToken
                             });
                             // Persist basic auth
                             localStorage.setItem('user_id', data.user.user_id);
                             localStorage.setItem('onboarding_complete', 'true');
+                            if (data.session_token) {
+                                localStorage.setItem('session_token', data.session_token);
+                            }
                             resolve(data);
                         };
 
@@ -543,12 +1090,16 @@ const useInterviewStore = create(
                             set({
                                 userId: data.user.user_id,
                                 userEmail: data.user.email,
-                                onboardingComplete: true
+                                onboardingComplete: true,
+                                sessionToken: data.session_token || get().sessionToken
                             });
                             // Persist basic auth
                             localStorage.setItem('user_id', data.user.user_id);
                             localStorage.setItem('onboarding_complete', 'true');
                             localStorage.setItem('user_name', data.user.username);
+                            if (data.session_token) {
+                                localStorage.setItem('session_token', data.session_token);
+                            }
                             resolve(data);
                         };
 
@@ -586,10 +1137,22 @@ const useInterviewStore = create(
             // Full Logout Action
             logout: () => {
                 console.log('👋 Logging out...');
-                const { socket } = get();
+                const { socket, sessionToken } = get();
 
-                // 1. Disconnect socket
-                if (socket) {
+                // 1. Revoke server-side session token before disconnect (best effort)
+                // Small delay improves chance the logout packet is sent before transport closes.
+                if (socket?.connected && sessionToken) {
+                    try {
+                        socket.emit('logout', { session_token: sessionToken });
+                    } catch (err) {
+                        console.warn('⚠️ Failed to emit logout revoke event:', err);
+                    }
+                    setTimeout(() => {
+                        try {
+                            socket.disconnect();
+                        } catch (_) {}
+                    }, 120);
+                } else if (socket) {
                     socket.disconnect();
                 }
 
@@ -597,12 +1160,14 @@ const useInterviewStore = create(
                 localStorage.removeItem('user_id');
                 localStorage.removeItem('onboarding_complete');
                 localStorage.removeItem('user_name');
+                localStorage.removeItem('session_token');
                 localStorage.removeItem('interview-agent-storage'); // Clear zustand persist
 
                 // 3. Reset Store State completely
                 set({
                     userId: null,
                     userEmail: null,
+                    sessionToken: null,
                     socket: null,
                     isConnected: false,
                     onboardingComplete: false,
@@ -618,6 +1183,12 @@ const useInterviewStore = create(
                     analysisProgress: '',
                     targetRole: '',
                     targetCompany: '',
+                    jobDescription: '',
+                    questionCountOverride: null,
+                    interviewerPersona: 'friendly',
+                    piperStyle: 'interviewer',
+                    evaluationThresholds: {},
+                    recordingThresholds: {},
                     focusAreas: [],
                     lastAnalysisTime: null,
 
@@ -628,13 +1199,26 @@ const useInterviewStore = create(
                     ttsAudioQueue: [],
                     isRecording: false,
                     interviewActive: false,
+                    interviewMode: 'practice',
+                    interviewFeedbackTiming: 'end_only',
                     currentQuestion: null,
                     questionNumber: 0,
                     totalQuestions: 0,
                     answerEvaluation: null,
+                    coachingEnabled: false,
                     coachingHint: null,
                     allEvaluations: [],
                     interviewSummary: null,
+                    answerSubmitPending: false,
+                    selectedSession: null,
+                    currentSessionId: null,
+                    retryAttemptsByQuestion: {},
+                    retrySubmitting: {},
+                    retryErrors: {},
+                    interviewHistory: [],
+                    historyLoading: false,
+                    deletingSessionIds: {},
+                    selectedSessionLoading: false,
                     thinkingLog: []
                 });
 
@@ -645,7 +1229,7 @@ const useInterviewStore = create(
 
             // Start interview with context from analysis
             startInterviewPractice: (mode = 'practice') => {
-                const { skillMapping, jobRequirements, readinessScore, focusAreas } = get();
+                const { skillMapping, jobRequirements, readinessScore, focusAreas, jobDescription, questionCountOverride, interviewerPersona, piperStyle } = get();
 
                 const { socket } = get();
                 if (!socket?.connected) {
@@ -661,22 +1245,36 @@ const useInterviewStore = create(
                     skill_gaps: skillGaps,
                     focus_areas: focusAreas,
                     readiness_score: readinessScore,
-                    mode: mode
+                    job_description: jobDescription || '',
+                    question_count: questionCountOverride || undefined,
+                    mode: mode,
+                    coaching_enabled: mode === 'coaching',
+                    feedback_timing: 'end_only',
+                    live_scoring: false,
+                    interviewer_persona: interviewerPersona || 'friendly',
+                    piper_style: normalizePiperStyle(piperStyle, 'interviewer'),
                 });
 
-                set({ appState: APP_STATES.INTERVIEWING });
+                set({
+                    appState: APP_STATES.INTERVIEWING,
+                    interviewMode: mode,
+                    interviewFeedbackTiming: 'end_only',
+                    coachingEnabled: mode === 'coaching',
+                });
                 get().addThinking(`🎙️ Starting ${mode} mode...`);
             },
 
             // Submit answer to current question
             submitInterviewAnswer: (answerText, durationSeconds) => {
-                const { socket } = get();
-                if (!socket?.connected) return;
+                const { socket, answerSubmitPending } = get();
+                if (!socket?.connected || answerSubmitPending) return false;
 
+                set({ answerSubmitPending: true });
                 socket.emit('submit_interview_answer', {
                     answer: answerText,
                     duration_seconds: durationSeconds
                 });
+                return true;
             },
 
             // Toggle coaching mode
@@ -708,11 +1306,6 @@ const useInterviewStore = create(
                 if (socket?.connected) {
                     socket.emit('end_interview_early', {});
                 }
-                // Immediately set app state to go back to map view
-                set({
-                    interviewActive: false,
-                    appState: APP_STATES.MAP_READY
-                });
             },
 
             // Audio Handling
@@ -749,11 +1342,54 @@ const useInterviewStore = create(
             // Set focus areas
             setFocusAreas: (areas) => set({ focusAreas: areas }),
 
+            // Set default interviewer persona for upcoming sessions.
+            setInterviewerPersona: (persona) => {
+                const normalized = String(persona || '').trim().toLowerCase();
+                const allowed = new Set(['friendly', 'strict', 'rapid_fire', 'skeptical']);
+                set({ interviewerPersona: allowed.has(normalized) ? normalized : 'friendly' });
+            },
+
+            // Set default Piper voice style for upcoming sessions.
+            setPiperStyle: (style) => {
+                set({ piperStyle: normalizePiperStyle(style, 'interviewer') });
+            },
+
             // Save user preferences to backend
             savePreferences: (preferences) => {
                 const { socket } = get();
                 if (socket?.connected) {
                     socket.emit('save_preferences', preferences);
+                }
+                if (preferences && typeof preferences === 'object') {
+                    const nextState = {};
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'target_role')) {
+                        nextState.targetRole = preferences.target_role || '';
+                    }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'target_company')) {
+                        nextState.targetCompany = preferences.target_company || '';
+                    }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'job_description')) {
+                        nextState.jobDescription = preferences.job_description || '';
+                    }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'question_count_override')) {
+                        const raw = preferences.question_count_override;
+                        nextState.questionCountOverride =
+                            raw === '' || raw === null || raw === undefined ? null : Number(raw);
+                    }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'interviewer_persona')) {
+                        const normalized = String(preferences.interviewer_persona || '').trim().toLowerCase();
+                        const allowed = new Set(['friendly', 'strict', 'rapid_fire', 'skeptical']);
+                        nextState.interviewerPersona = allowed.has(normalized) ? normalized : 'friendly';
+                    }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'piper_style')) {
+                        nextState.piperStyle = normalizePiperStyle(
+                            preferences.piper_style,
+                            get().piperStyle || 'interviewer'
+                        );
+                    }
+                    if (Object.keys(nextState).length > 0) {
+                        set(nextState);
+                    }
                 }
             },
 
@@ -765,12 +1401,143 @@ const useInterviewStore = create(
                 }
             },
 
-            // Load interview history from backend
-            loadInterviewHistory: () => {
+            // Load latest saved career analysis from backend DB.
+            loadLatestAnalysis: () => {
                 const { socket } = get();
                 if (socket?.connected) {
-                    socket.emit('get_interview_history', { limit: 20 });
+                    socket.emit('get_latest_analysis', {});
                 }
+            },
+
+            // Load interview history from backend
+            loadInterviewHistory: (force = false) => {
+                const { socket, interviewHistory, historyLoading } = get();
+                // Don't re-fetch if already loading or data exists (unless forced)
+                if (!socket?.connected) return;
+                if (historyLoading) return;
+                if (!force && interviewHistory.length > 0) return;
+                set({ historyLoading: true });
+                socket.emit('get_interview_history', { limit: 30 });
+            },
+
+            deleteInterviewHistory: () => {
+                const { socket } = get();
+                if (!socket?.connected) return false;
+                set({ historyLoading: true, selectedSessionLoading: false });
+                socket.emit('delete_interview_history', {});
+                return true;
+            },
+
+            deleteInterviewSession: (sessionId) => {
+                const cleanSessionId = String(sessionId || '').trim();
+                const { socket } = get();
+                if (!socket?.connected || !cleanSessionId) return false;
+                set((state) => ({
+                    historyLoading: true,
+                    selectedSessionLoading: false,
+                    deletingSessionIds: {
+                        ...state.deletingSessionIds,
+                        [cleanSessionId]: true,
+                    },
+                }));
+                socket.emit('delete_interview_session', { session_id: cleanSessionId });
+                return true;
+            },
+
+            clearConfiguration: () => {
+                const { socket } = get();
+                if (!socket?.connected) return false;
+                socket.emit('clear_configuration', {});
+                return true;
+            },
+
+            resetAllData: () => {
+                const { socket } = get();
+                if (!socket?.connected) return false;
+                set({ historyLoading: true, selectedSessionLoading: false });
+                socket.emit('reset_all_data', {});
+                return true;
+            },
+
+            // Load details of a specific session
+            loadSessionDetails: (sessionId) => {
+                const { socket } = get();
+                if (socket?.connected) {
+                    set({ selectedSessionLoading: true, selectedSession: null });
+                    socket.emit('get_session_details', { session_id: sessionId });
+                }
+            },
+
+            // Clear selected session
+            clearSelectedSession: () => set({ selectedSession: null }),
+
+            loadRetryAttempts: (sessionId, questionNumber) => {
+                const { socket } = get();
+                if (!socket?.connected || !sessionId || !questionNumber) return;
+                socket.emit('get_retry_attempts', {
+                    session_id: sessionId,
+                    question_number: Number(questionNumber),
+                });
+            },
+
+            submitRetryAnswer: ({
+                sessionId,
+                questionNumber,
+                answer,
+                durationSeconds = 0,
+                inputMode = 'text',
+            }) => {
+                const { socket } = get();
+                if (!socket?.connected || !sessionId || !questionNumber) return false;
+                const cleanAnswer = String(answer || '').trim();
+                if (!cleanAnswer) return false;
+
+                const key = `${sessionId}:${Number(questionNumber)}`;
+                set((state) => ({
+                    retrySubmitting: { ...state.retrySubmitting, [key]: true },
+                    retryErrors: { ...state.retryErrors, [key]: '' },
+                }));
+
+                socket.emit('submit_retry_answer', {
+                    session_id: sessionId,
+                    question_number: Number(questionNumber),
+                    answer: cleanAnswer,
+                    duration_seconds: Number(durationSeconds || 0),
+                    input_mode: String(inputMode || 'text'),
+                });
+                return true;
+            },
+
+            // Normalize a historical session payload into report-compatible state
+            setReportFromHistorySession: (session) => {
+                if (!session) return;
+
+                const summary = session.summary || {};
+                const evaluations = (session.answers || []).map((answer) => ({
+                    question: {
+                        text: answer.question_text || 'Question',
+                        category: answer.category || 'General',
+                        skill_tested: answer.difficulty || '',
+                        expected_points: [],
+                    },
+                    answer: answer.user_answer || '',
+                    evaluation: answer.evaluation || {},
+                    duration: answer.duration_seconds || 0,
+                }));
+
+                set({
+                    selectedSession: session,
+                    currentSessionId: session.session_id || null,
+                    interviewSummary: {
+                        ...summary,
+                        average_score: session.average_score ?? summary.average_score ?? 0,
+                        total_questions: session.total_questions ?? summary.total_questions ?? evaluations.length,
+                        answered_questions: session.answered_questions ?? summary.answered_questions ?? evaluations.length,
+                    },
+                    allEvaluations: evaluations,
+                    answerSubmitPending: false,
+                    appState: APP_STATES.COMPLETE,
+                });
             },
         }),
 
@@ -779,8 +1546,10 @@ const useInterviewStore = create(
             partialize: (state) => ({
                 // Only persist these fields:
                 userId: state.userId,
+                sessionToken: state.sessionToken,
                 appState: state.appState,
                 onboardingComplete: state.onboardingComplete,
+                darkMode: state.darkMode,
                 mindmap: state.mindmap,
                 readinessScore: state.readinessScore,
                 skillMapping: state.skillMapping,
@@ -789,17 +1558,27 @@ const useInterviewStore = create(
                 resumeData: state.resumeData,
                 targetRole: state.targetRole,
                 targetCompany: state.targetCompany,
+                jobDescription: state.jobDescription,
+                questionCountOverride: state.questionCountOverride,
+                interviewerPersona: state.interviewerPersona,
+                piperStyle: state.piperStyle,
+                evaluationThresholds: state.evaluationThresholds,
+                recordingThresholds: state.recordingThresholds,
                 focusAreas: state.focusAreas,
                 lastAnalysisTime: state.lastAnalysisTime,
                 suggestedSessions: state.suggestedSessions,
                 practicePlan: state.practicePlan,
+                currentSessionId: state.currentSessionId,
+                selectedSession: state.selectedSession,
+                interviewSummary: state.interviewSummary,
+                allEvaluations: state.allEvaluations,
             }),
         }
     )
 );
 
 // Selector to convert isConnected boolean to connectionStatus string
-// This is used by Layout component to show connection indicator
+// Useful for compact network badges in any view.
 export const useConnectionStatus = () => {
     return useInterviewStore((state) =>
         state.isConnected ? 'connected' : 'disconnected'

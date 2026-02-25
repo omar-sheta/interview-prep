@@ -44,3 +44,37 @@ logs/
 node_modules/
 .npm/
 
+# Local runtime/test artifacts (do not ship)
+debug_audio/
+output/
+tmp/
+stitch_screens/
+models/
+third_party/
+persona_generation_results_*.json
+persona_grading_results_*.json
+
+# Audio test files
+*.wav
+
+# Local app data
+user_data/
+
+# Local IDE/assistant state
+.claude/
+
+# Stray binaries/links
+python3
+
+# Backup files
+*.bak
+
+# Probe / utility scripts (not part of app)
+_persona_probe_import.py
+download_stitch.py
+scripts/test_neutts.py
+scripts/test_neutts_output.wav
+scripts/persona_answers_template.json
+scripts/persona_backend_generation_probe.py
+scripts/persona_backend_grading_probe.py
+scripts/sync_features_to_notion.py

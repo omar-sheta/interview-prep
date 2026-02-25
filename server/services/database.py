@@ -2,14 +2,26 @@
 Database service for Qdrant vector database operations.
 """
 
+from typing import Optional
+
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
 from server.config import settings
 
 
-# Initialize Qdrant client with local persistence
-qdrant_client = QdrantClient(path=settings.QDRANT_PATH)
+_qdrant_client: Optional[QdrantClient] = None
+
+
+def get_qdrant_client() -> QdrantClient:
+    """
+    Lazily initialize Qdrant client with local persistence.
+    This avoids lock conflicts during module import when uvicorn reload spawns parent/child.
+    """
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(path=settings.QDRANT_PATH)
+    return _qdrant_client
 
 
 def init_vectors() -> None:
@@ -17,6 +29,7 @@ def init_vectors() -> None:
     Initialize vector collections on application startup.
     Creates the 'interview_questions' collection if it doesn't exist.
     """
+    qdrant_client = get_qdrant_client()
     collection_name = "interview_questions"
     
     # Check if collection already exists
@@ -43,6 +56,7 @@ def check_qdrant_status() -> str:
     Returns 'active' if the client can communicate, 'error' otherwise.
     """
     try:
+        qdrant_client = get_qdrant_client()
         qdrant_client.get_collections()
         return "active"
     except Exception as e:
