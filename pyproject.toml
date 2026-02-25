@@ -21,6 +21,7 @@ pydantic = "^2.9.0"
 # AI/ML (Apple Silicon Optimized)
 mlx-lm = "^0.20.0"
 mlx-whisper = "^0.4.0"
+neutts = "*"
 soundfile = "^0.12.1"
 numpy = "^2.0.0"
 huggingface-hub = "^0.26.0"

@@ -6,10 +6,26 @@ Handles question generation, answer evaluation, and real-time coaching.
 import asyncio
 import json
 import re
+from collections import Counter
 from typing import Any, Callable, Literal, Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+try:
+    from pydantic import BaseModel, Field
+    HAS_PYDANTIC = True
+except Exception:
+    HAS_PYDANTIC = False
 
+    class BaseModel:  # type: ignore[override]
+        """Fallback marker when pydantic is unavailable."""
+        pass
+
+    def Field(default=None, default_factory=None):  # type: ignore[override]
+        if default_factory is not None:
+            return default_factory()
+        return default
+
+from server.config import settings
 from server.services.llm_factory import get_chat_model
 from server.tools.resume_tool import parse_json_safely
 
@@ -25,6 +41,9 @@ class InterviewState(TypedDict):
     job_title: str
     skill_gaps: list[str]
     readiness_score: float
+    interview_type: str
+    interviewer_persona: str
+    question_count: int | None
     
     # Interview session
     mode: InterviewMode
@@ -41,7 +60,183 @@ class InterviewState(TypedDict):
     hint_count: int
 
 
+class GeneratedQuestionSchema(BaseModel):
+    text: str
+    category: str = "Technical"
+    skill_tested: str = "Core competency"
+    difficulty: str = "medium"
+    expected_points: list[str] = Field(default_factory=list)
+    time_estimate_minutes: int = 3
+
+
+class GeneratedQuestionsSchema(BaseModel):
+    questions: list[GeneratedQuestionSchema] = Field(default_factory=list)
+
+
+class EvaluationBreakdownSchema(BaseModel):
+    clarity: float = 5.0
+    accuracy: float = 5.0
+    completeness: float = 5.0
+    structure: float = 5.0
+
+
+class EvaluationResponseSchema(BaseModel):
+    score: float = 5.0
+    score_breakdown: EvaluationBreakdownSchema = Field(default_factory=EvaluationBreakdownSchema)
+    strengths: list[str] = Field(default_factory=list)
+    missing_concepts: list[str] = Field(default_factory=list)
+    coaching_tip: str = ""
+    optimized_answer: str = ""
+    feedback: str = ""
+    rubric_hits: list[str] = Field(default_factory=list)
+    rubric_misses: list[str] = Field(default_factory=list)
+    evidence_quotes: list[str] = Field(default_factory=list)
+    quality_flags: list[str] = Field(default_factory=list)
+    confidence: float = 0.7
+    improvement_plan: dict = Field(default_factory=dict)
+    retry_drill: dict = Field(default_factory=dict)
+
+
+class SummaryResponseSchema(BaseModel):
+    overall_feedback: str = ""
+    top_strengths: list[str] = Field(default_factory=list)
+    areas_to_improve: list[str] = Field(default_factory=list)
+    action_items: list[str] = Field(default_factory=list)
+    communication_feedback: str = ""
+
+
+def _dump_structured(value: Any) -> Any:
+    """Convert pydantic or message objects into plain python dict/list values."""
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, list):
+        return [_dump_structured(item) for item in value]
+    return value
+
+
+def _compute_overall_breakdown(evaluations: list[dict]) -> dict:
+    """
+    Compute average score breakdown across all answered questions.
+    Falls back to per-question score when a dimension is missing.
+    """
+    dims = ("clarity", "accuracy", "completeness", "structure")
+    buckets: dict[str, list[float]] = {k: [] for k in dims}
+
+    for item in evaluations or []:
+        evaluation = (item or {}).get("evaluation") or {}
+        score_default = _clamp_score(evaluation.get("score", 0.0), default=0.0)
+        breakdown = evaluation.get("score_breakdown") or {}
+
+        for dim in dims:
+            value = _clamp_score(breakdown.get(dim, score_default), default=score_default)
+            buckets[dim].append(value)
+
+    result = {}
+    for dim in dims:
+        values = buckets[dim]
+        result[dim] = round(sum(values) / len(values), 1) if values else 0.0
+    return result
+
+
+async def _invoke_structured_output(messages: list, schema_model: type[BaseModel]) -> Optional[dict]:
+    """
+    Prefer schema-bound output when model/backend supports it.
+    Falls back to parser path on unsupported providers/models.
+    """
+    if not HAS_PYDANTIC:
+        return None
+    try:
+        model = get_chat_model()
+        if not hasattr(model, "with_structured_output"):
+            return None
+        structured_model = model.with_structured_output(schema_model)
+        response = await structured_model.ainvoke(messages)
+        payload = _dump_structured(response)
+        if isinstance(payload, dict):
+            return payload
+    except Exception as e:
+        print(f"⚠️ Structured output unavailable, falling back to parser path: {e}")
+    return None
+
+
 # ============== Question Generator ==============
+
+def detect_role_type(job_title: str) -> str:
+    """Classify role family for better interview question mix."""
+    title = (job_title or "").lower()
+    if any(k in title for k in ["engineer", "developer", "architect", "scientist", "analyst", "devops"]):
+        return "tech"
+    if any(k in title for k in ["nurse", "doctor", "clinical", "medical", "therapist"]):
+        return "healthcare"
+    if any(k in title for k in ["designer", "writer", "creative", "content", "brand"]):
+        return "creative"
+    if any(k in title for k in ["manager", "marketing", "sales", "finance", "consultant", "operations"]):
+        return "business"
+    return "general"
+
+
+def _sanitize_questions(raw_questions: list, total_questions: int, job_title: str, skill_gap_names: list[str]) -> list[dict]:
+    """Normalize generated question payload so downstream logic is stable."""
+    cleaned: list[dict] = []
+    for i, q in enumerate(raw_questions[:total_questions]):
+        if not isinstance(q, dict):
+            continue
+        text = str(q.get("text", "")).strip()
+        if not text:
+            continue
+        expected_points = q.get("expected_points") or []
+        if not isinstance(expected_points, list):
+            expected_points = [str(expected_points)]
+        expected_points = [str(p).strip() for p in expected_points if str(p).strip()][:5]
+        if len(expected_points) < 3:
+            expected_points = expected_points + [
+                "Clear structure and context",
+                "Concrete reasoning and trade-offs",
+                "Specific example from experience",
+            ]
+            expected_points = expected_points[:3]
+
+        cleaned.append({
+            "text": text,
+            "category": str(q.get("category", "Technical")).strip() or "Technical",
+            "skill_tested": str(q.get("skill_tested", skill_gap_names[i % len(skill_gap_names)] if skill_gap_names else "Core competency")).strip(),
+            "difficulty": str(q.get("difficulty", "medium")).strip().lower(),
+            "expected_points": expected_points,
+            "time_estimate_minutes": int(q.get("time_estimate_minutes", 3) or 3),
+            "is_followup": bool(q.get("is_followup", False))
+        })
+
+    if len(cleaned) >= total_questions:
+        return cleaned[:total_questions]
+
+    fallback_bank = [
+        ("Behavioral", "medium", "Tell me about a time you faced ambiguity in a project. How did you create clarity and move forward?", ["Situation context", "Decision framework", "Stakeholder communication", "Outcome and lesson"]),
+        ("Technical", "easy", f"Explain the core responsibilities of a {job_title} and how you prioritize them.", ["Core responsibilities", "Prioritization approach", "Trade-offs", "Example"]),
+        ("Technical", "medium", "Walk me through a design or process decision you made and why you chose that approach over alternatives.", ["Problem framing", "Alternatives considered", "Reasoning and trade-offs", "Results"]),
+        ("Behavioral", "medium", "Describe a difficult collaboration moment and how you handled disagreement constructively.", ["Conflict context", "Communication approach", "Resolution", "Takeaway"]),
+        ("Technical", "hard", "If performance or quality dropped unexpectedly, how would you diagnose and recover?", ["Debug/triage plan", "Hypothesis-driven steps", "Metrics/signals", "Preventive actions"]),
+        ("Behavioral", "medium", "Share an example of feedback you received that changed your approach.", ["Feedback source", "Behavior change", "Evidence of improvement", "Reflection"]),
+        ("Technical", "hard", "What risks do teams overlook most often in this kind of work, and how do you mitigate them?", ["Risk identification", "Impact assessment", "Mitigations", "Monitoring"]),
+    ]
+
+    idx = 0
+    while len(cleaned) < total_questions:
+        category, difficulty, text, expected_points = fallback_bank[idx % len(fallback_bank)]
+        skill_name = skill_gap_names[idx % len(skill_gap_names)] if skill_gap_names else "Core competency"
+        cleaned.append({
+            "text": text,
+            "category": category,
+            "skill_tested": skill_name,
+            "difficulty": difficulty,
+            "expected_points": expected_points[:5],
+            "time_estimate_minutes": 3,
+            "is_followup": False
+        })
+        idx += 1
+
+    return cleaned[:total_questions]
 
 async def generate_interview_questions(
     state: InterviewState,
@@ -51,13 +246,52 @@ async def generate_interview_questions(
     Generate 5-10 personalized questions based on skill gaps.
     
     Logic:
-    - If readiness < 0.5: Generate fundamental/easy questions
-    - If readiness 0.5-0.7: Mix of fundamental + intermediate
-    - If readiness > 0.7: Challenging questions
+    - If readiness < READINESS_LOW_CUTOFF: Generate fundamental/easy questions
+    - If readiness in [READINESS_LOW_CUTOFF, READINESS_MID_CUTOFF): Mix of fundamental + intermediate
+    - If readiness >= READINESS_MID_CUTOFF: Challenging questions
     """
     skill_gaps = state.get("skill_gaps", [])
     job_title = state.get("job_title", "Software Engineer")
     readiness = state.get("readiness_score", 0.5)
+    interview_type = str(state.get("interview_type", "mixed") or "mixed").strip().lower()
+    interviewer_persona = str(state.get("interviewer_persona", "friendly") or "friendly").strip().lower()
+    if interviewer_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        interviewer_persona = "friendly"
+    persona_profiles = {
+        "friendly": {
+            "label": "Friendly",
+            "tone": "Warm, encouraging, and collaborative while still rigorous.",
+            "rules": [
+                "Use approachable language without reducing difficulty.",
+                "Frame prompts in a supportive, confidence-building tone.",
+            ],
+        },
+        "strict": {
+            "label": "Strict",
+            "tone": "Direct, high-bar, and precision-focused.",
+            "rules": [
+                "Use concise wording that demands specific, measurable answers.",
+                "Prefer prompts that expose gaps in structure and rigor.",
+            ],
+        },
+        "rapid_fire": {
+            "label": "Rapid-Fire",
+            "tone": "Fast-paced and intense with short, sharp prompts.",
+            "rules": [
+                "Keep each question compact and quick to parse.",
+                "Favor pressure-style prompts that test response agility.",
+            ],
+        },
+        "skeptical": {
+            "label": "Skeptical",
+            "tone": "Challenging and evidence-oriented with probing skepticism.",
+            "rules": [
+                "Favor prompts that test assumptions, proof, and trade-offs.",
+                "Push for concrete evidence and defensible reasoning.",
+            ],
+        },
+    }
+    persona_profile = persona_profiles[interviewer_persona]
 
     # Extract skill names if they are dictionaries (new format)
     skill_gap_names = []
@@ -72,60 +306,164 @@ async def generate_interview_questions(
             await progress_callback("status", msg)
         print(f"📊 {msg}")
     
-    await emit(f"Generating questions for {job_title}...")
-    
-    # Determine difficulty distribution (3 questions for testing)
-    if readiness < 0.5:
-        difficulty_mix = {"easy": 2, "medium": 1, "hard": 0}
-        total_questions = 3
-    elif readiness < 0.7:
-        difficulty_mix = {"easy": 1, "medium": 1, "hard": 1}
-        total_questions = 3
+    await emit(f"Generating adaptive questions for {job_title}...")
+
+    requested_count = state.get("question_count")
+    if requested_count is not None:
+        try:
+            requested_count = int(requested_count)
+            requested_count = max(1, min(12, requested_count))
+        except Exception:
+            requested_count = None
+
+    if requested_count is not None:
+        total_questions = requested_count
+        difficulty_mix = f"adaptive mix across {total_questions} question(s)"
+    elif readiness < settings.READINESS_LOW_CUTOFF:
+        total_questions = 5
+        difficulty_mix = "3 easy, 2 medium, 0 hard"
+    elif readiness < settings.READINESS_MID_CUTOFF:
+        total_questions = 6
+        difficulty_mix = "2 easy, 3 medium, 1 hard"
     else:
-        difficulty_mix = {"easy": 0, "medium": 2, "hard": 1}
-        total_questions = 3
-    
-    system_prompt = f"""You are an expert technical interviewer for {job_title} positions.
+        total_questions = 7
+        difficulty_mix = "1 easy, 3 medium, 3 hard"
+
+    role_type = detect_role_type(job_title)
+    role_mix = {
+        "tech": "40% technical concepts, 25% system design, 20% behavioral, 15% troubleshooting",
+        "business": "35% role-specific execution, 35% behavioral/situational, 20% strategy, 10% analytics",
+        "healthcare": "40% clinical/role-specific judgement, 30% situational response, 20% communication, 10% ethics",
+        "creative": "35% portfolio/process, 30% collaboration, 20% strategy, 15% delivery",
+        "general": "35% role execution, 35% behavioral, 20% problem-solving, 10% communication"
+    }[role_type]
+
+    type_overrides = {
+        "behavioral": {
+            "mix": "70% behavioral/situational, 20% communication, 10% reflection/growth",
+            "requirements": [
+                "At least 3 behavioral/situational questions",
+                "Use prompts that encourage STAR-style answers",
+                "Minimize deeply technical architecture prompts",
+            ],
+        },
+        "technical": {
+            "mix": "65% technical reasoning, 25% troubleshooting, 10% behavioral",
+            "requirements": [
+                "At least 3 role-specific technical reasoning questions",
+                "Include practical debugging and trade-off questions",
+                "Avoid purely culture-fit prompts dominating the set",
+            ],
+        },
+        "system_design": {
+            "mix": "70% system design/architecture, 20% reliability/performance, 10% behavioral",
+            "requirements": [
+                "At least 3 architecture/scalability design prompts",
+                "Emphasize trade-offs, bottlenecks, and failure modes",
+                "Do not ask coding implementation questions",
+            ],
+        },
+        "mixed": {
+            "mix": role_mix,
+            "requirements": [
+                "At least 2 behavioral/situational questions",
+                "At least 2 role-specific technical/reasoning questions",
+                "Questions should progressively get harder",
+            ],
+        },
+    }
+    interview_track = type_overrides.get(interview_type, type_overrides["mixed"])
+    effective_role_mix = interview_track["mix"]
+    type_requirements = "\n".join([f"- {line}" for line in interview_track["requirements"]])
+
+    # Get job description context if available
+    job_description = state.get("job_description", "")
+    jd_context = f"\n- Job Description: {job_description[:500]}" if job_description else ""
+
+    system_prompt = f"""You are an expert interviewer for {job_title} positions.
 
 CANDIDATE CONTEXT:
 - Readiness Score: {int(readiness * 100)}%
-- Skill Gaps: {', '.join(skill_gap_names[:8]) if skill_gap_names else 'General skills'}
+- Role Family: {role_type}
+- Selected Interview Type: {interview_type}
+- Interviewer Persona: {persona_profile["label"]}
+- Skill Gaps: {', '.join(skill_gap_names[:8]) if skill_gap_names else 'General skills'}{jd_context}
 
-TASK: Generate {total_questions} interview questions that:
-1. Focus on their weak areas ({', '.join(skill_gap_names[:3]) if skill_gap_names else 'core competencies'})
-2. Follow this difficulty distribution: {difficulty_mix}
-3. Cover different question types (60% technical, 30% system design, 10% behavioral)
+TASK: Generate exactly {total_questions} interview questions for realistic interview practice.
+
+PEDAGOGY REQUIREMENTS:
+- Difficulty mix: {difficulty_mix}
+- Category mix target: {effective_role_mix}
+- Track-specific requirements:
+{type_requirements}
+- Focus at least half of questions on weak areas: {', '.join(skill_gap_names[:5]) if skill_gap_names else 'core role competencies'}
+- Persona tone: {persona_profile["tone"]}
+- Persona rules:
+{chr(10).join([f"- {rule}" for rule in persona_profile["rules"]])}
+
+CRITICAL RULES:
+- Questions must be answerable by SPEAKING (not writing code)
+- NO coding questions, NO "write a function", NO algorithm implementation
+- Technical questions should test understanding and reasoning, not syntax
+- Questions should relate to the candidate's skill gaps and the target role
+- Include 3-5 expected talking points for evaluation
+- Keep each question to one prompt (no multi-part nested prompts)
+- Output ONLY valid JSON (no markdown, no prose)
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
   "questions": [
     {{
       "text": "Clear, specific question",
-      "category": "Core Concepts|System Design|Behavioral|Debugging",
+      "category": "Behavioral",
       "skill_tested": "specific skill",
-      "difficulty": "easy|medium|hard",
+      "difficulty": "medium",
+      "expected_points": ["point 1", "point 2", "point 3"],
+      "time_estimate_minutes": 3
+    }},
+    {{
+      "text": "Clear, specific question",
+      "category": "Technical",
+      "skill_tested": "specific skill",
+      "difficulty": "medium",
       "expected_points": ["point 1", "point 2", "point 3"],
       "time_estimate_minutes": 3
     }}
   ]
 }}
 
-RULES:
-- Questions must be specific and testable
-- Include 3-5 expected talking points for evaluation
-- Easy questions: definition/explanation
-- Medium questions: implementation/comparison
-- Hard questions: design/optimization/edge cases
-- Output ONLY valid JSON, no markdown code blocks"""
+"""
 
-    user_msg = f"Generate {total_questions} interview questions for: {job_title}\nFocus on: {', '.join(skill_gap_names[:5]) if skill_gap_names else 'general technical skills'}"
+    user_msg = (
+        f"Generate {total_questions} speech-based interview questions for {job_title}. "
+        f"Interview type={interview_type}. "
+        f"Interviewer persona={interviewer_persona}. "
+        f"Readiness={int(readiness * 100)}%. "
+        f"Prioritize these gaps: {', '.join(skill_gap_names[:5]) if skill_gap_names else 'general competencies'}."
+    )
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_msg)
+    ]
 
     try:
+        structured_payload = await _invoke_structured_output(messages, GeneratedQuestionsSchema)
+        if structured_payload and "questions" in structured_payload:
+            questions = _sanitize_questions(
+                raw_questions=structured_payload.get("questions", []),
+                total_questions=total_questions,
+                job_title=job_title,
+                skill_gap_names=skill_gap_names
+            )
+            if questions:
+                await emit(f"✅ Generated {len(questions)} questions (structured)")
+                return {
+                    **state,
+                    "questions": questions,
+                    "current_question_index": 0
+                }
+
         chat_model = get_chat_model()
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_msg)
-        ]
         
         print("\n🤖 Generating interview questions...")
         print("-" * 40)
@@ -143,45 +481,31 @@ RULES:
         
         if not questions_data or "questions" not in questions_data:
             raise ValueError("Failed to parse questions")
-        
-        await emit(f"✅ Generated {len(questions_data['questions'])} questions")
+
+        questions = _sanitize_questions(
+            raw_questions=questions_data.get("questions", []),
+            total_questions=total_questions,
+            job_title=job_title,
+            skill_gap_names=skill_gap_names
+        )
+
+        await emit(f"✅ Generated {len(questions)} questions")
         
         return {
             **state,
-            "questions": questions_data["questions"],
+            "questions": questions,
             "current_question_index": 0
         }
         
     except Exception as e:
         print(f"❌ Question generation error: {e}")
         
-        # Fallback questions
-        fallback_questions = [
-            {
-                "text": f"Tell me about your experience with {skill_gap_names[0] if skill_gap_names else 'your main technology stack'}.",
-                "category": "Behavioral",
-                "skill_tested": skill_gap_names[0] if skill_gap_names else "General",
-                "difficulty": "easy",
-                "expected_points": ["Background", "Specific projects", "Lessons learned"],
-                "time_estimate_minutes": 3
-            },
-            {
-                "text": f"What are the key considerations when designing a scalable system?",
-                "category": "System Design",
-                "skill_tested": "System Design",
-                "difficulty": "medium",
-                "expected_points": ["Load balancing", "Caching", "Database sharding", "Horizontal scaling"],
-                "time_estimate_minutes": 5
-            },
-            {
-                "text": "Walk me through how you would debug a production issue that only occurs intermittently.",
-                "category": "Debugging",
-                "skill_tested": "Problem Solving",
-                "difficulty": "medium",
-                "expected_points": ["Logging", "Monitoring", "Reproduction steps", "Root cause analysis"],
-                "time_estimate_minutes": 4
-            }
-        ]
+        fallback_questions = _sanitize_questions(
+            raw_questions=[],
+            total_questions=total_questions,
+            job_title=job_title,
+            skill_gap_names=skill_gap_names
+        )
         
         return {
             **state,
@@ -201,9 +525,9 @@ async def detect_struggle_and_coach(
     Detect if candidate is struggling and provide a hint.
     
     Struggle indicators:
-    - Silence > 8 seconds
-    - Many filler words (um, uh, like > 8 occurrences)
-    - Answer length < 20 words after 30 seconds
+    - Silence > configured silence threshold
+    - Many filler words > configured filler limit
+    - Very short answer after configured silence window
     
     Returns hint if struggling, None otherwise.
     """
@@ -217,18 +541,18 @@ async def detect_struggle_and_coach(
     
     # Determine if struggling
     is_struggling = (
-        silence_duration_seconds > 8.0 or
-        filler_count > 8 or
-        (word_count < 15 and silence_duration_seconds > 25)
+        silence_duration_seconds > settings.COACH_SILENCE_SECONDS or
+        filler_count > settings.COACH_FILLER_LIMIT or
+        (word_count < settings.COACH_SHORT_ANSWER_WORDS and silence_duration_seconds > settings.COACH_SHORT_ANSWER_SILENCE_SECONDS)
     )
     
     if not is_struggling:
         return None
     
     # Determine trigger type
-    if silence_duration_seconds > 8.0:
+    if silence_duration_seconds > settings.COACH_SILENCE_SECONDS:
         trigger = "silence"
-    elif filler_count > 8:
+    elif filler_count > settings.COACH_FILLER_LIMIT:
         trigger = "filler_words"
     else:
         trigger = "short_answer"
@@ -287,6 +611,309 @@ They seem stuck ({trigger}). Give a helpful hint (not the answer)."""
 
 
 # ============== Interview Summary Generator ==============
+
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "i", "if",
+    "in", "is", "it", "of", "on", "or", "our", "that", "the", "their", "there", "they",
+    "this", "to", "was", "we", "were", "what", "when", "where", "which", "who", "why",
+    "with", "you", "your", "about", "into", "through", "while", "during", "did", "do",
+}
+
+STRUCTURE_MARKERS = {
+    "first", "second", "third", "finally", "because", "therefore", "however", "then",
+    "result", "outcome", "impact", "situation", "task", "action", "lesson", "tradeoff",
+}
+
+TECH_TOKEN_MAP = {
+    "c++": "cpp",
+    "cplusplus": "cpp",
+    "c#": "csharp",
+    "f#": "fsharp",
+    ".net": "dotnet",
+    "asp.net": "aspdotnet",
+    "node.js": "nodejs",
+    "next.js": "nextjs",
+    "nuxt.js": "nuxtjs",
+    "vue.js": "vuejs",
+    "react.js": "reactjs",
+    "ci/cd": "cicd",
+}
+
+
+def resolve_feedback_thresholds(overrides: Optional[dict] = None) -> dict:
+    """Resolve strictness thresholds from settings with optional per-user overrides."""
+    def _cfg(name: str, default: Any) -> Any:
+        return getattr(settings, name, default)
+
+    base = {
+        "short_answer_words": int(_cfg("EVAL_SHORT_ANSWER_WORDS", 10)),
+        "transcript_low_words": int(_cfg("EVAL_TRANSCRIPT_LOW_WORDS", 8)),
+        "repetition_ratio_cap": float(_cfg("EVAL_REPETITION_RATIO_CAP", 0.42)),
+        "quality_repetition_ratio_flag": float(_cfg("EVAL_QUALITY_REPETITION_RATIO_FLAG", 0.45)),
+        "unique_word_ratio_min": float(_cfg("EVAL_UNIQUE_WORD_RATIO_MIN", 0.40)),
+        "quality_unique_word_ratio_flag": float(_cfg("EVAL_QUALITY_UNIQUE_WORD_RATIO_FLAG", 0.35)),
+        "gibberish_ratio_threshold": float(_cfg("EVAL_GIBBERISH_RATIO_THRESHOLD", 0.28)),
+        "structure_markers_min": int(_cfg("EVAL_STRUCTURE_MARKERS_MIN", 2)),
+        "structure_sentence_cap": int(_cfg("EVAL_STRUCTURE_SENTENCE_CAP", 2)),
+        "low_relevance_threshold": float(_cfg("EVAL_LOW_RELEVANCE_THRESHOLD", 0.12)),
+        "coverage_min": float(_cfg("EVAL_COVERAGE_MIN", 0.40)),
+        "low_transcript_penalty": float(_cfg("EVAL_LOW_TRANSCRIPT_PENALTY", 1.0)),
+        "low_transcript_confidence_cap": float(_cfg("EVAL_LOW_TRANSCRIPT_CONFIDENCE_CAP", 0.45)),
+        "accuracy_cap_low_relevance": float(_cfg("EVAL_ACCURACY_CAP_LOW_RELEVANCE", 3.0)),
+        "clarity_cap_repetition": float(_cfg("EVAL_CLARITY_CAP_REPETITION", 3.0)),
+        "completeness_cap_low_coverage": float(_cfg("EVAL_COMPLETENESS_CAP_LOW_COVERAGE", 4.0)),
+        "structure_cap_weak": float(_cfg("EVAL_STRUCTURE_CAP_WEAK", 4.0)),
+        "expected_overlap_min": 0.35,
+        "high_repetition_ngram_len": 3,
+    }
+    if not isinstance(overrides, dict):
+        return base
+
+    merged = dict(base)
+    for key, default_value in base.items():
+        if key not in overrides:
+            continue
+        try:
+            if isinstance(default_value, int):
+                merged[key] = int(overrides[key])
+            elif isinstance(default_value, float):
+                merged[key] = float(overrides[key])
+        except Exception:
+            continue
+
+    # Boundaries
+    merged["short_answer_words"] = max(1, min(50, merged["short_answer_words"]))
+    merged["transcript_low_words"] = max(1, min(50, merged["transcript_low_words"]))
+    merged["repetition_ratio_cap"] = max(0.1, min(0.95, merged["repetition_ratio_cap"]))
+    merged["quality_repetition_ratio_flag"] = max(0.1, min(0.99, merged["quality_repetition_ratio_flag"]))
+    merged["unique_word_ratio_min"] = max(0.1, min(0.95, merged["unique_word_ratio_min"]))
+    merged["quality_unique_word_ratio_flag"] = max(0.1, min(0.95, merged["quality_unique_word_ratio_flag"]))
+    merged["gibberish_ratio_threshold"] = max(0.05, min(0.95, merged["gibberish_ratio_threshold"]))
+    merged["structure_markers_min"] = max(0, min(8, merged["structure_markers_min"]))
+    merged["structure_sentence_cap"] = max(1, min(8, merged["structure_sentence_cap"]))
+    merged["low_relevance_threshold"] = max(0.01, min(0.9, merged["low_relevance_threshold"]))
+    merged["coverage_min"] = max(0.05, min(0.95, merged["coverage_min"]))
+    merged["low_transcript_penalty"] = max(0.0, min(4.0, merged["low_transcript_penalty"]))
+    merged["low_transcript_confidence_cap"] = max(0.1, min(0.95, merged["low_transcript_confidence_cap"]))
+    merged["accuracy_cap_low_relevance"] = max(0.0, min(10.0, merged["accuracy_cap_low_relevance"]))
+    merged["clarity_cap_repetition"] = max(0.0, min(10.0, merged["clarity_cap_repetition"]))
+    merged["completeness_cap_low_coverage"] = max(0.0, min(10.0, merged["completeness_cap_low_coverage"]))
+    merged["structure_cap_weak"] = max(0.0, min(10.0, merged["structure_cap_weak"]))
+    merged["expected_overlap_min"] = max(0.1, min(0.95, merged["expected_overlap_min"]))
+    merged["high_repetition_ngram_len"] = max(2, min(6, merged["high_repetition_ngram_len"]))
+    return merged
+
+
+def _tokenize_words(text: str) -> list[str]:
+    normalized_text = (text or "").lower()
+    # Normalize tech terms before tokenization so punctuation-heavy tokens survive.
+    for raw, mapped in sorted(TECH_TOKEN_MAP.items(), key=lambda item: len(item[0]), reverse=True):
+        normalized_text = normalized_text.replace(raw, mapped)
+
+    raw_tokens = re.findall(r"[a-z0-9][a-z0-9+#./'-]*", normalized_text)
+    normalized_tokens: list[str] = []
+    for token in raw_tokens:
+        t = token.strip(".'-")
+        if not t:
+            continue
+        t = TECH_TOKEN_MAP.get(t, t)
+        t = (
+            t.replace("node.js", "nodejs")
+             .replace("next.js", "nextjs")
+             .replace("react.js", "reactjs")
+             .replace(".net", "dotnet")
+             .replace("c++", "cpp")
+             .replace("c#", "csharp")
+        )
+        t = t.replace("/", "")
+        t = re.sub(r"[^a-z0-9+#']", "", t)
+        if t:
+            normalized_tokens.append(t)
+    return normalized_tokens
+
+
+def _keywordize(text: str) -> list[str]:
+    return [w for w in _tokenize_words(text) if len(w) > 2 and w not in STOPWORDS]
+
+
+def _estimate_relevance(question_text: str, answer_text: str) -> float:
+    q = set(_keywordize(question_text))
+    a = set(_keywordize(answer_text))
+    if not q:
+        return 0.5
+    overlap = len(q & a)
+    return overlap / len(q)
+
+
+def _split_answer_chunks(answer_text: str) -> list[str]:
+    text = (answer_text or "").strip()
+    if not text:
+        return []
+    chunks = [c.strip() for c in re.split(r"(?<=[.!?])\s+|\n+", text) if c.strip()]
+    if chunks:
+        return chunks
+    words = text.split()
+    return [" ".join(words[i:i + 18]) for i in range(0, len(words), 18)]
+
+
+def _longest_repeated_ngram(tokens: list[str], n: int = 3) -> int:
+    if len(tokens) < n:
+        return 0
+    grams = [" ".join(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
+    counts = Counter(grams)
+    repeated = [len(g.split()) for g, c in counts.items() if c > 1]
+    return max(repeated) if repeated else 0
+
+
+def _estimate_gibberish_ratio(tokens: list[str]) -> float:
+    if not tokens:
+        return 1.0
+    weird = 0
+    for token in tokens:
+        has_vowel = bool(re.search(r"[aeiou]", token))
+        repeats = bool(re.search(r"(.)\1\1\1", token))
+        if (not has_vowel and len(token) > 3) or repeats:
+            weird += 1
+    return weird / max(len(tokens), 1)
+
+
+def compute_quality_signals(answer: str, thresholds: Optional[dict] = None) -> dict:
+    t = resolve_feedback_thresholds(thresholds)
+    words = _tokenize_words(answer)
+    unique_ratio = len(set(words)) / max(len(words), 1)
+    sentence_count = len(_split_answer_chunks(answer))
+    repetition_ratio = 1.0 - unique_ratio if words else 1.0
+    repeated_ngram = _longest_repeated_ngram(words, n=t["high_repetition_ngram_len"])
+    gibberish_ratio = _estimate_gibberish_ratio(words)
+    markers_hit = len({w for w in words if w in STRUCTURE_MARKERS})
+
+    flags: list[str] = []
+    if len(words) < t["short_answer_words"]:
+        flags.append("short_answer")
+    if repetition_ratio > t["quality_repetition_ratio_flag"] or repeated_ngram >= t["high_repetition_ngram_len"]:
+        flags.append("high_repetition")
+    if unique_ratio < t["quality_unique_word_ratio_flag"]:
+        flags.append("low_lexical_diversity")
+    if markers_hit < t["structure_markers_min"] and sentence_count <= t["structure_sentence_cap"]:
+        flags.append("weak_structure")
+    if gibberish_ratio > t["gibberish_ratio_threshold"]:
+        flags.append("possible_gibberish")
+    if (
+        len(words) < t["transcript_low_words"]
+        or gibberish_ratio > t["gibberish_ratio_threshold"]
+        or (unique_ratio < t["quality_unique_word_ratio_flag"] and repetition_ratio > t["quality_repetition_ratio_flag"])
+    ):
+        flags.append("low_transcript_quality")
+
+    confidence = 0.9
+    if "low_transcript_quality" in flags:
+        confidence = 0.35
+    elif "high_repetition" in flags:
+        confidence = 0.55
+    elif "weak_structure" in flags:
+        confidence = 0.65
+
+    return {
+        "word_count": len(words),
+        "unique_word_ratio": round(unique_ratio, 3),
+        "repetition_ratio": round(repetition_ratio, 3),
+        "sentence_count": sentence_count,
+        "longest_repeated_ngram": repeated_ngram,
+        "gibberish_ratio": round(gibberish_ratio, 3),
+        "structure_markers_hit": markers_hit,
+        "quality_flags": flags,
+        "confidence": round(max(0.1, min(0.95, confidence)), 2),
+    }
+
+
+def _evaluate_expected_point_coverage(
+    answer: str,
+    expected_points: list[str],
+    thresholds: Optional[dict] = None
+) -> tuple[list[str], list[str], float]:
+    if not expected_points:
+        return [], [], 0.5
+    t = resolve_feedback_thresholds(thresholds)
+
+    answer_keywords = set(_keywordize(answer))
+    hits: list[str] = []
+    misses: list[str] = []
+    for point in expected_points:
+        point_text = str(point).strip()
+        point_keywords = set(_keywordize(point_text))
+        if not point_keywords:
+            misses.append(point_text)
+            continue
+        overlap_ratio = len(answer_keywords & point_keywords) / len(point_keywords)
+        if overlap_ratio >= t["expected_overlap_min"]:
+            hits.append(point_text)
+        else:
+            misses.append(point_text)
+
+    coverage = len(hits) / max(len(expected_points), 1)
+    return hits, misses, round(coverage, 3)
+
+
+def _extract_evidence_quotes(answer: str, expected_points: list[str], max_quotes: int = 2) -> list[str]:
+    chunks = _split_answer_chunks(answer)
+    if not chunks:
+        return []
+
+    keywords = set()
+    for point in expected_points[:6]:
+        keywords.update(_keywordize(point))
+
+    ranked: list[tuple[int, str]] = []
+    for chunk in chunks:
+        chunk_tokens = set(_keywordize(chunk))
+        hit_count = len(chunk_tokens & keywords)
+        ranked.append((hit_count, chunk))
+
+    ranked.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+    selected = []
+    for _, chunk in ranked:
+        quote = chunk.strip()
+        if len(quote) > 180:
+            quote = f"{quote[:177]}..."
+        if quote and quote not in selected:
+            selected.append(quote)
+        if len(selected) >= max_quotes:
+            break
+
+    return selected
+
+
+def _build_improvement_plan(rubric_misses: list[str], expected_points: list[str], question_text: str) -> dict:
+    misses = [m for m in rubric_misses if m][:3]
+    if not misses:
+        misses = [str(p).strip() for p in expected_points[:2] if str(p).strip()]
+
+    focus = misses[0] if misses else "structured, evidence-based response"
+    steps = [
+        f"Lead with a direct answer to the question about {focus}.",
+        "Add one concrete example from your experience with context and constraints.",
+        "Close with measurable impact and one trade-off you considered.",
+    ]
+    success_criteria = [
+        "Mentions at least 2 expected points explicitly.",
+        "Includes one concrete metric, result, or business impact.",
+        "Follows clear structure: context -> action -> outcome.",
+    ]
+    drill_prompt = (
+        f"Retry this question in 90 seconds: {question_text}. "
+        f"Prioritize: {', '.join(misses[:3])}."
+    ).strip()
+
+    return {
+        "focus": focus,
+        "steps": steps,
+        "success_criteria": success_criteria,
+        "retry_drill": {
+            "prompt": drill_prompt,
+            "target_points": misses[:3] if misses else expected_points[:3],
+        },
+    }
+
 
 def analyze_transcript(transcript: str, duration_seconds: float) -> dict:
     """
@@ -355,15 +982,23 @@ def analyze_transcript(transcript: str, duration_seconds: float) -> dict:
 
 async def generate_interview_summary(evaluations: list[dict]) -> dict:
     """Generate an LLM-powered overall summary of the interview performance."""
-    from collections import Counter
-
     if not evaluations:
+        empty_breakdown = {
+            "clarity": 0.0,
+            "accuracy": 0.0,
+            "completeness": 0.0,
+            "structure": 0.0,
+        }
         return {
             "total_questions": 0,
             "average_score": 0,
+            "overall_breakdown": empty_breakdown,
+            "score_breakdown": empty_breakdown,
             "top_strengths": [],
             "areas_to_improve": [],
             "overall_feedback": "No questions were answered.",
+            "priority_focus": "Provide structured answers with concrete evidence",
+            "quality_risks": [],
             "telemetry": {
                 "pace": 0, "fillerWords": 0, "confidence": "N/A",
                 "word_count": 0, "filler_detail": {},
@@ -373,16 +1008,20 @@ async def generate_interview_summary(evaluations: list[dict]) -> dict:
     # ---------- basic stats ----------
     scores = [e.get("evaluation", {}).get("score", 0) for e in evaluations]
     avg_score = sum(scores) / len(scores) if scores else 0
+    overall_breakdown = _compute_overall_breakdown(evaluations)
 
     all_strengths = []
     all_missing = []
+    all_quality_flags = []
     for e in evaluations:
         eval_data = e.get("evaluation", {})
         all_strengths.extend(eval_data.get("strengths", []))
-        all_missing.extend(eval_data.get("missing_concepts", []))
+        all_missing.extend(eval_data.get("rubric_misses") or eval_data.get("missing_concepts", []))
+        all_quality_flags.extend(eval_data.get("quality_flags", []))
 
     top_strengths = [item for item, _ in Counter(all_strengths).most_common(5)]
     areas_to_improve = [item for item, _ in Counter(all_missing).most_common(5)]
+    top_quality_risks = [item for item, _ in Counter(all_quality_flags).most_common(3)]
 
     # ---------- transcript analytics ----------
     combined_transcript = " ".join(e.get("answer", "") for e in evaluations)
@@ -397,10 +1036,11 @@ async def generate_interview_summary(evaluations: list[dict]) -> dict:
         score = e.get("evaluation", {}).get("score", 0)
         answer_snippet = (e.get("answer", "") or "")[:300]
         strengths = e.get("evaluation", {}).get("strengths", [])
-        missing = e.get("evaluation", {}).get("missing_concepts", [])
+        missing = e.get("evaluation", {}).get("rubric_misses") or e.get("evaluation", {}).get("missing_concepts", [])
+        flags = e.get("evaluation", {}).get("quality_flags", [])
         qa_digest.append(
             f"Q{i}: {q_text}\n"
-            f"  Score: {score}/10 | Strengths: {', '.join(strengths[:3])} | Gaps: {', '.join(missing[:3])}\n"
+            f"  Score: {score}/10 | Strengths: {', '.join(strengths[:3])} | Gaps: {', '.join(missing[:3])} | Quality Flags: {', '.join(flags[:2])}\n"
             f"  Answer excerpt: \"{answer_snippet}\""
         )
 
@@ -430,35 +1070,43 @@ SPEECH ANALYTICS:
 Provide a holistic summary. Output valid JSON only:"""
 
     llm_summary = None
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
     try:
-        chat_model = get_chat_model()
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
+        llm_summary = await _invoke_structured_output(messages, SummaryResponseSchema)
+    except Exception:
+        llm_summary = None
 
-        raw = ""
-        async for chunk in chat_model.astream(messages):
-            if chunk.content:
-                raw += chunk.content
-
-        # Parse
-        clean = raw.strip()
-        if "```" in clean:
-            match = re.search(r'```(?:json)?\s*([\s\S]*?)```', clean)
-            if match:
-                clean = match.group(1).strip()
+    if llm_summary is None:
         try:
-            llm_summary = json.loads(clean)
-        except json.JSONDecodeError:
-            try:
-                from json_repair import repair_json
-                llm_summary = json.loads(repair_json(clean))
-            except Exception:
-                llm_summary = None
+            chat_model = get_chat_model()
 
-    except Exception as e:
-        print(f"⚠️ LLM summary generation failed, using stats-only: {e}")
+            raw = ""
+            async for chunk in chat_model.astream(messages):
+                if chunk.content:
+                    raw += chunk.content
+
+            # Parse
+            clean = raw.strip()
+            # Strip <think>...</think> blocks (qwen3 reasoning traces)
+            clean = re.sub(r'<think>[\s\S]*?</think>', '', clean).strip()
+            if "```" in clean:
+                match = re.search(r'```(?:json)?\s*([\s\S]*?)```', clean)
+                if match:
+                    clean = match.group(1).strip()
+            try:
+                llm_summary = json.loads(clean)
+            except json.JSONDecodeError:
+                try:
+                    from json_repair import repair_json
+                    llm_summary = json.loads(repair_json(clean))
+                except Exception:
+                    llm_summary = None
+
+        except Exception as e:
+            print(f"⚠️ LLM summary generation failed, using stats-only: {e}")
 
     # Merge LLM insights with computed stats
     if llm_summary:
@@ -481,7 +1129,10 @@ Provide a holistic summary. Output valid JSON only:"""
     return {
         "total_questions": len(evaluations),
         "average_score": round(avg_score, 1),
+        "overall_breakdown": overall_breakdown,
+        "score_breakdown": overall_breakdown,
         "top_strengths": top_strengths[:3],
+        "strengths": top_strengths[:3],
         "areas_to_improve": areas_to_improve[:3],
         "overall_feedback": overall_feedback,
         "action_items": action_items,
@@ -491,6 +1142,8 @@ Provide a holistic summary. Output valid JSON only:"""
             "good": sum(1 for s in scores if 6 <= s < 8),
             "needs_work": sum(1 for s in scores if s < 6),
         },
+        "priority_focus": (areas_to_improve[0] if areas_to_improve else "Provide clearer structure and evidence"),
+        "quality_risks": top_quality_risks,
         "telemetry": {
             "pace": telemetry["words_per_minute"],
             "fillerWords": telemetry["filler_word_count"],
@@ -501,7 +1154,165 @@ Provide a holistic summary. Output valid JSON only:"""
         },
     }
 
-async def evaluate_answer_stream(question, answer, callback):
+def _clamp_score(value: Any, default: float = 5.0) -> float:
+    try:
+        score = float(value)
+    except Exception:
+        score = float(default)
+    return max(0.0, min(10.0, score))
+
+
+def _normalize_evaluation_payload(
+    evaluation: dict,
+    expected_points: list[str],
+    question_text: str,
+    answer_text: str,
+    thresholds: Optional[dict] = None
+) -> dict:
+    """Enforce rubric consistency and stable field shapes with conservative caps."""
+    t = resolve_feedback_thresholds(thresholds)
+    breakdown = evaluation.get("score_breakdown") or {}
+    clarity = _clamp_score(breakdown.get("clarity"), evaluation.get("score", 5))
+    accuracy = _clamp_score(breakdown.get("accuracy"), evaluation.get("score", 5))
+    completeness = _clamp_score(breakdown.get("completeness"), evaluation.get("score", 5))
+    structure = _clamp_score(breakdown.get("structure"), evaluation.get("score", 5))
+
+    missing = evaluation.get("missing_concepts") or []
+    if not isinstance(missing, list):
+        missing = [str(missing)]
+    missing = list(dict.fromkeys([str(x).strip() for x in missing if str(x).strip()]))[:6]
+
+    strengths = evaluation.get("strengths") or []
+    if not isinstance(strengths, list):
+        strengths = [str(strengths)]
+    strengths = list(dict.fromkeys([str(x).strip() for x in strengths if str(x).strip()]))[:6]
+
+    rubric_hits_llm = evaluation.get("rubric_hits") or []
+    if not isinstance(rubric_hits_llm, list):
+        rubric_hits_llm = [str(rubric_hits_llm)]
+    rubric_hits_llm = [str(x).strip() for x in rubric_hits_llm if str(x).strip()]
+
+    rubric_misses_llm = evaluation.get("rubric_misses") or []
+    if not isinstance(rubric_misses_llm, list):
+        rubric_misses_llm = [str(rubric_misses_llm)]
+    rubric_misses_llm = [str(x).strip() for x in rubric_misses_llm if str(x).strip()]
+
+    quality_signals = compute_quality_signals(answer_text, thresholds=t)
+    relevance = _estimate_relevance(question_text, answer_text)
+    auto_hits, auto_misses, coverage = _evaluate_expected_point_coverage(answer_text, expected_points, thresholds=t)
+
+    rubric_hits = list(dict.fromkeys((rubric_hits_llm + auto_hits)))[:6]
+    rubric_misses = list(dict.fromkeys((rubric_misses_llm + auto_misses + missing)))[:6]
+
+    quality_flags = list(dict.fromkeys(
+        quality_signals.get("quality_flags", []) + [str(x).strip() for x in (evaluation.get("quality_flags") or []) if str(x).strip()]
+    ))
+
+    if settings.FEEDBACK_LOOP_V2:
+        if relevance < t["low_relevance_threshold"]:
+            accuracy = min(accuracy, t["accuracy_cap_low_relevance"])
+            quality_flags.append("low_relevance")
+            if "Answer did not directly address the question intent" not in rubric_misses:
+                rubric_misses.append("Answer did not directly address the question intent")
+        if quality_signals["repetition_ratio"] > t["repetition_ratio_cap"] or quality_signals["unique_word_ratio"] < t["unique_word_ratio_min"]:
+            clarity = min(clarity, t["clarity_cap_repetition"])
+        if coverage < t["coverage_min"]:
+            completeness = min(completeness, t["completeness_cap_low_coverage"])
+        if quality_signals["structure_markers_hit"] < t["structure_markers_min"] and quality_signals["sentence_count"] <= t["structure_sentence_cap"]:
+            structure = min(structure, t["structure_cap_weak"])
+
+    expected_count = max(1, len(expected_points))
+    covered = max(0, expected_count - min(len(rubric_misses), expected_count))
+    completeness_from_coverage = _clamp_score((covered / expected_count) * 10.0, completeness)
+    completeness = max(completeness, completeness_from_coverage)
+
+    weighted = round((0.25 * clarity) + (0.35 * accuracy) + (0.25 * completeness) + (0.15 * structure), 1)
+    provided_score = _clamp_score(evaluation.get("score"), weighted)
+    score = weighted if abs(provided_score - weighted) > 2.0 else round(provided_score, 1)
+
+    if settings.FEEDBACK_LOOP_V2 and "low_transcript_quality" in quality_flags:
+        score = max(0.0, round(score - t["low_transcript_penalty"], 1))
+
+    evidence_quotes = evaluation.get("evidence_quotes")
+    if not isinstance(evidence_quotes, list) or not evidence_quotes:
+        evidence_quotes = _extract_evidence_quotes(answer_text, expected_points, max_quotes=2)
+    evidence_quotes = [str(x).strip() for x in evidence_quotes if str(x).strip()][:2]
+
+    if not strengths:
+        strengths = ["Attempted to answer the question"]
+    if not rubric_hits and expected_points:
+        rubric_hits = expected_points[:1]
+
+    improvement_plan = evaluation.get("improvement_plan")
+    if not isinstance(improvement_plan, dict):
+        improvement_plan = {}
+    derived_plan = _build_improvement_plan(rubric_misses, expected_points, question_text)
+    focus = str(improvement_plan.get("focus") or derived_plan["focus"])
+    steps = improvement_plan.get("steps") if isinstance(improvement_plan.get("steps"), list) else derived_plan["steps"]
+    steps = [str(x).strip() for x in steps if str(x).strip()][:3]
+    success_criteria = (
+        improvement_plan.get("success_criteria")
+        if isinstance(improvement_plan.get("success_criteria"), list)
+        else derived_plan["success_criteria"]
+    )
+    success_criteria = [str(x).strip() for x in success_criteria if str(x).strip()][:3]
+
+    retry_drill = evaluation.get("retry_drill")
+    if not isinstance(retry_drill, dict):
+        retry_drill = derived_plan["retry_drill"]
+    retry_prompt = str(retry_drill.get("prompt") or derived_plan["retry_drill"]["prompt"])
+    retry_points = retry_drill.get("target_points")
+    if not isinstance(retry_points, list) or not retry_points:
+        retry_points = derived_plan["retry_drill"]["target_points"]
+    retry_points = [str(x).strip() for x in retry_points if str(x).strip()][:3]
+
+    confidence = evaluation.get("confidence")
+    try:
+        confidence = float(confidence)
+    except Exception:
+        confidence = quality_signals.get("confidence", 0.65)
+    confidence = max(0.1, min(0.95, confidence))
+    if settings.FEEDBACK_LOOP_V2 and "low_transcript_quality" in quality_flags:
+        confidence = min(confidence, t["low_transcript_confidence_cap"])
+
+    quality_flags = list(dict.fromkeys([f for f in quality_flags if f]))[:6]
+
+    return {
+        "evaluation_version": "v2" if settings.FEEDBACK_LOOP_V2 else "v1_compat",
+        "score": score,
+        "score_breakdown": {
+            "clarity": round(clarity, 1),
+            "accuracy": round(accuracy, 1),
+            "completeness": round(completeness, 1),
+            "structure": round(structure, 1),
+        },
+        "strengths": strengths[:6],
+        "missing_concepts": rubric_misses[:6],
+        "rubric_hits": rubric_hits[:6],
+        "rubric_misses": rubric_misses[:6],
+        "quality_flags": quality_flags,
+        "confidence": round(confidence, 2),
+        "quality_signals": quality_signals,
+        "coverage_ratio": coverage,
+        "relevance_ratio": round(relevance, 3),
+        "expected_points_used": expected_points[:5],
+        "evidence_quotes": evidence_quotes,
+        "improvement_plan": {
+            "focus": focus,
+            "steps": steps,
+            "success_criteria": success_criteria,
+        },
+        "retry_drill": {
+            "prompt": retry_prompt,
+            "target_points": retry_points,
+        },
+        "coaching_tip": str(evaluation.get("coaching_tip") or "Give a clearer structure, add evidence, and close with impact."),
+        "optimized_answer": str(evaluation.get("optimized_answer") or "Define the concept, explain trade-offs, and anchor with a concrete example."),
+        "feedback": str(evaluation.get("feedback") or "Good attempt; focus on core concepts and more concrete examples."),
+    }
+
+
+async def evaluate_answer_stream(question, answer, callback, thresholds: Optional[dict] = None):
     """
     Evaluate user's answer with streaming feedback and detailed coaching.
     
@@ -519,13 +1330,16 @@ async def evaluate_answer_stream(question, answer, callback):
     from langchain_core.messages import SystemMessage, HumanMessage
     
     llm = get_chat_model()
-    
+    resolved_thresholds = resolve_feedback_thresholds(thresholds)
+
     question_text = question.get('text', 'Unknown question')
     expected_points = question.get('expected_points', [])
     category = question.get('category', 'General')
     skill = question.get('skill_tested', 'General knowledge')
     
-    system_prompt = """You are an expert interview coach evaluating a candidate's response.
+    system_prompt = """You are an expert interview coach evaluating a candidate's spoken response.
+The answer was captured via speech-to-text, so ignore minor transcription artifacts like filler words (um, uh), repeated words, or missing punctuation. Focus on the SUBSTANCE of what the candidate communicated.
+
 Be constructive but honest. If the answer is weak, explain WHY and HOW to improve.
 
 IMPORTANT: Output ONLY valid JSON, no markdown code blocks, no extra text.
@@ -551,24 +1365,38 @@ CATEGORY: {category}
 SKILL TESTED: {skill}
 EXPECTED POINTS: {', '.join(expected_points[:5]) if expected_points else 'Clear explanation with examples'}
 
-CANDIDATE'S ANSWER: "{answer}"
+CANDIDATE'S SPOKEN ANSWER (transcribed from speech): "{answer}"
 
-Evaluate this answer. If the answer is weak, rambling, or doesn't address the question:
-- Give a low score (0-3)
-- Identify what's missing
-- Provide a clear coaching tip on how to improve
-- Give an optimized answer example
+Evaluate the substance of this answer. Score based on content quality, not speech fluency.
+- Score 8-10: Covers most expected points with good depth
+- Score 5-7: Covers some points but misses key concepts
+- Score 0-4: Weak, off-topic, or mostly empty
 
 Output valid JSON only:"""
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ]
 
     full_response = ""
     try:
+        structured_payload = await _invoke_structured_output(messages, EvaluationResponseSchema)
+        if structured_payload:
+            evaluation = _normalize_evaluation_payload(
+                evaluation=structured_payload,
+                expected_points=expected_points,
+                question_text=question_text,
+                answer_text=answer,
+                thresholds=resolved_thresholds,
+            )
+            print(f"📝 Evaluation: Score {evaluation.get('score', 0)}/10 (structured)")
+            print(
+                "📈 Eval v2 flags=%s confidence=%.2f"
+                % (evaluation.get("quality_flags", []), float(evaluation.get("confidence", 0.0)))
+            )
+            return evaluation
+
         # Stream response
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
-        ]
-        
         async for chunk in llm.astream(messages):
             content = chunk.content if hasattr(chunk, 'content') else str(chunk)
             await callback("token", content)
@@ -580,7 +1408,10 @@ Output valid JSON only:"""
         
         # Clean the response
         clean_response = full_response.strip()
-        
+
+        # Strip <think>...</think> blocks (qwen3 reasoning traces)
+        clean_response = re.sub(r'<think>[\s\S]*?</think>', '', clean_response).strip()
+
         # Remove markdown code blocks if present
         if "```" in clean_response:
             match = re.search(r'```(?:json)?\s*([\s\S]*?)```', clean_response)
@@ -610,28 +1441,25 @@ Output valid JSON only:"""
                     "feedback": clean_response[:200] if clean_response else "Unable to parse detailed feedback."
                 }
         
-        # Ensure all required fields exist
-        if "score_breakdown" not in evaluation:
-            s = evaluation.get("score", 5)
-            evaluation["score_breakdown"] = {"clarity": s, "accuracy": s, "completeness": s, "structure": s}
-        
-        if "optimized_answer" not in evaluation:
-            evaluation["optimized_answer"] = "Focus on the core concept, explain your reasoning, and provide a concrete example."
-            
-        if "coaching_tip" not in evaluation:
-            evaluation["coaching_tip"] = "Try to structure your answer with a clear opening, supporting details, and a conclusion."
-            
-        if "missing_concepts" not in evaluation:
-            evaluation["missing_concepts"] = []
-            
+        evaluation = _normalize_evaluation_payload(
+            evaluation=evaluation,
+            expected_points=expected_points,
+            question_text=question_text,
+            answer_text=answer,
+            thresholds=resolved_thresholds,
+        )
         print(f"📝 Evaluation: Score {evaluation.get('score', 0)}/10")
+        print(
+            "📈 Eval v2 flags=%s confidence=%.2f"
+            % (evaluation.get("quality_flags", []), float(evaluation.get("confidence", 0.0)))
+        )
         return evaluation
         
     except Exception as e:
         print(f"❌ Error in evaluate_answer_stream: {e}")
         import traceback
         traceback.print_exc()
-        return {
+        fallback = {
             "score": 2,
             "score_breakdown": {"clarity": 2, "accuracy": 2, "completeness": 2, "structure": 2},
             "feedback": "The answer needs significant improvement. Focus on addressing the specific question with concrete examples.",
@@ -641,3 +1469,10 @@ Output valid JSON only:"""
             "optimized_answer": "A strong answer would clearly define the concept, explain the key differences or components, and provide a practical example from your experience.",
             "improvements": ["Address the question directly", "Provide specific examples", "Structure your answer clearly"]
         }
+        return _normalize_evaluation_payload(
+            evaluation=fallback,
+            expected_points=expected_points,
+            question_text=question_text,
+            answer_text=answer,
+            thresholds=resolved_thresholds,
+        )

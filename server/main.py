@@ -9,10 +9,11 @@ import time
 import base64
 import re
 import uuid
+import hashlib
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 try:
     import mlx.core as mx
@@ -21,16 +22,76 @@ except ImportError:
 import socketio
 import tempfile
 import os
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.graph import END, START, StateGraph
 
 from server.config import settings
 from server.services.database import check_qdrant_status, init_vectors
-from server.services.audio_service import get_audio_processor, get_vad
-from server.services.tts_service import get_tts_service
+from server.services.audio_service import (
+    get_audio_processor,
+    get_streaming_audio_processor,
+    get_vad,
+)
+from server.services.tts_service import get_tts_service, preload_tts
 from server.services.llm_factory import get_chat_model, preload_model
 from server.services.user_database import get_user_db
+
+TTS_RESPONSE_TIMEOUT_SEC = float(os.getenv("TTS_RESPONSE_TIMEOUT_SEC", "90"))
+TTS_TIMEOUT_PER_CHAR_SEC = float(os.getenv("TTS_TIMEOUT_PER_CHAR_SEC", "0.08"))
+TTS_MAX_TIMEOUT_SEC = float(os.getenv("TTS_MAX_TIMEOUT_SEC", "180"))
+TTS_PRELOAD_ON_STARTUP = os.getenv("TTS_PRELOAD_ON_STARTUP", "1").lower() in {"1", "true", "yes", "on"}
+TTS_STARTUP_WARMUP_TEXT = os.getenv(
+    "TTS_STARTUP_WARMUP_TEXT",
+    "Calibration.",
+).strip()
+TTS_WARMUP_AWAIT_ON_FIRST_TTS = os.getenv("TTS_WARMUP_AWAIT_ON_FIRST_TTS", "1").lower() in {"1", "true", "yes", "on"}
+TTS_WARMUP_WAIT_SEC = float(os.getenv("TTS_WARMUP_WAIT_SEC", "180"))
+
+_tts_warmup_task: Optional[asyncio.Task] = None
+
+
+def _compute_tts_timeout(text: str) -> float:
+    """Compute TTS timeout from base + text-length budget, clamped by max."""
+    text_len = len((text or "").strip())
+    timeout = TTS_RESPONSE_TIMEOUT_SEC + (text_len * TTS_TIMEOUT_PER_CHAR_SEC)
+    return max(1.0, min(TTS_MAX_TIMEOUT_SEC, timeout))
+
+
+async def _warmup_tts_backend():
+    """Preload and warm TTS once so first live question does not time out."""
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, preload_tts)
+        if TTS_STARTUP_WARMUP_TEXT:
+            tts_service = get_tts_service()
+            warmup_timeout = _compute_tts_timeout(TTS_STARTUP_WARMUP_TEXT)
+            await asyncio.wait_for(
+                tts_service.speak_wav_base64_async(TTS_STARTUP_WARMUP_TEXT),
+                timeout=warmup_timeout,
+            )
+        print("✅ TTS warmup complete")
+    except Exception as e:
+        print(f"⚠️ TTS warmup skipped: {e}")
+
+
+async def _await_tts_warmup_if_needed():
+    """Await startup warmup if it is still running (avoids first-question timeout drops)."""
+    global _tts_warmup_task
+    if not TTS_WARMUP_AWAIT_ON_FIRST_TTS:
+        return
+    task = _tts_warmup_task
+    if not task or task.done():
+        return
+    if asyncio.current_task() is task:
+        return
+    try:
+        print("⏳ Waiting for TTS warmup to finish before synthesis...")
+        await asyncio.wait_for(task, timeout=max(1.0, TTS_WARMUP_WAIT_SEC))
+    except asyncio.TimeoutError:
+        print(f"⚠️ TTS warmup wait timed out after {TTS_WARMUP_WAIT_SEC:.1f}s; continuing.")
+    except Exception as e:
+        print(f"⚠️ TTS warmup wait failed: {e}")
 
 
 # ============== Session State Management ==============
@@ -40,19 +101,26 @@ class SessionState:
     
     # Buffer constants
     MAX_BUFFER_SIZE = 960000  # 30 seconds at 16kHz mono 16-bit
-    NEW_AUDIO_THRESHOLD = 32000  # 2 seconds of new audio before transcribing
-    TRANSCRIBE_COOLDOWN = 2.0  # Minimum seconds between transcriptions
+    NEW_AUDIO_THRESHOLD = int(32000 * (settings.STT_PARTIAL_CHUNK_MS / 1000.0))
+    TRANSCRIBE_COOLDOWN = max(0.1, settings.STT_PARTIAL_COOLDOWN_MS / 1000.0)
+    FINALIZE_SILENCE_SECONDS = max(0.3, settings.STT_FINALIZE_SILENCE_MS / 1000.0)
     
-    def __init__(self, user_id: str = "anonymous"):
+    def __init__(self, user_id: str = "anonymous", is_authenticated: bool = False, session_token: Optional[str] = None):
         self.user_id = user_id
+        self.is_authenticated = is_authenticated
+        self.session_token = session_token
         
         # Audio buffer - circular with max size
         self.audio_buffer = bytearray()
         
         # Transcription tracking
         self.last_transcribed_position: int = 0
+        self.last_finalized_position: int = 0
+        self.current_utterance_start_position: int = 0
         self.last_transcribe_time: float = 0
         self.recent_transcripts: list[str] = []  # Last 3 for deduplication
+        self.current_partial_transcript: str = ""
+        self.finalized_answer_transcript: str = ""
         
         # Legacy (for compatibility)
         self.transcript_chunks: list[str] = []
@@ -65,7 +133,11 @@ class SessionState:
         self.interview_questions: list[dict] = []
         self.current_question_index: int = 0
         self.interview_mode: str = "practice"
-        self.coaching_enabled: bool = True
+        self.interview_feedback_timing: str = "end_only"
+        self.live_scoring_enabled: bool = False
+        self.interviewer_persona: str = "friendly"
+        self.tts_style: str = "interviewer"
+        self.coaching_enabled: bool = False
         self.answer_start_time: float = None
         self.current_answer_transcript: str = ""
         self.evaluations: list[dict] = []
@@ -73,6 +145,11 @@ class SessionState:
         self.last_hint_time: float = 0
         self.hints_given: list[str] = []
         self.db_session_id: str = None  # UUID for database persistence
+        self.answer_submission_in_flight: bool = False
+        self.accept_audio_chunks: bool = False
+        self.end_requested: bool = False
+        self.question_tts_task: Optional[asyncio.Task] = None
+        self.finalize_lock: asyncio.Lock = asyncio.Lock()
         
         # Speaking state tracking
         self.was_speaking: bool = False
@@ -88,6 +165,8 @@ class SessionState:
             self.audio_buffer = self.audio_buffer[overflow:]
             # Adjust position tracker
             self.last_transcribed_position = max(0, self.last_transcribed_position - overflow)
+            self.last_finalized_position = max(0, self.last_finalized_position - overflow)
+            self.current_utterance_start_position = max(0, self.current_utterance_start_position - overflow)
             trimmed = overflow
         
         return trimmed
@@ -96,21 +175,26 @@ class SessionState:
         """Check if we have enough new audio and cooldown has passed."""
         bytes_new = len(self.audio_buffer) - self.last_transcribed_position
         time_since = current_time - self.last_transcribe_time
-        return bytes_new >= self.NEW_AUDIO_THRESHOLD and time_since >= self.TRANSCRIBE_COOLDOWN
+        min_new_audio = max(3200, self.NEW_AUDIO_THRESHOLD)
+        return bytes_new >= min_new_audio and time_since >= self.TRANSCRIBE_COOLDOWN
     
     def clear_for_new_question(self):
         """Reset buffer state for a new question."""
         self.audio_buffer.clear()
         self.last_transcribed_position = 0
+        self.last_finalized_position = 0
+        self.current_utterance_start_position = 0
         self.last_transcribe_time = 0
         self.recent_transcripts = []
+        self.current_partial_transcript = ""
+        self.finalized_answer_transcript = ""
         self.current_answer_transcript = ""
         self.hints_given = []
         self.was_speaking = False
         self.silence_start_time = None
 
 # Global session storage
-sessions: dict[str, SessionState] = defaultdict(SessionState)
+sessions: dict[str, SessionState] = {}
 
 # Maps Socket ID -> User ID for quick lookup on disconnect
 sid_to_user: dict[str, str] = {}
@@ -121,6 +205,176 @@ user_connection_count: dict[str, int] = defaultdict(int)
 # Maps User ID -> Active asyncio Task (for cancellation on disconnect or restart)
 active_tasks: dict[str, asyncio.Task] = {}
 
+# Feedback loop metrics (v2 rollout visibility)
+feedback_metrics = {
+    "evaluations_total": 0,
+    "evaluations_v2": 0,
+    "low_transcript_quality": 0,
+    "retries_total": 0,
+    "retry_delta_sum": 0.0,
+    "retry_improved_count": 0,
+    "score_sum_v1": 0.0,
+    "score_count_v1": 0,
+    "score_sum_v2": 0.0,
+    "score_count_v2": 0,
+}
+
+
+def _record_evaluation_metrics(evaluation: dict):
+    feedback_metrics["evaluations_total"] += 1
+    score = 0.0
+    try:
+        score = float((evaluation or {}).get("score", 0) or 0)
+    except Exception:
+        score = 0.0
+
+    if (evaluation or {}).get("evaluation_version") == "v2":
+        feedback_metrics["evaluations_v2"] += 1
+        feedback_metrics["score_sum_v2"] += score
+        feedback_metrics["score_count_v2"] += 1
+    else:
+        feedback_metrics["score_sum_v1"] += score
+        feedback_metrics["score_count_v1"] += 1
+    if "low_transcript_quality" in ((evaluation or {}).get("quality_flags") or []):
+        feedback_metrics["low_transcript_quality"] += 1
+
+
+def _record_retry_metrics(delta_score: float):
+    feedback_metrics["retries_total"] += 1
+    try:
+        delta = float(delta_score)
+        feedback_metrics["retry_delta_sum"] += delta
+        if delta > 0:
+            feedback_metrics["retry_improved_count"] += 1
+    except Exception:
+        pass
+
+
+def _public_user_id(session: SessionState) -> str:
+    """Expose stable public user identity to the client."""
+    return session.user_id if session.is_authenticated else "anonymous"
+
+
+def _safe_user_payload(user: Optional[dict]) -> dict:
+    """Strip sensitive user fields before sending to client."""
+    if not user:
+        return {}
+    return {
+        "user_id": user.get("user_id"),
+        "email": user.get("email"),
+        "username": user.get("username"),
+        "created_at": user.get("created_at"),
+        "last_login": user.get("last_login"),
+        "profile": user.get("profile", {}),
+    }
+
+
+def _normalize_latest_analysis_payload(user_id: str, saved_analysis: Optional[dict]) -> dict:
+    """
+    Normalize latest analysis payload for UI consistency.
+    If session titles were saved as full questions, generate stable display titles and persist once.
+    """
+    if not isinstance(saved_analysis, dict):
+        return {}
+
+    analysis_data = saved_analysis.get("analysis")
+    if not isinstance(analysis_data, dict):
+        analysis_data = {}
+
+    practice_plan = analysis_data.get("practice_plan")
+    if not isinstance(practice_plan, dict):
+        return analysis_data
+
+    try:
+        import copy
+        from server.agents.nodes import normalize_practice_plan_titles
+
+        normalized_plan = normalize_practice_plan_titles(copy.deepcopy(practice_plan))
+        if normalized_plan != practice_plan:
+            analysis_data["practice_plan"] = normalized_plan
+            get_user_db().update_latest_analysis_plan(user_id, normalized_plan)
+    except Exception as e:
+        print(f"⚠️ Failed to normalize persisted plan titles: {e}")
+
+    return analysis_data
+
+
+def _cancel_user_task_if_idle(user_id: str):
+    """Cancel active long-running task when user has no active connections."""
+    if user_connection_count.get(user_id, 0) == 0:
+        task = active_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
+            print(f"🛑 No active connections: cancelled task for {user_id}")
+
+
+async def _bind_sid_identity(
+    sid: str,
+    new_user_id: str,
+    is_authenticated: bool,
+    session_token: Optional[str] = None
+):
+    """
+    Atomically re-bind socket identity, room, and connection counters.
+    Prevents counter drift when moving from anon -> authenticated user.
+    """
+    session = sessions.get(sid)
+    if session is None:
+        return
+
+    old_user_id = sid_to_user.get(sid)
+    old_auth = session.is_authenticated
+
+    if old_user_id == new_user_id and old_auth == is_authenticated:
+        session.session_token = session_token or session.session_token
+        return
+
+    if old_user_id:
+        await sio.leave_room(sid, str(old_user_id))
+        user_connection_count[old_user_id] = max(0, user_connection_count[old_user_id] - 1)
+        _cancel_user_task_if_idle(old_user_id)
+
+    await sio.enter_room(sid, str(new_user_id))
+    sid_to_user[sid] = new_user_id
+    user_connection_count[new_user_id] += 1
+
+    session.user_id = new_user_id
+    session.is_authenticated = is_authenticated
+    session.session_token = session_token if is_authenticated else None
+
+
+async def _get_authenticated_rest_user_id(
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token")
+) -> str:
+    """Authenticate REST requests using Bearer token or X-Session-Token header."""
+    token = None
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value:
+            token = value.strip()
+    if not token and x_session_token:
+        token = x_session_token.strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing session token")
+
+    user_db = get_user_db()
+    user_id = user_db.validate_session_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+
+    return user_id
+
+
+async def _require_socket_auth(sid: str) -> Optional[SessionState]:
+    """Ensure socket request belongs to an authenticated session."""
+    session = sessions.get(sid)
+    if not session or not session.is_authenticated:
+        await sio.emit("auth_error", {"error": "Authentication required", "user_id": "anonymous"}, room=sid)
+        return None
+    return session
+
 
 def transcript_similarity(a: str, b: str) -> float:
     """Return similarity ratio 0.0-1.0 between two transcripts."""
@@ -130,27 +384,239 @@ def transcript_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
 
 
+def _normalized_transcript_words(text: str) -> list[str]:
+    """Normalize transcript into lowercase word tokens for fuzzy overlap checks."""
+    if not text:
+        return []
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _should_drop_false_start(existing: str, new_chunk: str) -> bool:
+    """
+    Drop common Whisper false-start hallucinations on fresh transcripts.
+    Keeps legitimate content once there is already transcript context.
+    """
+    if (existing or "").strip():
+        return False
+
+    words = _normalized_transcript_words(new_chunk)
+    if not words:
+        return True
+
+    joined = " ".join(words)
+    common_false_starts = {
+        "thank you",
+        "thank you very much",
+        "thanks",
+        "thanks for watching",
+        "thank you for watching",
+        "thank you for transcription",
+    }
+    if joined in common_false_starts:
+        return True
+
+    # Guard short "thank you for ..." phantom opener chunks.
+    if len(words) <= 5 and words[:3] == ["thank", "you", "for"]:
+        return True
+
+    return False
+
+
 def merge_transcript(existing: str, new_chunk: str) -> str:
     """Intelligently merge new transcript chunk with existing, avoiding duplicates."""
-    if not existing:
-        return new_chunk.strip()
     if not new_chunk:
         return existing
-    
+
+    incoming = new_chunk.strip()
+    if not incoming:
+        return existing
+
+    # Whisper occasionally prepends "thank you" on first chunk; strip that prefix but keep real content.
+    if not (existing or "").strip():
+        opening_words = _normalized_transcript_words(incoming)
+        if len(opening_words) >= 6 and opening_words[:2] == ["thank", "you"]:
+            incoming = re.sub(r"^\s*thank you(?:\s+very\s+much)?[,\.\!\s]*", "", incoming, flags=re.IGNORECASE).strip()
+            incoming = re.sub(r"^(and|so)\b[\s,]*", "", incoming, flags=re.IGNORECASE).strip()
+            if not incoming:
+                return existing
+
+    if _should_drop_false_start(existing, incoming):
+        return existing
+
+    if not existing:
+        return incoming
+
     existing_words = existing.split()
-    new_words = new_chunk.strip().split()
-    
-    # Find overlap: check if end of existing matches start of new
-    max_overlap = min(len(existing_words), len(new_words), 10)  # Max 10 word overlap
-    
-    for overlap in range(max_overlap, 0, -1):
-        if existing_words[-overlap:] == new_words[:overlap]:
-            # Found overlap - merge without duplication
-            merged = existing + " " + " ".join(new_words[overlap:])
-            return merged.strip()
-    
-    # No overlap found - just append
-    return (existing + " " + new_chunk).strip()
+    new_words = incoming.split()
+
+    existing_norm = _normalized_transcript_words(existing)
+    new_norm = _normalized_transcript_words(incoming)
+
+    if not new_norm:
+        return existing
+
+    # If incoming chunk is basically already present in the latest transcript tail, skip it.
+    tail_len = min(len(existing_norm), max(len(new_norm) + 6, len(new_norm) * 2))
+    existing_tail_norm = existing_norm[-tail_len:] if tail_len > 0 else existing_norm
+    if transcript_similarity(" ".join(existing_tail_norm), " ".join(new_norm)) >= 0.9:
+        return existing
+
+    # Fuzzy overlap: compare normalized tail/start tokens to avoid duplicate append.
+    max_overlap = min(len(existing_words), len(new_words), 24)
+    for overlap in range(max_overlap, 2, -1):
+        existing_tail = " ".join(_normalized_transcript_words(" ".join(existing_words[-overlap:])))
+        new_head = " ".join(_normalized_transcript_words(" ".join(new_words[:overlap])))
+        if existing_tail and new_head and transcript_similarity(existing_tail, new_head) >= 0.92:
+            suffix = " ".join(new_words[overlap:]).strip()
+            if not suffix:
+                return existing
+            return f"{existing} {suffix}".strip()
+
+    # Final guard: near-identical restatement without clean overlap.
+    same_window = min(len(existing_norm), len(new_norm))
+    if same_window > 3:
+        existing_window = " ".join(existing_norm[-same_window:])
+        if transcript_similarity(existing_window, " ".join(new_norm)) >= 0.92:
+            return existing
+
+    return f"{existing} {incoming}".strip()
+
+
+def _combine_final_and_partial(finalized: str, partial: str) -> str:
+    """Compose live answer text from finalized transcript plus current partial utterance."""
+    finalized = (finalized or "").strip()
+    partial = (partial or "").strip()
+    if finalized and partial:
+        return f"{finalized} {partial}".strip()
+    return finalized or partial
+
+
+async def _emit_transcript_update(session: SessionState, is_final: bool = False):
+    """Emit current transcript to the client."""
+    transcript = (session.current_answer_transcript or "").strip()
+    if not transcript:
+        return
+    await sio.emit(
+        "transcript",
+        {
+            "text": transcript,
+            "full": transcript,
+            "is_final": is_final,
+            "user_id": session.user_id,
+        },
+        room=str(session.user_id),
+    )
+
+
+async def _maybe_emit_coaching_hint(session: SessionState, current_time: float, is_extended_silence: bool):
+    """Evaluate struggling heuristics and emit a coaching hint when appropriate."""
+    if not (session.coaching_enabled and is_extended_silence):
+        return
+
+    if session.answer_start_time:
+        answer_duration = current_time - session.answer_start_time
+    else:
+        answer_duration = 0
+
+    words = (session.current_answer_transcript or "").lower().split()
+    filler_words = ['uh', 'uhm', 'um', 'hmm', 'err', 'like,', '...']
+    last_words = words[-5:] if len(words) >= 5 else words
+    has_fillers = any(fw in ' '.join(last_words) for fw in filler_words)
+
+    hint_count = len(session.hints_given)
+    hint_cooldown = 5 if hint_count == 0 else 10
+
+    should_hint = (
+        (current_time - session.last_hint_time) > hint_cooldown and
+        (
+            (answer_duration > 5 and len(words) < 10) or
+            (has_fillers and len(words) < 20) or
+            (answer_duration > 20)
+        )
+    )
+    if not should_hint:
+        return
+
+    session.last_hint_time = current_time
+    hint_level = hint_count + 1
+    print(f"🤔 Generating hint level {hint_level}")
+
+    async def send_hint():
+        try:
+            from server.services.coaching_service import generate_coaching_hint
+
+            current_q = (
+                session.interview_questions[session.current_question_index]
+                if session.interview_questions else {}
+            )
+            hint = await generate_coaching_hint(
+                session.current_answer_transcript,
+                current_q,
+                previous_hints=session.hints_given,
+                hint_level=hint_level
+            )
+            if hint:
+                hint_message = hint["message"] if isinstance(hint, dict) else str(hint)
+                print(f"💡 Hint L{hint_level}: {hint_message}")
+                session.hints_given.append(hint_message)
+                payload = {"message": hint_message, "level": hint_level, "user_id": session.user_id}
+                if isinstance(hint, dict):
+                    payload.update({k: v for k, v in hint.items() if k != "message"})
+                await sio.emit("coaching_hint", payload, room=str(session.user_id))
+        except Exception as e:
+            print(f"⚠️ Hint error: {e}")
+
+    asyncio.create_task(send_hint())
+
+
+async def _finalize_current_utterance(session: SessionState, reason: str = "silence") -> bool:
+    """
+    Finalize current utterance with high-accuracy STT.
+    Returns True when accumulated transcript changed.
+    """
+    async with session.finalize_lock:
+        end_pos = len(session.audio_buffer)
+        start_pos = max(0, min(session.last_finalized_position, end_pos))
+        if end_pos <= start_pos:
+            session.current_partial_transcript = ""
+            session.current_utterance_start_position = end_pos
+            session.last_transcribed_position = end_pos
+            session.was_speaking = False
+            return False
+
+        # Require a small minimum amount of audio unless we're force-finalizing.
+        min_bytes = 6400  # ~200ms at 16kHz mono 16-bit
+        if (end_pos - start_pos) < min_bytes and reason != "force":
+            return False
+
+        audio_processor = get_audio_processor()
+        finalized_chunk = await audio_processor.transcribe_buffer_async(bytes(session.audio_buffer[start_pos:end_pos]))
+        finalized_chunk = (finalized_chunk or "").strip()
+
+        # If final pass is empty, keep best-effort partial text so user doesn't lose words.
+        if not finalized_chunk:
+            finalized_chunk = (session.current_partial_transcript or "").strip()
+
+        changed = False
+        if finalized_chunk:
+            merged = merge_transcript(session.finalized_answer_transcript, finalized_chunk)
+            changed = merged != session.finalized_answer_transcript or bool(session.current_partial_transcript)
+            session.finalized_answer_transcript = merged
+
+        session.current_partial_transcript = ""
+        session.current_answer_transcript = session.finalized_answer_transcript
+        session.last_finalized_position = end_pos
+        session.current_utterance_start_position = end_pos
+        session.last_transcribed_position = end_pos
+        session.last_transcribe_time = time.time()
+        session.was_speaking = False
+        session.silence_start_time = None
+
+        if changed and session.current_answer_transcript.strip():
+            await _emit_transcript_update(session, is_final=True)
+            print(f"🧾 Finalized ({reason}): {session.current_answer_transcript[:80]}...")
+
+        return changed
 
 
 # ============== LangGraph Sanity Check ==============
@@ -194,6 +660,12 @@ async def lifespan(app: FastAPI):
     
     if not metal_available:
         print("⚠️  Warning: Metal acceleration is not available!")
+
+    try:
+        streaming_stt = get_streaming_audio_processor()
+        print(f"🎙️ Streaming STT: {streaming_stt.__class__.__name__}")
+    except Exception as e:
+        print(f"⚠️ Streaming STT init failed: {e}")
     
     # Verify LangGraph installation
     try:
@@ -203,8 +675,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ LangGraph sanity check failed: {e}")
     
-    # Note: Models are lazily loaded on first use to speed up startup
-    print("ℹ️  Models will be loaded on first use (lazy loading)")
+    # Note: LLM models are lazily loaded on first use.
+    print("ℹ️  LLM models will be loaded on first use (lazy loading)")
+    if TTS_PRELOAD_ON_STARTUP:
+        global _tts_warmup_task
+        _tts_warmup_task = asyncio.create_task(_warmup_tts_backend())
+        print("ℹ️  TTS preload/warmup scheduled")
     
     yield
     
@@ -278,41 +754,67 @@ async def root():
 # ============== User Data API Endpoints ==============
 
 @fast_app.get("/api/user/{user_id}/progress")
-async def get_user_progress_api(user_id: str):
+async def get_user_progress_api(
+    user_id: str,
+    auth_user_id: str = Depends(_get_authenticated_rest_user_id)
+):
     """Get user's overall progress and statistics."""
+    if user_id != auth_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     user_db = get_user_db()
     progress = user_db.get_user_progress(user_id)
     user = user_db.get_user(user_id)
     
     return {
-        "user": user,
+        "user": _safe_user_payload(user),
         "progress": progress
     }
 
 
 @fast_app.get("/api/user/{user_id}/sessions")
-async def get_user_sessions_api(user_id: str, limit: int = 10):
+async def get_user_sessions_api(
+    user_id: str,
+    limit: int = 10,
+    auth_user_id: str = Depends(_get_authenticated_rest_user_id)
+):
     """Get user's interview session history."""
+    if user_id != auth_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     user_db = get_user_db()
     sessions_list = user_db.get_session_history(user_id, limit)
     return {"sessions": sessions_list}
 
 
 @fast_app.get("/api/session/{session_id}")
-async def get_session_details_api(session_id: str):
+async def get_session_details_api(
+    session_id: str,
+    auth_user_id: str = Depends(_get_authenticated_rest_user_id)
+):
     """Get full details of a specific interview session."""
     user_db = get_user_db()
     session_details = user_db.get_session_details(session_id)
     
     if not session_details:
-        return {"error": "Session not found"}
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if session_details.get("user_id") != auth_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
     
     return session_details
 
 
 @fast_app.get("/api/user/{user_id}/career_analyses")
-async def get_career_analyses_api(user_id: str, limit: int = 5):
+async def get_career_analyses_api(
+    user_id: str,
+    limit: int = 5,
+    auth_user_id: str = Depends(_get_authenticated_rest_user_id)
+):
     """Get user's career analysis history."""
+    if user_id != auth_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     user_db = get_user_db()
     analyses = user_db.get_career_analyses(user_id, limit)
     return {"analyses": analyses}
@@ -321,56 +823,68 @@ async def get_career_analyses_api(user_id: str, limit: int = 5):
 # ============== Socket.IO Events ==============
 
 @sio.event
-async def connect(sid, environ):
-    """Handle client connection."""
+async def connect(sid, environ, auth=None):
+    """Handle client connection with origin validation."""
     print(f"🔌 Client connected: {sid}")
-    
-    # Extract user_email or user_id from query params
-    query_string = environ.get("QUERY_STRING", "")
-    print(f"🔍 Handshake Query: {query_string}")
-    
-    user_email = None
-    user_id = "anonymous"
-    
-    try:
-        import urllib.parse
-        params = urllib.parse.parse_qs(query_string)
-        print(f"🔍 Handshake Params: {params}")
-        
-        # Check for user_id first (returning user)
-        if "user_id" in params:
-            provided_id = params["user_id"][0]
-            if provided_id and provided_id not in ("null", "undefined", "anonymous"):
-                user_db = get_user_db()
-                existing_user = user_db.get_user(provided_id)
-                if existing_user:
-                    user_id = provided_id
-                    print(f"✅ Recognized returning user: {user_id}")
 
-        # Check for user_email (auto-login/signup via magic link or similar)
-        if "user_email" in params and user_id == "anonymous":
-            user_email = params["user_email"][0]
+    # ── Origin validation (CSRF protection) ──
+    # environ contains ASGI/WSGI headers; Origin comes as HTTP_ORIGIN
+    origin = (environ.get("HTTP_ORIGIN", "") or "").strip()
+    trusted_origins = set(settings.CORS_ORIGINS or [])
+    local_dev_prefixes = (
+        "http://localhost",
+        "http://127.0.0.1",
+        "https://localhost",
+        "https://127.0.0.1",
+    )
+    is_local_dev_origin = origin.startswith(local_dev_prefixes)
+
+    if origin and origin not in trusted_origins and not is_local_dev_origin:
+        print(f"🛡️ Rejected connection from untrusted origin: {origin}")
+        raise socketio.exceptions.ConnectionRefusedError("Origin not allowed")
+
+    # Default unauthenticated identity gets a private room, never shared.
+    user_id = f"anon_{sid}"
+    is_authenticated = False
+    session_token = None
+
+    # Extract session_token from auth payload (sent via Socket.IO auth option,
+    # NOT the URL query string — keeps tokens out of server/proxy access logs).
+    try:
+        if isinstance(auth, dict):
+            session_token = auth.get("session_token")
+        if session_token:
+            token_user_id = get_user_db().validate_session_token(session_token)
+            if token_user_id:
+                user_id = token_user_id
+                is_authenticated = True
+                print(f"✅ Authenticated socket via session token: {user_id}")
     except Exception:
         pass
-    
-    # Create or get user from database if email provided
-    if user_email and user_id == "anonymous":
-        user_db = get_user_db()
-        user = user_db.get_user_by_email(user_email)
-        if not user:
-            user_id = user_db.create_user(user_email, user_email.split("@")[0])
-        else:
-            user_id = user["user_id"]
-            user_db.update_last_login(user_id)
-    
-    sessions[sid] = SessionState(user_id=user_id)
-    
-    # User Room Pattern: Join private room and register mapping
-    await sio.enter_room(sid, str(user_id))
-    sid_to_user[sid] = user_id
-    user_connection_count[user_id] += 1  # Track connection count
-    
-    await sio.emit("connected", {"sid": sid, "status": "ready", "user_id": user_id}, room=str(user_id))
+
+    sessions[sid] = SessionState(
+        user_id=user_id,
+        is_authenticated=is_authenticated,
+        session_token=session_token if is_authenticated else None
+    )
+    await _bind_sid_identity(
+        sid=sid,
+        new_user_id=user_id,
+        is_authenticated=is_authenticated,
+        session_token=session_token if is_authenticated else None
+    )
+
+    session = sessions[sid]
+    await sio.emit(
+        "connected",
+        {
+            "sid": sid,
+            "status": "ready",
+            "user_id": _public_user_id(session),
+            "authenticated": session.is_authenticated
+        },
+        room=str(session.user_id)
+    )
 
 
 @sio.event
@@ -389,10 +903,7 @@ async def disconnect(sid):
         
         # Only cancel task if ALL connections for this user are gone
         if remaining == 0:
-            task = active_tasks.pop(user_id, None)
-            if task and not task.done():
-                task.cancel()
-                print(f"🛑 All connections closed: Cancelled task for user {user_id}")
+            _cancel_user_task_if_idle(user_id)
         else:
             print(f"📡 User {user_id} still has {remaining} connection(s) - task continues")
     
@@ -405,6 +916,7 @@ async def disconnect(sid):
 @sio.event
 async def signup(sid, data):
     """Handle user signup."""
+    data = data or {}
     email = data.get("email", "").strip().lower()
     username = data.get("username", "").strip()
     password = data.get("password", "")
@@ -424,19 +936,14 @@ async def signup(sid, data):
     # Create new user
     try:
         user_id = user_db.create_user(email, username, password)
+        session_token = user_db.create_session_token(user_id)
         user = user_db.get_user(user_id)
-        
-        # Update session and room membership
-        if sid in sessions:
-            sessions[sid].user_id = user_id
-        
-        # Leave old room, join new user room
-        old_user = sid_to_user.get(sid)
-        if old_user and old_user != user_id:
-            await sio.leave_room(sid, str(old_user))
-        await sio.enter_room(sid, str(user_id))
-        sid_to_user[sid] = user_id
-        user_connection_count[user_id] += 1
+        await _bind_sid_identity(
+            sid=sid,
+            new_user_id=user_id,
+            is_authenticated=True,
+            session_token=session_token
+        )
         
         await sio.emit("auth_success", {
             "user": {
@@ -444,6 +951,7 @@ async def signup(sid, data):
                 "email": email,
                 "username": username
             },
+            "session_token": session_token,
             "user_id": user_id
         }, room=str(user_id))
         print(f"✅ New user signed up: {email}")
@@ -455,7 +963,8 @@ async def signup(sid, data):
 async def login(sid, data):
     """Handle user login."""
     import hashlib
-    
+
+    data = data or {}
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
     
@@ -476,18 +985,14 @@ async def login(sid, data):
         await sio.emit("auth_error", {"error": "Invalid email or password", "user_id": "anonymous"}, room=sid)
         return
     
-    # Update session and room membership
     user_id = user["user_id"]
-    if sid in sessions:
-        sessions[sid].user_id = user_id
-    
-    # Leave old room, join new user room
-    old_user = sid_to_user.get(sid)
-    if old_user and old_user != user_id:
-        await sio.leave_room(sid, str(old_user))
-    await sio.enter_room(sid, str(user_id))
-    sid_to_user[sid] = user_id
-    user_connection_count[user_id] += 1
+    session_token = user_db.create_session_token(user_id)
+    await _bind_sid_identity(
+        sid=sid,
+        new_user_id=user_id,
+        is_authenticated=True,
+        session_token=session_token
+    )
     
     user_db.update_last_login(user_id)
     
@@ -500,6 +1005,7 @@ async def login(sid, data):
             "email": user["email"],
             "username": user["username"]
         },
+        "session_token": session_token,
         "preferences": prefs or {},
         "user_id": user_id
     }, room=str(user_id))
@@ -510,14 +1016,16 @@ async def login(sid, data):
         recent = user_db.get_career_analyses(user_id, limit=1)
         if recent:
             saved_analysis = recent[0]
+            analysis_data = _normalize_latest_analysis_payload(user_id, saved_analysis)
             mapped_analysis = {
                 "job_title": saved_analysis.get("job_title"),
                 "company": saved_analysis.get("company"),
                 "readiness_score": saved_analysis.get("readiness_score"),
                 "skill_gaps": saved_analysis.get("skill_gaps", []),
                 "bridge_roles": saved_analysis.get("bridge_roles", []),
-                "suggested_sessions": saved_analysis.get("analysis", {}).get("suggested_sessions", []),
-                "analysis_data": saved_analysis.get("analysis", {})
+                "suggested_sessions": analysis_data.get("suggested_sessions", []),
+                "practice_plan": analysis_data.get("practice_plan"),
+                "analysis_data": analysis_data
             }
             await sio.emit("career_analysis", {"analysis": mapped_analysis, "user_id": user_id}, room=str(user_id))
     except Exception as e:
@@ -527,38 +1035,40 @@ async def login(sid, data):
 @sio.event
 async def restore_session(sid, data):
     """
-    Restore a session using a stored user_id (for page refreshes).
-    Trusts the client-side user_id (in a real app, use a session token).
+    Restore a session using a server-issued session token.
     """
-    user_id = data.get("user_id")
-    if not user_id:
+    data = data or {}
+    session_token = data.get("session_token")
+    if not session_token:
+        await sio.emit("auth_error", {"error": "Session token required", "user_id": "anonymous"}, room=sid)
         return
     
     user_db = get_user_db()
+    user_id = user_db.validate_session_token(session_token)
+    if not user_id:
+        await sio.emit("auth_error", {"error": "Invalid or expired session token", "user_id": "anonymous"}, room=sid)
+        return
+
     user = user_db.get_user(user_id)
     
     if not user:
-        # Invalid user_id
+        await sio.emit("auth_error", {"error": "Session user not found", "user_id": "anonymous"}, room=sid)
         return
     
-    # Associate current SID with this user and update room
-    if sid in sessions:
-        sessions[sid].user_id = user_id
-    
-    # Leave old room, join new user room
-    old_user = sid_to_user.get(sid)
-    if old_user and old_user != user_id:
-        await sio.leave_room(sid, str(old_user))
-    await sio.enter_room(sid, str(user_id))
-    sid_to_user[sid] = user_id
-    user_connection_count[user_id] += 1
+    await _bind_sid_identity(
+        sid=sid,
+        new_user_id=user_id,
+        is_authenticated=True,
+        session_token=session_token
+    )
         
     print(f"🔄 Restored session for user: {user_id}")
     
     # Send ack with preferences to ensure client is in sync
     prefs = user_db.get_user_preferences(user_id)
     await sio.emit("session_restored", {
-        "user": user,
+        "user": _safe_user_payload(user),
+        "session_token": session_token,
         "preferences": prefs or {},
         "user_id": user_id
     }, room=str(user_id))
@@ -568,38 +1078,111 @@ async def restore_session(sid, data):
         recent = user_db.get_career_analyses(user_id, limit=1)
         if recent:
             saved_analysis = recent[0]
+            analysis_data = _normalize_latest_analysis_payload(user_id, saved_analysis)
             mapped_analysis = {
                 "job_title": saved_analysis.get("job_title"),
                 "company": saved_analysis.get("company"),
                 "readiness_score": saved_analysis.get("readiness_score"),
                 "skill_gaps": saved_analysis.get("skill_gaps", []),
                 "bridge_roles": saved_analysis.get("bridge_roles", []),
-                "suggested_sessions": saved_analysis.get("analysis", {}).get("suggested_sessions", []),
-                "analysis_data": saved_analysis.get("analysis", {})
+                "suggested_sessions": analysis_data.get("suggested_sessions", []),
+                "practice_plan": analysis_data.get("practice_plan"),
+                "analysis_data": analysis_data
             }
             await sio.emit("career_analysis", {"analysis": mapped_analysis, "user_id": user_id}, room=str(user_id))
     except Exception as e:
         print(f"⚠️ Failed to load analysis on restore: {e}")
 
 
+@sio.event
+async def logout(sid, data=None):
+    """Revoke auth token and drop socket back to anonymous identity."""
+    data = data or {}
+    session = sessions.get(sid)
+    token = (
+        data.get("session_token")
+        or (session.session_token if session else None)
+    )
+
+    try:
+        if token:
+            get_user_db().revoke_session_token(token)
+    except Exception as e:
+        print(f"⚠️ Token revoke failed on logout: {e}")
+
+    if session:
+        await _bind_sid_identity(
+            sid=sid,
+            new_user_id=f"anon_{sid}",
+            is_authenticated=False,
+            session_token=None
+        )
+
+    await sio.emit("logged_out", {"success": True, "user_id": "anonymous"}, room=sid)
+
+
 # ============== User Identification Helper ==============
 
 def _get_uid(sid, data=None):
-    """Robust helper to get user_id from session or data fallback."""
+    """Get user_id from current socket session only."""
     session = sessions.get(sid)
-    uid = session.user_id if session else "anonymous"
-    
-    # Check if data contains a valid user_id override
-    if uid == "anonymous" and data and isinstance(data, dict):
-        provided = data.get("user_id")
-        if provided and provided not in ("anonymous", "null", "undefined"):
-            uid = provided
-            # Update session for consistency
-            if session:
-                session.user_id = provided
-            print(f"💡 Identification: Using fallback user_id from data: {uid}")
-            
-    return uid
+    return session.user_id if session else "anonymous"
+
+
+def _normalize_feedback_thresholds(overrides):
+    """Normalize per-user strictness overrides against server defaults."""
+    try:
+        from server.agents.interview_nodes import resolve_feedback_thresholds
+        return resolve_feedback_thresholds(overrides if isinstance(overrides, dict) else {})
+    except Exception:
+        return {}
+
+
+def _normalize_recording_thresholds(overrides):
+    """Normalize per-user recording/silence settings."""
+    defaults = {
+        "silence_auto_stop_seconds": 5.0,
+        "silence_rms_threshold": 0.008,
+    }
+    src = overrides if isinstance(overrides, dict) else {}
+    normalized = dict(defaults)
+    try:
+        if "silence_auto_stop_seconds" in src:
+            normalized["silence_auto_stop_seconds"] = float(src.get("silence_auto_stop_seconds"))
+    except Exception:
+        pass
+    try:
+        if "silence_rms_threshold" in src:
+            normalized["silence_rms_threshold"] = float(src.get("silence_rms_threshold"))
+    except Exception:
+        pass
+
+    normalized["silence_auto_stop_seconds"] = max(1.0, min(20.0, normalized["silence_auto_stop_seconds"]))
+    normalized["silence_rms_threshold"] = max(0.001, min(0.05, normalized["silence_rms_threshold"]))
+    return normalized
+
+
+ALLOWED_PIPER_STYLES = {"interviewer", "balanced", "fast"}
+
+
+def _normalize_piper_style(style_value, fallback: str = "interviewer") -> str:
+    """Normalize piper style to a supported preset."""
+    normalized_fallback = str(fallback or "interviewer").strip().lower()
+    if normalized_fallback not in ALLOWED_PIPER_STYLES:
+        normalized_fallback = "interviewer"
+    normalized_value = str(style_value or "").strip().lower()
+    if normalized_value in ALLOWED_PIPER_STYLES:
+        return normalized_value
+    return normalized_fallback
+
+
+def _get_user_feedback_thresholds(user_id: str) -> dict:
+    """Load normalized strictness thresholds for a user."""
+    try:
+        prefs = get_user_db().get_user_preferences(user_id) or {}
+        return _normalize_feedback_thresholds(prefs.get("evaluation_thresholds") or {})
+    except Exception:
+        return _normalize_feedback_thresholds({})
 
 
 # ============== User Preferences & History Events ==============
@@ -607,17 +1190,49 @@ def _get_uid(sid, data=None):
 @sio.event
 async def save_preferences(sid, data):
     """Save user preferences (resume, target role, focus areas)."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    data = data or {}
     user_id = _get_uid(sid, data)
     user_db = get_user_db()
+
+    existing = user_db.get_user_preferences(user_id) or {}
+    question_override = data.get("question_count_override", existing.get("question_count_override"))
+    if question_override in ("", None):
+        question_override = None
+    else:
+        try:
+            question_override = int(question_override)
+        except Exception:
+            question_override = existing.get("question_count_override")
+    incoming_thresholds = data.get("evaluation_thresholds", existing.get("evaluation_thresholds", {}))
+    normalized_thresholds = _normalize_feedback_thresholds(incoming_thresholds)
+    incoming_recording_thresholds = data.get("recording_thresholds", existing.get("recording_thresholds", {}))
+    normalized_recording_thresholds = _normalize_recording_thresholds(incoming_recording_thresholds)
+    incoming_persona = str(data.get("interviewer_persona", existing.get("interviewer_persona", "friendly")) or "friendly").strip().lower()
+    if incoming_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        incoming_persona = str(existing.get("interviewer_persona") or "friendly").strip().lower() or "friendly"
+    incoming_piper_style = _normalize_piper_style(
+        data.get("piper_style", existing.get("piper_style", "interviewer")),
+        fallback=existing.get("piper_style", "interviewer"),
+    )
     
     preferences = {
-        "resume_text": data.get("resume_text"),
-        "resume_filename": data.get("resume_filename"),
-        "target_role": data.get("target_role"),
-        "target_company": data.get("target_company"),
-        "focus_areas": data.get("focus_areas", []),
-        "onboarding_complete": data.get("onboarding_complete", False),
-        "mic_permission_granted": data.get("mic_permission_granted", False)
+        "resume_text": data.get("resume_text", existing.get("resume_text")),
+        "resume_filename": data.get("resume_filename", existing.get("resume_filename")),
+        "target_role": data.get("target_role", existing.get("target_role")),
+        "target_company": data.get("target_company", existing.get("target_company")),
+        "job_description": data.get("job_description", existing.get("job_description")),
+        "question_count_override": question_override,
+        "interviewer_persona": incoming_persona,
+        "piper_style": incoming_piper_style,
+        "evaluation_thresholds": normalized_thresholds,
+        "recording_thresholds": normalized_recording_thresholds,
+        "focus_areas": data.get("focus_areas", existing.get("focus_areas", [])),
+        "onboarding_complete": data.get("onboarding_complete", existing.get("onboarding_complete", False)),
+        "mic_permission_granted": data.get("mic_permission_granted", existing.get("mic_permission_granted", False))
     }
     
     user_db.save_user_preferences(user_id, preferences)
@@ -632,8 +1247,16 @@ async def start_career_analysis(sid, data=None):
     Can use saved preferences OR accept new resume/job_title in data.
     Implements Resource Guard pattern for cancellation.
     """
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    data = data or {}
     user_id = _get_uid(sid, data)
+    force_refresh = bool(data.get("force_refresh", False))
     print(f"🚀 Starting career analysis for {user_id}")
+    if force_refresh:
+        print(f"🔁 Force refresh enabled for {user_id}")
 
     # Resource Guard: Cancel any existing task for this user
     existing_task = active_tasks.get(user_id)
@@ -642,6 +1265,13 @@ async def start_career_analysis(sid, data=None):
         print(f"🛑 Cancelled previous task for {user_id} (double-click prevention)")
 
     user_db = get_user_db()
+    existing_prefs = user_db.get_user_preferences(user_id) or {}
+    if force_refresh:
+        try:
+            from server.services.cache import get_question_cache
+            get_question_cache().delete_user_keys(user_id)
+        except Exception as e:
+            print(f"⚠️ Failed to clear cache for force refresh: {e}")
 
     # Check if new resume/role provided in request
     if data and data.get("resume") and data.get("job_title"):
@@ -665,10 +1295,34 @@ async def start_career_analysis(sid, data=None):
             "resume_filename": f"resume_{user_id}.pdf",
             "target_role": data["job_title"],
             "target_company": data.get("company", "Tech Company"),
+            "job_description": data.get("job_description", ""),
+            "question_count_override": existing_prefs.get("question_count_override"),
+            "interviewer_persona": existing_prefs.get("interviewer_persona", "friendly"),
+            "piper_style": existing_prefs.get("piper_style", "interviewer"),
+            "evaluation_thresholds": existing_prefs.get("evaluation_thresholds", {}),
+            "recording_thresholds": existing_prefs.get("recording_thresholds", {}),
             "focus_areas": []
         }
         user_db.save_user_preferences(user_id, preferences)
         print(f"✅ Saved new preferences for {user_id}")
+    elif data and any(k in data for k in ("job_title", "company", "job_description")):
+        # Persist latest targets/JD even when resume is reused from existing prefs.
+        preferences = {
+            "resume_text": existing_prefs.get("resume_text"),
+            "resume_filename": existing_prefs.get("resume_filename"),
+            "target_role": data.get("job_title", existing_prefs.get("target_role")),
+            "target_company": data.get("company", existing_prefs.get("target_company", "Tech Company")),
+            "job_description": data.get("job_description", existing_prefs.get("job_description", "")),
+            "question_count_override": existing_prefs.get("question_count_override"),
+            "interviewer_persona": existing_prefs.get("interviewer_persona", "friendly"),
+            "piper_style": existing_prefs.get("piper_style", "interviewer"),
+            "evaluation_thresholds": existing_prefs.get("evaluation_thresholds", {}),
+            "recording_thresholds": existing_prefs.get("recording_thresholds", {}),
+            "focus_areas": existing_prefs.get("focus_areas", []),
+            "onboarding_complete": existing_prefs.get("onboarding_complete", False),
+            "mic_permission_granted": existing_prefs.get("mic_permission_granted", False),
+        }
+        user_db.save_user_preferences(user_id, preferences)
 
     # Load preferences (either just saved or existing)
     prefs = user_db.get_user_preferences(user_id)
@@ -676,6 +1330,10 @@ async def start_career_analysis(sid, data=None):
     if not prefs or not prefs.get("resume_text") or not prefs.get("target_role"):
         print(f"❌ Analysis failed: Missing prefs for {user_id}. Prefs: {prefs}")
         await sio.emit("analysis_error", {"error": "Missing resume or target role. Please complete onboarding first.", "user_id": user_id}, room=str(user_id))
+        return
+
+    if not str(prefs.get("job_description", "")).strip():
+        await sio.emit("analysis_error", {"error": "Job description is required before running analysis.", "user_id": user_id}, room=str(user_id))
         return
 
     # Helper to emit progress events
@@ -690,7 +1348,7 @@ async def start_career_analysis(sid, data=None):
     # Create cancellable task
     async def run_analysis():
         try:
-            from server.agents.nodes import analyze_career_path
+            from server.agents.nodes import analyze_career_path, normalize_practice_plan_titles
             import json
 
             # Run analysis
@@ -698,12 +1356,18 @@ async def start_career_analysis(sid, data=None):
                 resume_text=prefs["resume_text"],
                 target_role=prefs["target_role"],
                 target_company=prefs.get("target_company", "Tech Company"),
+                job_description=prefs.get("job_description", ""),
                 emit_progress=emit_progress
             )
 
             if result.get("error"):
                 await sio.emit("analysis_error", {"error": result["error"], "user_id": user_id}, room=str(user_id))
                 return
+
+            # Persist JD context in analysis payload for portability/history rendering.
+            result["job_description"] = prefs.get("job_description", "")
+            if isinstance(result.get("practice_plan"), dict):
+                result["practice_plan"] = normalize_practice_plan_titles(result["practice_plan"])
 
             # Validate JSON-serializability before saving
             try:
@@ -717,7 +1381,8 @@ async def start_career_analysis(sid, data=None):
                 user_id,
                 prefs["target_role"],
                 prefs.get("target_company", "Tech Company"),
-                result
+                result,
+                job_description=prefs.get("job_description", "")
             )
             
             # Emit final result with safe JSON serialization
@@ -740,7 +1405,7 @@ async def start_career_analysis(sid, data=None):
                 
                 # Trigger background question generation for suggestions
                 from server.agents.nodes import trigger_background_generation
-                trigger_background_generation(user_id, result)
+                trigger_background_generation(user_id, result, force_refresh=force_refresh)
 
             except (TypeError, ValueError) as json_err:
                 print(f"⚠️ JSON serialization error in career_analysis result: {json_err}")
@@ -781,6 +1446,10 @@ async def start_career_analysis(sid, data=None):
 @sio.event
 async def get_preferences(sid, data=None):
     """Get user preferences."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
     user_id = _get_uid(sid, data)
     user_db = get_user_db()
     preferences = user_db.get_user_preferences(user_id)
@@ -794,12 +1463,17 @@ async def get_preferences(sid, data=None):
 @sio.event
 async def get_interview_history(sid, data=None):
     """Get user's interview session history."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
     user_id = _get_uid(sid, data)
     limit = (data or {}).get("limit", 20)
-    
+
     user_db = get_user_db()
-    history = user_db.get_interview_history(user_id, limit)
-    
+    # Use get_session_history which is the correct method name
+    history = user_db.get_session_history(user_id, limit)
+
     await sio.emit("interview_history", {
         "history": history,
         "user_id": user_id
@@ -807,8 +1481,220 @@ async def get_interview_history(sid, data=None):
 
 
 @sio.event
+async def get_session_details(sid, data=None):
+    """Get full details of a specific interview session including all answers."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    user_id = _get_uid(sid, data)
+    session_id = (data or {}).get("session_id")
+
+    if not session_id:
+        await sio.emit("session_details_error", {
+            "error": "session_id required",
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    user_db = get_user_db()
+    details = user_db.get_session_details(session_id)
+
+    if not details:
+        await sio.emit("session_details_error", {
+            "error": "Session not found",
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    # Security: ensure the session belongs to this user
+    if details.get("user_id") != user_id:
+        await sio.emit("session_details_error", {
+            "error": "Access denied",
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    await sio.emit("session_details", {
+        "session": details,
+        "user_id": user_id
+    }, room=str(user_id))
+
+
+@sio.event
+async def get_retry_attempts(sid, data=None):
+    """Get retry attempts for a specific question in a completed session."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    payload = data or {}
+    user_id = _get_uid(sid, payload)
+    session_id = str(payload.get("session_id") or "").strip()
+    question_number = payload.get("question_number")
+
+    try:
+        question_number = int(question_number)
+    except Exception:
+        question_number = None
+
+    if not session_id or not question_number or question_number < 1:
+        await sio.emit("retry_error", {
+            "error": "session_id and valid question_number are required",
+            "session_id": session_id or None,
+            "question_number": question_number,
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    user_db = get_user_db()
+    owner_id = user_db.get_session_owner(session_id)
+    if owner_id != user_id:
+        await sio.emit("retry_error", {
+            "error": "Access denied",
+            "session_id": session_id,
+            "question_number": question_number,
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    attempts = user_db.get_retry_attempts(session_id, question_number)
+    await sio.emit("retry_attempts", {
+        "session_id": session_id,
+        "question_number": question_number,
+        "attempts": attempts,
+        "user_id": user_id
+    }, room=str(user_id))
+
+
+@sio.event
+async def submit_retry_answer(sid, data=None):
+    """Evaluate and save a report-stage retry attempt for one question."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    payload = data or {}
+    user_id = _get_uid(sid, payload)
+    session_id = str(payload.get("session_id") or "").strip()
+    answer = str(payload.get("answer") or "").strip()
+    input_mode = str(payload.get("input_mode") or "text").strip().lower() or "text"
+    duration_seconds = payload.get("duration_seconds", 0)
+    question_number = payload.get("question_number")
+
+    try:
+        question_number = int(question_number)
+    except Exception:
+        question_number = None
+
+    try:
+        duration_seconds = float(duration_seconds or 0)
+    except Exception:
+        duration_seconds = 0.0
+
+    if not session_id or not question_number or question_number < 1 or not answer:
+        await sio.emit("retry_error", {
+            "error": "session_id, question_number, and answer are required",
+            "session_id": session_id or None,
+            "question_number": question_number,
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    user_db = get_user_db()
+    owner_id = user_db.get_session_owner(session_id)
+    if owner_id != user_id:
+        await sio.emit("retry_error", {
+            "error": "Access denied",
+            "session_id": session_id,
+            "question_number": question_number,
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    original = user_db.get_answer_record(session_id, question_number)
+    if not original:
+        await sio.emit("retry_error", {
+            "error": "Original answer record not found",
+            "session_id": session_id,
+            "question_number": question_number,
+            "user_id": user_id
+        }, room=str(user_id))
+        return
+
+    # Preserve immutable baseline record for report history on first retry.
+    user_db.ensure_original_retry_snapshot(session_id, question_number)
+
+    original_eval = original.get("evaluation") or {}
+    expected_points = original_eval.get("expected_points_used") or []
+    if not isinstance(expected_points, list) or not expected_points:
+        expected_points = (
+            (original_eval.get("rubric_hits") or []) + (original_eval.get("rubric_misses") or [])
+        )[:5]
+    if not expected_points:
+        expected_points = [
+            "Directly answer the question",
+            "Explain decision process and trade-offs",
+            "Provide concrete outcome or impact",
+        ]
+
+    question_payload = {
+        "text": original.get("question_text", "Question"),
+        "category": original.get("question_category", "General"),
+        "difficulty": original.get("question_difficulty", "medium"),
+        "skill_tested": original.get("question_category", "General"),
+        "expected_points": expected_points,
+    }
+
+    from server.agents.interview_nodes import evaluate_answer_stream
+    user_thresholds = _get_user_feedback_thresholds(user_id)
+
+    async def retry_callback(msg_type, content):
+        if msg_type == "status":
+            await sio.emit("status", {"stage": f"retry_{content}", "user_id": user_id}, room=str(user_id))
+
+    await sio.emit("status", {"stage": "retry_evaluating", "user_id": user_id}, room=str(user_id))
+    evaluation = await evaluate_answer_stream(question_payload, answer, retry_callback, thresholds=user_thresholds)
+    _record_evaluation_metrics(evaluation)
+
+    baseline_score = float((original_eval or {}).get("score") or 0)
+    attempt = user_db.save_retry_attempt(
+        session_id=session_id,
+        question_number=question_number,
+        answer_text=answer,
+        input_mode=input_mode,
+        duration_seconds=duration_seconds,
+        evaluation=evaluation,
+        baseline_score=baseline_score
+    )
+    promotion = user_db.promote_retry_if_higher(session_id, question_number, attempt)
+    _record_retry_metrics(attempt.get("delta_score", 0))
+
+    await sio.emit("retry_evaluated", {
+        "session_id": session_id,
+        "question_number": question_number,
+        "attempt": attempt,
+        "evaluation": evaluation,
+        "delta": {
+            "score": attempt.get("delta_score", 0),
+            "baseline_score": attempt.get("baseline_score", baseline_score),
+            "new_score": (evaluation or {}).get("score", 0),
+        },
+        "promoted_to_primary": bool((promotion or {}).get("promoted")),
+        "primary_score": (promotion or {}).get("primary_score"),
+        "previous_score": (promotion or {}).get("previous_score"),
+        "session_average_score": (promotion or {}).get("session_average_score"),
+        "user_id": user_id
+    }, room=str(user_id))
+
+
+@sio.event
 async def get_user_stats(sid, data=None):
     """Get user progress statistics."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
     user_id = _get_uid(sid, data)
     user_db = get_user_db()
     stats = user_db.get_user_stats(user_id)
@@ -820,8 +1706,171 @@ async def get_user_stats(sid, data=None):
 
 
 @sio.event
+async def get_action_queue(sid, data=None):
+    """Get persisted dashboard action queue."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    user_id = _get_uid(sid, data)
+    user_db = get_user_db()
+    queue = user_db.get_action_queue(user_id)
+
+    await sio.emit("action_queue", {
+        "actions": queue,
+        "user_id": user_id
+    }, room=str(user_id))
+
+
+@sio.event
+async def reset_analysis_workspace(sid, data=None):
+    """Reset analysis workspace artifacts and clear resume/JD inputs."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    user_id = _get_uid(sid, data)
+    user_db = get_user_db()
+    user_db.reset_analysis_workspace(user_id)
+    try:
+        from server.services.cache import get_question_cache
+        get_question_cache().delete_user_keys(user_id)
+    except Exception as e:
+        print(f"⚠️ Failed to clear in-memory cache on workspace reset: {e}")
+
+    await sio.emit("career_analysis", {"analysis": None, "user_id": user_id}, room=str(user_id))
+    await sio.emit("action_queue", {"actions": [], "user_id": user_id}, room=str(user_id))
+    prefs = user_db.get_user_preferences(user_id) or {}
+    await sio.emit("user_preferences", {"preferences": prefs, "user_id": user_id}, room=str(user_id))
+    await sio.emit("workspace_reset", {"success": True, "user_id": user_id}, room=str(user_id))
+
+
+@sio.event
+async def clear_configuration(sid, data=None):
+    """Clear saved configuration fields (resume/role/company/JD/default persona/count)."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    user_id = _get_uid(sid, data)
+    user_db = get_user_db()
+    user_db.clear_user_configuration(user_id)
+    try:
+        from server.services.cache import get_question_cache
+        get_question_cache().delete_user_keys(user_id)
+    except Exception as e:
+        print(f"⚠️ Failed to clear question cache on configuration clear: {e}")
+
+    await sio.emit("career_analysis", {"analysis": None, "user_id": user_id}, room=str(user_id))
+    await sio.emit("action_queue", {"actions": [], "user_id": user_id}, room=str(user_id))
+    prefs = user_db.get_user_preferences(user_id) or {}
+    await sio.emit("user_preferences", {"preferences": prefs, "user_id": user_id}, room=str(user_id))
+    await sio.emit("configuration_cleared", {"success": True, "user_id": user_id}, room=str(user_id))
+
+
+@sio.event
+async def delete_interview_history(sid, data=None):
+    """Delete all interview history (sessions + answers + retries) for the authenticated user."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    user_id = _get_uid(sid, data)
+    user_db = get_user_db()
+    user_db.delete_interview_history(user_id)
+
+    await sio.emit("interview_history", {"history": [], "user_id": user_id}, room=str(user_id))
+    await sio.emit("history_deleted", {"success": True, "user_id": user_id}, room=str(user_id))
+
+
+@sio.event
+async def delete_interview_session(sid, data=None):
+    """Delete a single interview session for the authenticated user."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    user_id = _get_uid(sid, data)
+    session_id = str((data or {}).get("session_id") or "").strip()
+    if not session_id:
+        await sio.emit("session_delete_error", {
+            "error": "session_id required",
+            "user_id": user_id,
+        }, room=str(user_id))
+        return
+
+    user_db = get_user_db()
+    deleted = user_db.delete_interview_session(user_id, session_id)
+    if not deleted:
+        await sio.emit("session_delete_error", {
+            "error": "Session not found",
+            "session_id": session_id,
+            "user_id": user_id,
+        }, room=str(user_id))
+        return
+
+    history = user_db.get_session_history(user_id, 30)
+    await sio.emit("interview_history", {"history": history, "user_id": user_id}, room=str(user_id))
+    await sio.emit("session_deleted", {
+        "success": True,
+        "session_id": session_id,
+        "user_id": user_id,
+    }, room=str(user_id))
+
+
+@sio.event
+async def reset_all_data(sid, data=None):
+    """Full reset: clear interview history, configuration, and analysis workspace artifacts."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    user_id = _get_uid(sid, data)
+    user_db = get_user_db()
+    user_db.reset_all_user_data(user_id)
+    try:
+        from server.services.cache import get_question_cache
+        get_question_cache().delete_user_keys(user_id)
+    except Exception as e:
+        print(f"⚠️ Failed to clear cache on full reset: {e}")
+
+    await sio.emit("career_analysis", {"analysis": None, "user_id": user_id}, room=str(user_id))
+    await sio.emit("interview_history", {"history": [], "user_id": user_id}, room=str(user_id))
+    await sio.emit("action_queue", {"actions": [], "user_id": user_id}, room=str(user_id))
+    prefs = user_db.get_user_preferences(user_id) or {}
+    await sio.emit("user_preferences", {"preferences": prefs, "user_id": user_id}, room=str(user_id))
+    await sio.emit("all_data_reset", {"success": True, "user_id": user_id}, room=str(user_id))
+
+
+@sio.event
+async def save_action_queue(sid, data=None):
+    """Persist dashboard action queue updates."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    payload = data or {}
+    actions = payload.get("actions", [])
+    if not isinstance(actions, list):
+        actions = []
+
+    user_id = _get_uid(sid, payload)
+    user_db = get_user_db()
+    user_db.save_action_queue(user_id, actions)
+
+    await sio.emit("action_queue", {
+        "actions": actions,
+        "user_id": user_id
+    }, room=str(user_id))
+
+
+@sio.event
 async def get_latest_analysis(sid, data=None):
     """Get the most recent career analysis for the user."""
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
     user_id = _get_uid(sid, data)
     user_db = get_user_db()
     # reuse get_career_analyses but limit 1
@@ -830,15 +1879,17 @@ async def get_latest_analysis(sid, data=None):
     if recent:
         # Transform DB format to Frontend format
         saved_analysis = recent[0]
+        analysis_data = _normalize_latest_analysis_payload(user_id, saved_analysis)
         mapped_analysis = {
             "job_title": saved_analysis.get("job_title"),
             "company": saved_analysis.get("company"),
+            "job_description": saved_analysis.get("job_description") or analysis_data.get("job_description", ""),
             "readiness_score": saved_analysis.get("readiness_score"),
             "skill_gaps": saved_analysis.get("skill_gaps", []),
             "bridge_roles": saved_analysis.get("bridge_roles", []),
-            "suggested_sessions": saved_analysis.get("suggested_sessions", []) or saved_analysis.get("analysis", {}).get("suggested_sessions", []),
-            "practice_plan": saved_analysis.get("practice_plan") or saved_analysis.get("analysis", {}).get("practice_plan"),
-            "analysis_data": saved_analysis.get("analysis", {})
+            "suggested_sessions": saved_analysis.get("suggested_sessions", []) or analysis_data.get("suggested_sessions", []),
+            "practice_plan": analysis_data.get("practice_plan"),
+            "analysis_data": analysis_data
         }
         
         await sio.emit("career_analysis", {"analysis": mapped_analysis, "user_id": user_id}, room=str(user_id))
@@ -853,6 +1904,11 @@ async def regenerate_suggestions(sid, data):
     """
     Regenerate suggested sessions based on user prompt.
     """
+    session = await _require_socket_auth(sid)
+    if not session:
+        return
+
+    data = data or {}
     user_id = _get_uid(sid, data)
     user_prompt = data.get("prompt", "")
     current_analysis_id = data.get("analysis_id") # Optional/Future use
@@ -887,7 +1943,8 @@ async def regenerate_suggestions(sid, data):
         "job_requirements": full_analysis.get("job_requirements", {}),
         "skill_mapping": full_analysis.get("skill_mapping", {}),
         "readiness_score": latest.get("readiness_score", 0.5),
-        "suggested_sessions": latest.get("suggested_sessions", [])
+        "suggested_sessions": latest.get("suggested_sessions", []),
+        "job_description": latest.get("job_description", "")
     }
     
     try:
@@ -913,7 +1970,8 @@ async def regenerate_suggestions(sid, data):
             user_id,
             latest["job_title"],
             latest["company"],
-            new_state
+            new_state,
+            job_description=latest.get("job_description", "")
         )
         
         # Emit new suggestions
@@ -936,14 +1994,12 @@ async def regenerate_suggestions(sid, data):
 @sio.event
 async def user_audio_chunk(sid, data):
     """
-    Handle incoming audio chunks with improved buffer management.
-    - Circular buffer (max 30s)
-    - Smart transcription timing (every 2s of new audio)
-    - Deduplication
-    - Proper interview mode handling
+    Handle incoming audio chunks with low-latency partial STT and utterance finalization.
     """
     session = sessions.get(sid)
     if session is None:
+        return
+    if not session.accept_audio_chunks:
         return
     
     try:
@@ -971,12 +2027,21 @@ async def user_audio_chunk(sid, data):
         import time
         current_time = time.time()
         audio_processor = get_audio_processor()
+        streaming_audio_processor = get_streaming_audio_processor()
         
         # Check volume of recent audio
         recent_chunk = bytes(session.audio_buffer[-len(audio_bytes):]) if len(audio_bytes) > 0 else b''
         rms = audio_processor.calculate_rms(recent_chunk) if recent_chunk else 0
         is_speaking = rms > 0.012  # Noise gate
-        
+
+        if is_speaking and not session.was_speaking:
+            # Start a fresh utterance from this chunk boundary.
+            session.current_utterance_start_position = max(
+                session.last_finalized_position,
+                len(session.audio_buffer) - len(audio_bytes),
+            )
+            session.current_partial_transcript = ""
+
         # Track speaking state
         if is_speaking:
             session.was_speaking = True
@@ -989,21 +2054,22 @@ async def user_audio_chunk(sid, data):
         if session.silence_start_time:
             silence_duration = current_time - session.silence_start_time
         is_extended_silence = silence_duration > 1.5  # 1.5s of silence
-        
-        # Determine if we should transcribe
-        should_transcribe = (
-            session.should_transcribe(current_time) and (is_speaking or is_extended_silence)
-        ) or (
-            # Also transcribe if user just stopped speaking
-            not is_speaking and session.was_speaking and silence_duration > 0.8
+
+        should_partial_transcribe = session.interview_active and is_speaking and session.should_transcribe(current_time)
+        should_finalize_utterance = (
+            session.interview_active and
+            not is_speaking and
+            session.was_speaking and
+            silence_duration >= session.FINALIZE_SILENCE_SECONDS
         )
-        
-        if not should_transcribe:
+        should_process_chat = (not session.interview_active) and is_extended_silence
+
+        if not (should_partial_transcribe or should_finalize_utterance or should_process_chat):
             return
         
         # Skip transcription if too quiet overall
         buffer_rms = audio_processor.calculate_rms(bytes(session.audio_buffer[-32000:])) if len(session.audio_buffer) > 32000 else rms
-        if buffer_rms < 0.01:
+        if buffer_rms < 0.01 and not (should_finalize_utterance or should_process_chat):
             print(f"🔇 Skipping quiet buffer (RMS: {buffer_rms:.4f})")
             session.last_transcribe_time = current_time
             return
@@ -1012,105 +2078,39 @@ async def user_audio_chunk(sid, data):
         
         try:
             if session.interview_active:
-                # Interview Mode - Transcribe with overlap for context
-                OVERLAP = 16000  # 1 second overlap for context
-                start_pos = max(0, session.last_transcribed_position - OVERLAP)
-                audio_to_transcribe = bytes(session.audio_buffer[start_pos:])
-                
-                print(f"🎙️ Transcribing {len(audio_to_transcribe)} bytes (pos {start_pos} to {len(session.audio_buffer)})")
-                
-                transcript = await audio_processor.transcribe_buffer_async(audio_to_transcribe)
-                
-                # Update position
-                session.last_transcribed_position = len(session.audio_buffer)
-                session.last_transcribe_time = current_time
-                
-                if transcript.strip():
-                    # Deduplication check
-                    is_duplicate = False
-                    if session.recent_transcripts:
-                        for recent in session.recent_transcripts[-2:]:
-                            if transcript_similarity(transcript, recent) > 0.85:
-                                print(f"🔄 Skipping duplicate transcript")
-                                is_duplicate = True
-                                break
-                    
-                    if not is_duplicate:
-                        # Merge with existing transcript
-                        session.current_answer_transcript = merge_transcript(
-                            session.current_answer_transcript,
-                            transcript
-                        )
-                        
-                        # Track for dedup
-                        session.recent_transcripts.append(transcript)
-                        session.recent_transcripts = session.recent_transcripts[-3:]
-                        
-                        # Emit full accumulated transcript
-                        await sio.emit("transcript", {
-                            "text": session.current_answer_transcript,
-                            "full": session.current_answer_transcript,
-                            "user_id": session.user_id
-                        }, room=str(session.user_id))
-                        
-                        print(f"📝 Transcript: {session.current_answer_transcript[:80]}...")
-                        
-                        # Coaching hints logic
-                        if session.answer_start_time:
-                            answer_duration = current_time - session.answer_start_time
-                        else:
-                            answer_duration = 0
-                        
-                        words = session.current_answer_transcript.lower().split()
-                        filler_words = ['uh', 'uhm', 'um', 'hmm', 'err', 'like,', '...']
-                        last_words = words[-5:] if len(words) >= 5 else words
-                        has_fillers = any(fw in ' '.join(last_words) for fw in filler_words)
-                        
-                        hint_count = len(session.hints_given)
-                        hint_cooldown = 5 if hint_count == 0 else 10
-                        
-                        should_hint = (
-                            session.coaching_enabled and
-                            (current_time - session.last_hint_time) > hint_cooldown and
-                            is_extended_silence and
-                            (
-                                (answer_duration > 5 and len(words) < 10) or
-                                (has_fillers and len(words) < 20) or
-                                (answer_duration > 20)
-                            )
-                        )
-                        
-                        if should_hint:
-                            session.last_hint_time = current_time
-                            hint_level = hint_count + 1
-                            print(f"🤔 Generating hint level {hint_level}")
-                            
-                            async def send_hint():
-                                try:
-                                    from server.services.coaching_service import generate_coaching_hint
-                                    current_q = session.interview_questions[session.current_question_index] if session.interview_questions else {}
-                                    hint = await generate_coaching_hint(
-                                        session.current_answer_transcript,
-                                        current_q,
-                                        previous_hints=session.hints_given,
-                                        hint_level=hint_level
-                                    )
-                                    if hint:
-                                        print(f"💡 Hint L{hint_level}: {hint}")
-                                        session.hints_given.append(hint)
-                                        await sio.emit("coaching_hint", {"message": hint, "level": hint_level, "user_id": session.user_id}, room=str(session.user_id))
-                                except Exception as e:
-                                    print(f"⚠️ Hint error: {e}")
-                            
-                            asyncio.create_task(send_hint())
+                if should_partial_transcribe:
+                    start_pos = max(0, min(session.current_utterance_start_position, len(session.audio_buffer)))
+                    audio_to_transcribe = bytes(session.audio_buffer[start_pos:])
+                    if len(audio_to_transcribe) >= 6400:  # ~200ms minimum
+                        transcript = await streaming_audio_processor.transcribe_buffer_async(audio_to_transcribe)
+                        transcript = (transcript or "").strip()
+                        session.last_transcribed_position = len(session.audio_buffer)
+                        session.last_transcribe_time = current_time
+
+                        if transcript and not _should_drop_false_start(session.finalized_answer_transcript, transcript):
+                            if transcript_similarity(transcript, session.current_partial_transcript) < 0.98:
+                                session.current_partial_transcript = transcript
+                                composed = _combine_final_and_partial(
+                                    session.finalized_answer_transcript,
+                                    session.current_partial_transcript,
+                                )
+                                if composed != session.current_answer_transcript:
+                                    session.current_answer_transcript = composed
+                                    await _emit_transcript_update(session, is_final=False)
+                                    print(f"📝 Partial: {session.current_answer_transcript[:80]}...")
+
+                if should_finalize_utterance:
+                    await _finalize_current_utterance(session, reason="silence")
+
+                await _maybe_emit_coaching_hint(session, current_time, is_extended_silence)
             else:
                 # Normal Chat Mode
-                if is_extended_silence:
+                if should_process_chat:
                     await process_audio_and_respond(sid, session)
         finally:
             session.is_processing = False
             # Reset speaking state after extended silence
-            if is_extended_silence:
+            if is_extended_silence and not session.interview_active:
                 session.was_speaking = False
     
     except Exception as e:
@@ -1132,10 +2132,34 @@ async def force_transcribe(sid):
     if len(session.audio_buffer) > 0:
         session.is_processing = True
         try:
-            await process_audio_and_respond(sid, session)
+            if session.interview_active:
+                await _finalize_current_utterance(session, reason="force")
+            else:
+                await process_audio_and_respond(sid, session)
         finally:
             session.is_processing = False
             session.audio_buffer.clear()
+            session.last_transcribed_position = 0
+            session.last_finalized_position = 0
+            session.current_utterance_start_position = 0
+            session.current_partial_transcript = ""
+            session.was_speaking = False
+            session.silence_start_time = None
+
+
+@sio.event
+async def set_recording_state(sid, data):
+    """Client toggles recording lifecycle; backend uses this to gate audio chunks."""
+    session = sessions.get(sid)
+    if session is None:
+        return
+
+    data = data or {}
+    recording = bool(data.get("recording", False))
+    session.accept_audio_chunks = recording and session.interview_active
+    if not session.accept_audio_chunks:
+        session.was_speaking = False
+        session.silence_start_time = None
 
 
 @sio.event
@@ -1201,17 +2225,33 @@ async def submit_audio(sid, data):
         os.remove(temp_path)
         
         if text.strip():
+            if session.interview_active and _should_drop_false_start(session.current_answer_transcript, text):
+                print(f"🔇 Dropping false-start transcript: {text!r}")
+                return
+
             print(f"🗣️ Transcribed: {text[:50]}...")
-            # Emit transcript back to user
-            await sio.emit("transcript", {"text": text, "user_id": session.user_id}, room=str(session.user_id))
-            
-            # Process as Answer
-            session.is_processing = True
-            await sio.emit("status", {"stage": "analyzing", "user_id": session.user_id}, room=str(session.user_id))
-            try:
-                 await process_text_and_respond(sid, session, text)
-            finally:
-                 session.is_processing = False
+
+            # In interview mode we only keep transcript; no live LLM/TTS feedback.
+            if session.interview_active:
+                merged = merge_transcript(
+                    session.finalized_answer_transcript,
+                    text
+                )
+                if merged != session.finalized_answer_transcript:
+                    session.finalized_answer_transcript = merged
+                    session.current_partial_transcript = ""
+                    session.current_answer_transcript = merged
+                    await _emit_transcript_update(session, is_final=True)
+            else:
+                # Emit transcript back to user
+                await sio.emit("transcript", {"text": text, "user_id": session.user_id}, room=str(session.user_id))
+                # Process as chat answer for non-interview mode
+                session.is_processing = True
+                await sio.emit("status", {"stage": "analyzing", "user_id": session.user_id}, room=str(session.user_id))
+                try:
+                    await process_text_and_respond(sid, session, text)
+                finally:
+                    session.is_processing = False
         else:
             print("⚠️ Transcription empty")
             
@@ -1276,21 +2316,42 @@ async def process_text_and_respond(sid: str, session: SessionState, text: str):
     # Emit complete response
     await sio.emit("llm_complete", {"text": full_response, "user_id": session.user_id}, room=str(session.user_id))
     
-    # Step 2: Generate TTS audio
+    # Step 2: Generate TTS audio (non-fatal if unavailable/slow)
     await sio.emit("status", {"stage": "speaking", "user_id": session.user_id}, room=str(session.user_id))
-    
-    tts_service = get_tts_service()
-    audio_base64 = await tts_service.speak_wav_base64_async(full_response)
-    
-    # Send audio to client
-    await sio.emit("tts_audio", {
-        "audio": audio_base64,
-        "format": "wav",
-        "sample_rate": 24000,
-        "user_id": session.user_id
-    }, room=str(session.user_id))
-    
-    await sio.emit("status", {"stage": "ready", "user_id": session.user_id}, room=str(session.user_id))
+
+    try:
+        await _await_tts_warmup_if_needed()
+        tts_service = get_tts_service()
+        tts_timeout = _compute_tts_timeout(full_response)
+        audio_base64 = await asyncio.wait_for(
+            tts_service.speak_wav_base64_async(
+                full_response,
+                style=getattr(session, "tts_style", "interviewer"),
+            ),
+            timeout=tts_timeout,
+        )
+
+        # Send audio to client
+        await sio.emit("tts_audio", {
+            "audio": audio_base64,
+            "format": "wav",
+            "sample_rate": tts_service.sample_rate,
+            "user_id": session.user_id
+        }, room=str(session.user_id))
+    except asyncio.TimeoutError:
+        print(f"⚠️ TTS timed out after {tts_timeout:.1f}s (continuing without audio)")
+        await sio.emit("tts_error", {
+            "error": "TTS timed out; continuing without audio.",
+            "user_id": session.user_id
+        }, room=str(session.user_id))
+    except Exception as e:
+        print(f"⚠️ TTS failed in process_text_and_respond (continuing): {e}")
+        await sio.emit("tts_error", {
+            "error": "TTS unavailable; continuing without audio.",
+            "user_id": session.user_id
+        }, room=str(session.user_id))
+    finally:
+        await sio.emit("status", {"stage": "ready", "user_id": session.user_id}, room=str(session.user_id))
 
 
 # ============== Career Analysis ==============
@@ -1327,9 +2388,13 @@ async def request_hint(sid):
             )
             
             if hint:
-                print(f"💡 Manual Hint L{hint_level}: {hint}")
-                session.hints_given.append(hint)
-                await sio.emit("coaching_hint", {"message": hint, "level": hint_level, "user_id": session.user_id}, room=str(session.user_id))
+                hint_message = hint["message"] if isinstance(hint, dict) else str(hint)
+                print(f"💡 Manual Hint L{hint_level}: {hint_message}")
+                session.hints_given.append(hint_message)
+                payload = {"message": hint_message, "level": hint_level, "user_id": session.user_id}
+                if isinstance(hint, dict):
+                    payload.update({k: v for k, v in hint.items() if k != "message"})
+                await sio.emit("coaching_hint", payload, room=str(session.user_id))
             else:
                 await sio.emit("coaching_hint", {"message": "Try to break down the problem into smaller steps.", "level": 1, "user_id": session.user_id}, room=str(session.user_id))
         except Exception as e:
@@ -1339,6 +2404,60 @@ async def request_hint(sid):
 
 
 # ============== Interview Practice Events ==============
+
+
+async def send_question_tts(session, question_text: str, question_index: Optional[int] = None):
+    """Generate TTS audio for an interview question and send to client asynchronously."""
+    try:
+        await _await_tts_warmup_if_needed()
+        tts_service = get_tts_service()
+        tts_style = getattr(session, "tts_style", "interviewer")
+        print(
+            f"🔈 Generating question TTS (q_index={question_index}, chars={len(question_text or '')}, style={tts_style})"
+        )
+        tts_timeout = _compute_tts_timeout(question_text)
+        audio_b64 = await asyncio.wait_for(
+            tts_service.speak_wav_base64_async(question_text, style=tts_style),
+            timeout=tts_timeout,
+        )
+        if not session.interview_active:
+            return
+        # Drop stale audio if user already advanced to another question.
+        if question_index is not None and session.current_question_index != question_index:
+            return
+        await sio.emit("tts_audio", {
+            "audio": audio_b64,
+            "format": "wav",
+            "sample_rate": tts_service.sample_rate,
+            "question_index": question_index,
+            "user_id": session.user_id
+        }, room=str(session.user_id))
+        print(f"🔊 TTS sent for question ({len(question_text)} chars)")
+    except asyncio.TimeoutError:
+        print(f"⚠️ Question TTS timed out after {tts_timeout:.1f}s")
+        await sio.emit("tts_error", {
+            "error": "Question audio timed out; continuing without audio.",
+            "user_id": session.user_id
+        }, room=str(session.user_id))
+    except asyncio.CancelledError:
+        # Question advanced/ended before TTS finished.
+        print(f"ℹ️ Question TTS task cancelled (q_index={question_index})")
+        return
+    except Exception as e:
+        print(f"⚠️ TTS failed (non-blocking): {e}")
+        await sio.emit("tts_error", {
+            "error": "Question audio generation failed; continuing without audio.",
+            "user_id": session.user_id
+        }, room=str(session.user_id))
+
+
+def _cancel_question_tts(session: SessionState):
+    """Cancel in-flight per-question TTS task when question/session changes."""
+    task = getattr(session, "question_tts_task", None)
+    if task and not task.done():
+        task.cancel()
+    session.question_tts_task = None
+
 
 @sio.event
 async def start_interview(sid, data):
@@ -1350,18 +2469,72 @@ async def start_interview(sid, data):
         "job_title": "from analysis",
         "skill_gaps": ["Python", "System Design"],
         "readiness_score": 0.65,
+        "interview_type": "behavioral|technical|system_design|mixed",
+        "interviewer_persona": "friendly|strict|rapid_fire|skeptical",
+        "piper_style": "interviewer|balanced|fast",
+        "question_count": 3,  // optional debug/demo override (1-12)
         "mode": "practice" | "coaching"
     }
     """
-    session = sessions.get(sid)
+    session = await _require_socket_auth(sid)
     if not session:
         return
+
+    data = data or {}
+    requested_mode = str(data.get("mode", "practice") or "practice").strip().lower()
+    if requested_mode not in {"practice", "coaching", "evaluation"}:
+        requested_mode = "practice"
+
+    requested_feedback_timing = str(data.get("feedback_timing", "end_only") or "end_only").strip().lower()
+    if requested_feedback_timing not in {"end_only", "live"}:
+        requested_feedback_timing = "end_only"
+    requested_persona = str(data.get("interviewer_persona", "") or "").strip().lower()
+    requested_tts_style = str(data.get("piper_style", "") or "").strip().lower()
+
+    explicit_coaching = data.get("coaching_enabled")
+    coaching_enabled = bool(explicit_coaching) if explicit_coaching is not None else requested_mode == "coaching"
+    live_scoring = bool(data.get("live_scoring", False)) or requested_feedback_timing == "live"
+
+    requested_question_count = None
+    if data.get("question_count") not in (None, ""):
+        try:
+            requested_question_count = int(data.get("question_count"))
+            requested_question_count = max(1, min(12, requested_question_count))
+        except Exception:
+            requested_question_count = None
     
     await sio.emit("status", {"stage": "generating_questions", "user_id": session.user_id}, room=str(session.user_id))
     
     try:
         from server.agents.interview_nodes import generate_interview_questions
         from server.services.user_database import get_user_db
+
+        if requested_question_count is None:
+            try:
+                prefs = get_user_db().get_user_preferences(session.user_id) or {}
+                pref_count = prefs.get("question_count_override")
+                if pref_count not in (None, ""):
+                    requested_question_count = max(1, min(12, int(pref_count)))
+            except Exception:
+                requested_question_count = None
+        if requested_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+            try:
+                prefs_for_persona = get_user_db().get_user_preferences(session.user_id) or {}
+                requested_persona = str(prefs_for_persona.get("interviewer_persona") or "friendly").strip().lower()
+            except Exception:
+                requested_persona = "friendly"
+        if requested_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+            requested_persona = "friendly"
+        if requested_tts_style not in ALLOWED_PIPER_STYLES:
+            try:
+                prefs_for_tts = get_user_db().get_user_preferences(session.user_id) or {}
+                requested_tts_style = _normalize_piper_style(
+                    prefs_for_tts.get("piper_style"),
+                    fallback="interviewer",
+                )
+            except Exception:
+                requested_tts_style = "interviewer"
+        requested_tts_style = _normalize_piper_style(requested_tts_style, fallback="interviewer")
         
         # CRITICAL FIX: Generate unique DB ID for every interview attempt
         db_session_id = str(uuid.uuid4())
@@ -1372,7 +2545,11 @@ async def start_interview(sid, data):
             "job_title": data.get("job_title", "Software Engineer"),
             "skill_gaps": data.get("skill_gaps", []),
             "readiness_score": data.get("readiness_score", 0.5),
-            "mode": data.get("mode", "practice")
+            "job_description": data.get("job_description", ""),
+            "interview_type": data.get("interview_type", "mixed"),
+            "question_count": requested_question_count,
+            "mode": requested_mode,
+            "interviewer_persona": requested_persona,
         }
         
         # Progress callback
@@ -1386,18 +2563,24 @@ async def start_interview(sid, data):
         session_id = data.get("session_id", suggestion_id)  # Allow explicit session_id override
         cached_questions = None
         cache_key = None
+        job_title = data.get("job_title", "generic")
+        safe_title = re.sub(r'[^a-zA-Z0-9]', '_', job_title).lower()
+        question_suffix = f"_q{requested_question_count}" if requested_question_count else ""
+        persona_suffix = f"_p{requested_persona}"
         
         if suggestion_id or session_id:
-            job_title = data.get("job_title", "generic")
-            safe_title = re.sub(r'[^a-zA-Z0-9]', '_', job_title).lower()
-            
             # Try multiple cache key formats (pre-gen may use different IDs)
-            possible_keys = [
+            base_keys = [
                 f"{session.user_id}_{safe_title}_{suggestion_id}",  # Standard: user_job_s1
                 f"{session.user_id}_{safe_title}_{session_id}",     # With session_id
                 f"{session.user_id}_{suggestion_id}",               # Short: user_s1
                 f"{session.user_id}_{session_id}",                  # Short with session_id
             ]
+            persona_keys = [f"{k}{question_suffix}{persona_suffix}" for k in base_keys]
+            legacy_keys = []
+            if requested_persona == "friendly":
+                legacy_keys = [f"{k}{question_suffix}" for k in base_keys] if question_suffix else list(base_keys)
+            possible_keys = persona_keys + legacy_keys
             
             for key in possible_keys:
                 if key:
@@ -1408,10 +2591,41 @@ async def start_interview(sid, data):
             
             # If no cache_key was set but we found questions, use first format
             if not cache_key and suggestion_id:
-                cache_key = f"{session.user_id}_{safe_title}_{suggestion_id}"
+                cache_key = f"{session.user_id}_{safe_title}_{suggestion_id}{question_suffix}{persona_suffix}"
+        else:
+            # Fallback caching for direct interview starts without suggestion/session IDs.
+            # This allows repeated runs from setup to reuse generated question sets.
+            skill_values = []
+            for item in data.get("skill_gaps", []) or []:
+                if isinstance(item, dict):
+                    value = str(item.get("name") or item.get("skill") or item.get("label") or "")
+                else:
+                    value = str(item)
+                value = value.strip().lower()
+                if value:
+                    skill_values.append(value)
+            skill_values = sorted(set(skill_values))
+
+            normalized_jd = re.sub(r"\s+", " ", str(data.get("job_description", "") or "").strip().lower())[:240]
+            fingerprint_source = "|".join([
+                str(session.user_id or ""),
+                safe_title,
+                str(data.get("interview_type", "mixed") or "mixed").strip().lower(),
+                str(requested_persona),
+                str(requested_mode),
+                str(requested_feedback_timing),
+                str(bool(coaching_enabled)),
+                str(requested_question_count or ""),
+                ",".join(skill_values),
+                normalized_jd,
+            ])
+            auto_hash = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+            cache_key = f"{session.user_id}_{safe_title}_auto_{auto_hash}{question_suffix}{persona_suffix}"
+            cached_questions = cache.get(cache_key)
             
         if cached_questions:
-            print(f"⚡ Using cached questions for {suggestion_id} (key: {cache_key})")
+            cache_label = suggestion_id if suggestion_id else "direct_start"
+            print(f"⚡ Using cached questions for {cache_label} (key: {cache_key})")
             await sio.emit("status", {"stage": "questions_ready", "user_id": session.user_id}, room=str(session.user_id))
             result = {"questions": cached_questions}
         else:
@@ -1421,7 +2635,11 @@ async def start_interview(sid, data):
                 try:
                     from server.services.user_database import get_user_db
                     user_db = get_user_db()
-                    db_questions = user_db.get_analysis_session_questions(session.user_id, suggestion_id)
+                    db_questions = user_db.get_analysis_session_questions(
+                        session.user_id,
+                        suggestion_id,
+                        interviewer_persona=requested_persona
+                    )
                 except Exception as e:
                     print(f"⚠️ DB Fallback failed: {e}")
             
@@ -1438,16 +2656,41 @@ async def start_interview(sid, data):
                 if cache_key and result.get("questions"):
                     cache.set(cache_key, result["questions"])
 
+        if requested_question_count and result.get("questions"):
+            result["questions"] = result["questions"][:requested_question_count]
+
+        # Persist persona-specific question set on plan sessions.
+        # This prevents non-friendly personas from falling back to generic pre-generated sets.
+        if suggestion_id and result.get("questions"):
+            try:
+                from server.services.user_database import get_user_db
+                get_user_db().set_latest_analysis_session_questions(
+                    user_id=session.user_id,
+                    session_id=suggestion_id,
+                    questions=result["questions"],
+                    interviewer_persona=requested_persona
+                )
+            except Exception as e:
+                print(f"⚠️ Failed to persist persona questions for {suggestion_id}: {e}")
+
         
         # Store in session
         session.interview_active = True
         session.interview_questions = result["questions"]
         session.current_question_index = 0
-        session.interview_mode = data.get("mode", "practice")
-        session.coaching_enabled = True  # Always enable coaching hints
+        session.interview_mode = requested_mode
+        session.interview_feedback_timing = requested_feedback_timing
+        session.live_scoring_enabled = live_scoring
+        session.interviewer_persona = requested_persona
+        session.tts_style = requested_tts_style
+        session.coaching_enabled = coaching_enabled
         session.evaluations = []
         session.hints_given = []  # Clear hint history
+        session.answer_submission_in_flight = False
+        session.accept_audio_chunks = False
+        session.end_requested = False
         session.job_title = data.get("job_title", "Software Engineer")
+        session.clear_for_new_question()
         
         # Store db_session_id in session for later DB updates
         session.db_session_id = db_session_id
@@ -1471,6 +2714,11 @@ async def start_interview(sid, data):
             "session_id": db_session_id,  # Send back the valid unique ID
             "total_questions": len(session.interview_questions),
             "mode": session.interview_mode,
+            "coaching_enabled": session.coaching_enabled,
+            "interviewer_persona": session.interviewer_persona,
+            "piper_style": session.tts_style,
+            "feedback_timing": session.interview_feedback_timing,
+            "live_scoring": session.live_scoring_enabled,
             "user_id": session.user_id
         }, room=str(session.user_id))
         
@@ -1480,42 +2728,37 @@ async def start_interview(sid, data):
             "total_questions": len(session.interview_questions),
             "user_id": session.user_id
         }, room=str(session.user_id))
-        
+
+        # TTS: Read the question aloud (non-blocking, one task per session)
+        _cancel_question_tts(session)
+        session.question_tts_task = asyncio.create_task(
+            send_question_tts(session, first_q["text"], question_index=0)
+        )
+
         # Generate initial coaching tip for the question (non-blocking)
         async def send_initial_tip():
             try:
-                from server.services.llm_factory import get_fast_chat_model
-                from langchain_core.messages import SystemMessage
-                
-                category = first_q.get("category", "General")
-                difficulty = first_q.get("difficulty", "medium")
-                
-                prompt = f"""Generate a brief, encouraging coaching tip for someone about to answer this interview question.
-Question: {first_q.get('text', '')[:200]}
-Category: {category}
-Difficulty: {difficulty}
+                from server.services.coaching_service import generate_coaching_hint
 
-Give ONE actionable tip in 10-15 words. Be encouraging. No quotes or prefixes."""
-                
-                chat_model = get_fast_chat_model()
-                response = await chat_model.ainvoke([SystemMessage(content=prompt)])
-                tip = response.content.strip().replace('"', '').replace("'", "")
-                
-                # Clean up common prefixes
-                for prefix in ["Tip:", "Hint:", "Remember:", "Try:"]:
-                    if tip.startswith(prefix):
-                        tip = tip[len(prefix):].strip()
-                
-                await sio.emit("coaching_hint", {
-                    "message": tip,
-                    "level": 0,  # Initial tip
-                    "user_id": session.user_id
-                }, room=str(session.user_id))
-                print(f"💡 Initial tip: {tip}")
+                hint = await generate_coaching_hint(
+                    transcript="",
+                    question=first_q,
+                    previous_hints=[],
+                    hint_level=0
+                )
+
+                if hint:
+                    hint_message = hint["message"] if isinstance(hint, dict) else str(hint)
+                    payload = {"message": hint_message, "level": 0, "user_id": session.user_id}
+                    if isinstance(hint, dict):
+                        payload.update({k: v for k, v in hint.items() if k != "message"})
+                    await sio.emit("coaching_hint", payload, room=str(session.user_id))
+                    print(f"💡 Initial tip: {hint_message}")
             except Exception as e:
                 print(f"⚠️ Initial tip generation skipped: {e}")
         
-        asyncio.create_task(send_initial_tip())
+        if session.coaching_enabled:
+            asyncio.create_task(send_initial_tip())
         
     except Exception as e:
         print(f"❌ Error starting interview: {e}")
@@ -1539,28 +2782,28 @@ async def submit_interview_answer(sid, data):
     session = sessions.get(sid)
     if not session or not session.interview_active:
         return
+    data = data or {}
+    session.accept_audio_chunks = False
+    if session.answer_submission_in_flight:
+        await sio.emit("status", {"stage": "answer_already_submitting", "user_id": session.user_id}, room=str(session.user_id))
+        return
     
+    session.answer_submission_in_flight = True
     try:
         from server.agents.interview_nodes import evaluate_answer_stream
-        from server.services.audio_service import get_audio_processor
         
         # Get current question
         current_q = session.interview_questions[session.current_question_index]
+        await _finalize_current_utterance(session, reason="force")
         user_answer = data.get("answer", "")
         
-        # Prefer accumulated transcript over full retranscription
+        # Prefer finalized high-accuracy transcript over partial.
         if not user_answer.strip():
-            # Use the incrementally accumulated transcript (already deduped and merged)
-            user_answer = session.current_answer_transcript.strip()
-            print(f"📝 Using accumulated transcript ({len(user_answer)} chars)")
-            
-            # Only retranscribe full buffer if accumulated is too short (< 10 words)
-            if len(user_answer.split()) < 10 and len(session.audio_buffer) > 32000:
-                print(f"📝 Accumulated too short, retranscribing {len(session.audio_buffer)} bytes...")
-                audio_processor = get_audio_processor()
-                full_transcript = await audio_processor.transcribe_buffer_async(bytes(session.audio_buffer))
-                if len(full_transcript.split()) > len(user_answer.split()):
-                    user_answer = full_transcript.strip()
+            user_answer = (
+                session.finalized_answer_transcript.strip() or
+                session.current_answer_transcript.strip()
+            )
+            print(f"📝 Using finalized transcript ({len(user_answer)} chars)")
         
         if not user_answer.strip():
             await sio.emit("interview_error", {"error": "No answer detected. Please speak your answer.", "user_id": session.user_id}, room=str(session.user_id))
@@ -1574,13 +2817,16 @@ async def submit_interview_answer(sid, data):
                 await sio.emit("status", {"stage": content, "user_id": session.user_id}, room=str(session.user_id))
         
         await sio.emit("status", {"stage": "evaluating", "user_id": session.user_id}, room=str(session.user_id))
+        user_thresholds = _get_user_feedback_thresholds(session.user_id)
         
         # Evaluate answer
         evaluation = await evaluate_answer_stream(
             current_q,
             user_answer,
-            eval_callback
+            eval_callback,
+            thresholds=user_thresholds,
         )
+        _record_evaluation_metrics(evaluation)
         
         # Store evaluation
         session.evaluations.append({
@@ -1608,12 +2854,19 @@ async def submit_interview_answer(sid, data):
         else:
             print(f"⚠️ No db_session_id found for session {sid}, answer not saved to DB")
         
-        # Send complete evaluation
-        await sio.emit("answer_evaluated", {
-            "question_number": session.current_question_index + 1,
-            "evaluation": evaluation,
-            "user_id": session.user_id
-        }, room=str(session.user_id))
+        # Live per-question scoring is optional. Default flow grades silently and shows report at session end.
+        if session.live_scoring_enabled:
+            await sio.emit("answer_evaluated", {
+                "question_number": session.current_question_index + 1,
+                "evaluation": evaluation,
+                "user_id": session.user_id
+            }, room=str(session.user_id))
+
+        # If user pressed End Session while this answer was being evaluated,
+        # finish immediately after persisting this attempt.
+        if session.end_requested:
+            await finish_interview(sid, session)
+            return
         
         # Move to next question or finish
         session.current_question_index += 1
@@ -1630,39 +2883,129 @@ async def submit_interview_answer(sid, data):
                 "total_questions": len(session.interview_questions),
                 "user_id": session.user_id
             }, room=str(session.user_id))
+
+            # TTS: Read next question aloud (cancel stale previous task first)
+            _cancel_question_tts(session)
+            session.question_tts_task = asyncio.create_task(
+                send_question_tts(
+                    session,
+                    next_q["text"],
+                    question_index=session.current_question_index,
+                )
+            )
         else:
             # Interview complete
             await finish_interview(sid, session)
-            
+
     except Exception as e:
         print(f"❌ Error evaluating answer: {e}")
         import traceback
         traceback.print_exc()
         await sio.emit("interview_error", {"error": str(e), "user_id": session.user_id}, room=str(session.user_id))
+    finally:
+        session.answer_submission_in_flight = False
 
 
 async def finish_interview(sid: str, session: SessionState):
     """Complete interview and generate summary report."""
     from server.agents.interview_nodes import generate_interview_summary
     
-    summary = await generate_interview_summary(session.evaluations)
-    
+    session.accept_audio_chunks = False
+    session.end_requested = False
+    _cancel_question_tts(session)
+
+    try:
+        summary = await generate_interview_summary(session.evaluations)
+    except Exception as e:
+        print(f"⚠️ Summary generation failed in finish_interview: {e}")
+        summary = {
+            "total_questions": len(session.evaluations),
+            "average_score": 0,
+            "overall_breakdown": {
+                "clarity": 0.0,
+                "accuracy": 0.0,
+                "completeness": 0.0,
+                "structure": 0.0,
+            },
+            "score_breakdown": {
+                "clarity": 0.0,
+                "accuracy": 0.0,
+                "completeness": 0.0,
+                "structure": 0.0,
+            },
+            "top_strengths": [],
+            "strengths": [],
+            "areas_to_improve": [],
+            "overall_feedback": "Interview ended. Summary generation failed; please retry report generation.",
+            "action_items": [],
+            "communication_feedback": "",
+            "performance_breakdown": {"excellent": 0, "good": 0, "needs_work": len(session.evaluations)},
+            "telemetry": {
+                "pace": 0,
+                "fillerWords": 0,
+                "confidence": "N/A",
+                "word_count": 0,
+                "filler_detail": {},
+                "avg_sentence_length": 0,
+            },
+        }
+
     # Save session summary to database using the proper DB session ID
-    user_db = get_user_db()
-    db_sid = getattr(session, 'db_session_id', None)
-    if db_sid:
-        user_db.complete_session(db_sid, summary)
-    else:
-        print(f"⚠️ No db_session_id found, session summary not saved to DB")
-    
+    try:
+        user_db = get_user_db()
+        db_sid = getattr(session, 'db_session_id', None)
+        if db_sid:
+            user_db.complete_session(db_sid, summary)
+            updated_queue = user_db.append_report_actions(session.user_id, summary, session_id=db_sid)
+            await sio.emit("action_queue", {
+                "actions": updated_queue,
+                "user_id": session.user_id
+            }, room=str(session.user_id))
+        else:
+            print(f"⚠️ No db_session_id found, session summary not saved to DB")
+    except Exception as e:
+        print(f"⚠️ Failed persisting completed interview {getattr(session, 'db_session_id', 'unknown')}: {e}")
+
     session.interview_active = False
     
     await sio.emit("interview_complete", {
+        "session_id": getattr(session, "db_session_id", None),
         "summary": summary,
         "evaluations": session.evaluations,
-        "message": f"Interview complete! Average score: {summary['average_score']}/10",
+        "message": f"Interview complete! Average score: {summary.get('average_score', 0)}/10",
         "user_id": session.user_id
     }, room=str(session.user_id))
+
+    if settings.FEEDBACK_LOOP_V2:
+        retries = feedback_metrics["retries_total"]
+        avg_delta = (feedback_metrics["retry_delta_sum"] / retries) if retries else 0.0
+        eval_total = max(1, feedback_metrics["evaluations_total"])
+        low_quality_rate = feedback_metrics["low_transcript_quality"] / eval_total
+        retry_usage_rate = retries / eval_total
+        retry_success_rate = (feedback_metrics["retry_improved_count"] / retries) if retries else 0.0
+        avg_score_v1 = (
+            feedback_metrics["score_sum_v1"] / feedback_metrics["score_count_v1"]
+            if feedback_metrics["score_count_v1"] else 0.0
+        )
+        avg_score_v2 = (
+            feedback_metrics["score_sum_v2"] / feedback_metrics["score_count_v2"]
+            if feedback_metrics["score_count_v2"] else 0.0
+        )
+        print(
+            "📊 Feedback v2 metrics: eval=%s v2=%s low_stt=%s (%.2f) retries=%s retry_usage=%.2f retry_success=%.2f avg_delta=%.2f avg_v1=%.2f avg_v2=%.2f"
+            % (
+                feedback_metrics["evaluations_total"],
+                feedback_metrics["evaluations_v2"],
+                feedback_metrics["low_transcript_quality"],
+                low_quality_rate,
+                retries,
+                retry_usage_rate,
+                retry_success_rate,
+                avg_delta,
+                avg_score_v1,
+                avg_score_v2,
+            )
+        )
 
 
 @sio.event
@@ -1716,59 +3059,229 @@ async def skip_question(sid, data):
     session = sessions.get(sid)
     if not session or not session.interview_active:
         return
+    if session.answer_submission_in_flight:
+        return
+    if session.current_question_index >= len(session.interview_questions):
+        return
+    session.answer_submission_in_flight = True
+    session.accept_audio_chunks = False
     
-    # Record skip
-    current_q = session.interview_questions[session.current_question_index]
-    skip_eval = {"score": 0, "score_breakdown": {"clarity": 0, "accuracy": 0, "completeness": 0}}
-    session.evaluations.append({
-        "question": current_q,
-        "answer": "(Skipped)",
-        "evaluation": skip_eval,
-        "duration": 0,
-        "skipped": True
-    })
+    try:
+        _cancel_question_tts(session)
 
-    # Save skip to database
-    db_sid = getattr(session, 'db_session_id', None)
-    if db_sid:
-        user_db = get_user_db()
-        user_db.save_answer(
-            session_id=db_sid,
-            question_number=session.current_question_index + 1,
-            question_text=current_q.get("text", ""),
-            question_category=current_q.get("category", "Technical"),
-            question_difficulty=current_q.get("difficulty", "intermediate"),
-            user_answer="(Skipped)",
-            evaluation=skip_eval,
-            duration_seconds=0,
-            skipped=True
-        )
+        # Record skip
+        current_q = session.interview_questions[session.current_question_index]
+        skip_eval = {
+            "evaluation_version": "v2",
+            "score": 0,
+            "score_breakdown": {"clarity": 0, "accuracy": 0, "completeness": 0, "structure": 0},
+            "strengths": [],
+            "missing_concepts": ["Question skipped"],
+            "rubric_hits": [],
+            "rubric_misses": ["Question skipped"],
+            "quality_flags": ["skipped"],
+            "confidence": 0.0,
+            "evidence_quotes": [],
+            "improvement_plan": {
+                "focus": "Answer the full question",
+                "steps": [
+                    "Give a direct response first.",
+                    "Support with a specific example.",
+                    "Close with measurable impact.",
+                ],
+                "success_criteria": [
+                    "Addresses the prompt directly",
+                    "Includes concrete context and action",
+                    "Ends with a clear outcome",
+                ],
+            },
+            "retry_drill": {
+                "prompt": "Retry this skipped question with a structured answer.",
+                "target_points": ["Direct answer", "Specific example", "Outcome"],
+            },
+            "coaching_tip": "Answer this question in full to unlock useful feedback.",
+            "optimized_answer": "",
+            "feedback": "Question was skipped.",
+        }
+        session.evaluations.append({
+            "question": current_q,
+            "answer": "(Skipped)",
+            "evaluation": skip_eval,
+            "duration": 0,
+            "skipped": True
+        })
 
-    session.current_question_index += 1
-    
-    if session.current_question_index < len(session.interview_questions):
-        next_q = session.interview_questions[session.current_question_index]
-        session.clear_for_new_question()  # Proper buffer reset
-        session.answer_start_time = time.time()
+        # Save skip to database
+        db_sid = getattr(session, 'db_session_id', None)
+        if db_sid:
+            user_db = get_user_db()
+            user_db.save_answer(
+                session_id=db_sid,
+                question_number=session.current_question_index + 1,
+                question_text=current_q.get("text", ""),
+                question_category=current_q.get("category", "Technical"),
+                question_difficulty=current_q.get("difficulty", "intermediate"),
+                user_answer="(Skipped)",
+                evaluation=skip_eval,
+                duration_seconds=0,
+                skipped=True
+            )
+
+        session.current_question_index += 1
         
-        await sio.emit("interview_question", {
-            "question": next_q,
-            "question_number": session.current_question_index + 1,
-            "total_questions": len(session.interview_questions),
-            "user_id": session.user_id
-        }, room=str(session.user_id))
-    else:
-        await finish_interview(sid, session)
+        if session.current_question_index < len(session.interview_questions):
+            next_q = session.interview_questions[session.current_question_index]
+            session.clear_for_new_question()  # Proper buffer reset
+            session.answer_start_time = time.time()
+            
+            await sio.emit("interview_question", {
+                "question": next_q,
+                "question_number": session.current_question_index + 1,
+                "total_questions": len(session.interview_questions),
+                "user_id": session.user_id
+            }, room=str(session.user_id))
+
+            # TTS: Read next question aloud
+            session.question_tts_task = asyncio.create_task(
+                send_question_tts(
+                    session,
+                    next_q["text"],
+                    question_index=session.current_question_index,
+                )
+            )
+        else:
+            await finish_interview(sid, session)
+    finally:
+        session.answer_submission_in_flight = False
 
 
 @sio.event
-async def end_interview_early(sid, data):
+async def end_interview_early(sid, data=None):
     """End interview before all questions are answered."""
     session = sessions.get(sid)
     if not session or not session.interview_active:
         return
-    
-    await finish_interview(sid, session)
+    session.accept_audio_chunks = False
+    session.end_requested = True
+    _cancel_question_tts(session)
+
+    if session.answer_submission_in_flight:
+        await sio.emit("status", {
+            "stage": "ending_after_current_evaluation",
+            "user_id": session.user_id
+        }, room=str(session.user_id))
+        return
+
+    # Persist partial in-progress answer if user ends mid-question.
+    try:
+        await _finalize_current_utterance(session, reason="force")
+        current_q = session.interview_questions[session.current_question_index]
+    except Exception:
+        current_q = None
+
+    if current_q:
+        raw_answer = (
+            (session.finalized_answer_transcript or "").strip() or
+            (session.current_answer_transcript or "").strip()
+        )
+        already_recorded = len(session.evaluations) > session.current_question_index
+        if raw_answer and not already_recorded:
+            duration = 0
+            if session.answer_start_time:
+                duration = max(0, time.time() - session.answer_start_time)
+
+            partial_eval = {
+                "evaluation_version": "v2",
+                "score": 0,
+                "score_breakdown": {"clarity": 0, "accuracy": 0, "completeness": 0, "structure": 0},
+                "strengths": [],
+                "missing_concepts": [],
+                "rubric_hits": [],
+                "rubric_misses": ["Answer was incomplete"],
+                "quality_flags": ["partial_answer"],
+                "confidence": 0.2,
+                "evidence_quotes": [],
+                "improvement_plan": {
+                    "focus": "Complete the answer with clear outcome",
+                    "steps": [
+                        "State your decision clearly.",
+                        "Explain why you chose it.",
+                        "Add outcome and what you learned.",
+                    ],
+                    "success_criteria": [
+                        "Direct answer given",
+                        "Reasoning and trade-off included",
+                        "Outcome is concrete",
+                    ],
+                },
+                "retry_drill": {
+                    "prompt": "Retry this question and finish your full thought end-to-end.",
+                    "target_points": ["Direct answer", "Reasoning", "Outcome"],
+                },
+                "coaching_tip": "Complete your full thought and submit before ending for a stronger evaluation.",
+                "optimized_answer": "",
+                "feedback": "Session ended mid-answer. Partial response saved.",
+            }
+
+            session.evaluations.append({
+                "question": current_q,
+                "answer": raw_answer,
+                "evaluation": partial_eval,
+                "duration": duration,
+                "skipped": True,
+            })
+
+            db_sid = getattr(session, 'db_session_id', None)
+            if db_sid:
+                try:
+                    user_db = get_user_db()
+                    user_db.save_answer(
+                        session_id=db_sid,
+                        question_number=session.current_question_index + 1,
+                        question_text=current_q.get("text", ""),
+                        question_category=current_q.get("category", "Technical"),
+                        question_difficulty=current_q.get("difficulty", "intermediate"),
+                        user_answer=raw_answer,
+                        evaluation=partial_eval,
+                        duration_seconds=duration,
+                        skipped=True
+                    )
+                except Exception as e:
+                    print(f"⚠️ Failed saving partial end-interview answer: {e}")
+
+    try:
+        await finish_interview(sid, session)
+    except Exception as e:
+        print(f"❌ end_interview_early fallback path: {e}")
+        session.interview_active = False
+        await sio.emit("interview_complete", {
+            "session_id": getattr(session, "db_session_id", None),
+            "summary": {
+                "total_questions": len(session.evaluations),
+                "average_score": 0,
+                "overall_breakdown": {
+                    "clarity": 0.0,
+                    "accuracy": 0.0,
+                    "completeness": 0.0,
+                    "structure": 0.0,
+                },
+                "score_breakdown": {
+                    "clarity": 0.0,
+                    "accuracy": 0.0,
+                    "completeness": 0.0,
+                    "structure": 0.0,
+                },
+                "top_strengths": [],
+                "strengths": [],
+                "areas_to_improve": [],
+                "overall_feedback": "Interview ended early.",
+                "action_items": [],
+                "communication_feedback": "",
+            },
+            "evaluations": session.evaluations,
+            "message": "Interview ended early.",
+            "user_id": session.user_id
+        }, room=str(session.user_id))
 
 
 
@@ -1806,4 +3319,3 @@ if __name__ == "__main__":
         port=settings.PORT,
         reload=True
     )
-

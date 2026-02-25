@@ -4,8 +4,11 @@ Provides realtime hints and guidance during interviews with progressive clarity.
 Uses fast lightweight model (gemma3:4b) for quick responses.
 """
 
+import json
+import re
+
 from server.services.llm_factory import get_fast_chat_model
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage
 
 
 async def generate_coaching_hint(
@@ -13,7 +16,7 @@ async def generate_coaching_hint(
     question: dict, 
     previous_hints: list[str] = None,
     hint_level: int = 1
-) -> str:
+) -> dict | None:
     """
     Generate a coaching hint with progressive clarity based on hint_level.
     
@@ -31,23 +34,18 @@ async def generate_coaching_hint(
     has_transcript = transcript and len(transcript.split()) >= 3
     
     # Progressive hint prompts based on level
-    if hint_level == 1:
-        if has_transcript:
-            directiveness = """Based on what they've said so far, give a helpful direction.
-Suggest the NEXT concept or point they should cover.
-Be specific and actionable. Max 20 words."""
-        else:
-            directiveness = """The user needs help getting started.
-Suggest HOW to structure their answer or WHERE to begin.
-Give a concrete first step. Max 20 words."""
+    if hint_level <= 0:
+        directiveness = """Give a short "starting tip" before the candidate speaks.
+Keep it encouraging and tactical."""
+    elif hint_level == 1:
+        directiveness = """Candidate needs a gentle but specific nudge.
+Suggest the next concept they should mention."""
     elif hint_level == 2:
-        directiveness = """The user needs clearer guidance.
-Mention a specific concept, framework, or example they should discuss.
-Be direct and helpful. Max 25 words."""
+        directiveness = """Candidate needs clearer direction.
+Point to an interview framework and one concrete move."""
     else:  # 3+
-        directiveness = f"""This is hint #{hint_level}. Be VERY helpful.
-List 2-3 specific points they should cover or give them a mini-outline.
-Don't give the full answer, but guide them clearly. Max 30 words."""
+        directiveness = f"""This is hint #{hint_level}. Candidate is still struggling.
+Be very explicit with a mini-plan, while avoiding giving a full final answer."""
     
     # Context about previous hints
     prev_context = ""
@@ -69,21 +67,70 @@ KEY POINTS TO COVER: {', '.join(points[:4]) if points else "Clear explanation wi
 
 INSTRUCTION: {directiveness}
 
-Respond with ONLY the helpful hint, no quotes or prefixes."""
+Return STRICT JSON ONLY with this exact schema:
+{{
+  "message": "single actionable sentence (max 22 words)",
+  "next_step": "single concrete action to do now",
+  "framework": "short framework name (e.g. STAR, Problem-Approach-Tradeoff-Result)",
+  "starter": "first sentence stem candidate can say next",
+  "must_mention": ["point 1", "point 2", "point 3"],
+  "avoid": "one common mistake to avoid"
+}}
+
+Rules:
+- Do not provide the full answer.
+- Keep must_mention to 2-3 short items.
+- No markdown, no preface, no extra keys."""
 
     chat_model = get_fast_chat_model()
     try:
         response = await chat_model.ainvoke([SystemMessage(content=prompt)])
-        hint = response.content.strip()
-        # Clean up quotes and prefixes
-        hint = hint.replace('"', '').replace("'", "")
-        for prefix in ["Hint:", "Tip:", "Try:", "Remember:"]:
-            if hint.startswith(prefix):
-                hint = hint[len(prefix):].strip()
-        return hint
+        content = response.content.strip()
+
+        # Extract JSON block safely, even if model adds wrappers.
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-zA-Z]*\n?", "", content).strip()
+            content = re.sub(r"\n?```$", "", content).strip()
+        if not content.startswith("{"):
+            match = re.search(r"\{.*\}", content, re.DOTALL)
+            if match:
+                content = match.group(0)
+
+        data = json.loads(content)
+
+        message = str(data.get("message", "")).strip()
+        next_step = str(data.get("next_step", "")).strip()
+        framework = str(data.get("framework", "")).strip()
+        starter = str(data.get("starter", "")).strip()
+        avoid = str(data.get("avoid", "")).strip()
+        must_mention = data.get("must_mention", [])
+        if not isinstance(must_mention, list):
+            must_mention = []
+        must_mention = [str(x).strip() for x in must_mention if str(x).strip()][:3]
+
+        if not message:
+            message = next_step or "Start with the core challenge, then explain your decision and measurable outcome."
+
+        return {
+            "message": message,
+            "next_step": next_step or message,
+            "framework": framework or ("STAR" if category.lower() == "behavioral" else "Problem-Approach-Tradeoff-Result"),
+            "starter": starter or "I’d approach this by first clarifying the core problem, then outlining my actions and impact.",
+            "must_mention": must_mention,
+            "avoid": avoid or "Avoid staying too abstract without a concrete example or result.",
+        }
     except Exception as e:
         print(f"❌ Coaching generation failed: {e}")
-        return None
+        fallback_framework = "STAR" if category.lower() == "behavioral" else "Problem-Approach-Tradeoff-Result"
+        fallback_points = points[:3] if points else ["Core challenge", "Your specific action", "Measurable result"]
+        return {
+            "message": "Use a clear structure: challenge, your action, and outcome with a metric.",
+            "next_step": "State the situation in one line, then move to what you did.",
+            "framework": fallback_framework,
+            "starter": "In that scenario, the key challenge was __, so I focused on __.",
+            "must_mention": fallback_points,
+            "avoid": "Avoid listing tasks without explaining your decisions and impact.",
+        }
 
 
 async def generate_quick_encouragement() -> str:
