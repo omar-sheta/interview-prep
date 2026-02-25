@@ -16,9 +16,9 @@ from datetime import datetime
 from typing import Optional, TypedDict
 
 try:
-    import mlx.core as mx
+    import torch
 except ImportError:
-    mx = None  # MLX not available (non-Apple Silicon)
+    torch = None
 import socketio
 import tempfile
 import os
@@ -654,12 +654,12 @@ async def lifespan(app: FastAPI):
     # Initialize vector database
     init_vectors()
     
-    # Check MLX Metal availability
-    metal_available = mx.metal.is_available() if mx else False
-    print(f"🍎 MLX Metal GPU: {metal_available}")
+    # Check CUDA availability
+    cuda_available = torch.cuda.is_available() if torch else False
+    print(f"✅ CUDA GPU: {cuda_available}")
     
-    if not metal_available:
-        print("⚠️  Warning: Metal acceleration is not available!")
+    if not cuda_available:
+        print("⚠️  Warning: CUDA acceleration is not available!")
 
     try:
         streaming_stt = get_streaming_audio_processor()
@@ -734,7 +734,7 @@ async def health_check():
     return {
         "status": "ready" if langgraph_ok else "degraded",
         "agent_engine": "langgraph",
-        "mlx_gpu": mx.metal.is_available() if mx else False,
+        "cuda_gpu": torch.cuda.is_available() if torch else False,
         "qdrant_status": check_qdrant_status()
     }
 

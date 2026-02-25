@@ -14,17 +14,16 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-import mlx_whisper
+from faster_whisper import WhisperModel
 
 from server.config import settings
 
 
 # ============== Global Model Cache ==============
 
-_whisper_model: Optional[str] = None
-# large-v3-turbo is the best balance of speed + accuracy on Apple Silicon
-# It's 4x faster than large-v3 with nearly identical WER (Word Error Rate)
-WHISPER_MODEL_ID = "mlx-community/whisper-large-v3-turbo"
+_whisper_model_instance = None
+# large-v3-turbo is extremely fast and accurate on modern GPUs
+WHISPER_MODEL_ID = "large-v3-turbo"
 
 
 def _pcm16_bytes_to_float32(audio_data: bytes) -> np.ndarray:
@@ -57,30 +56,30 @@ def _normalize_transcript_text(text: str) -> str:
 
 def _ensure_whisper_loaded():
     """
-    Ensure Whisper model is loaded.
-    The mlx_whisper library handles caching internally.
+    Ensure Whisper model is loaded using faster-whisper.
     """
-    global _whisper_model
-    if _whisper_model is None:
+    global _whisper_model_instance
+    if _whisper_model_instance is None:
         print(f"🔄 Loading Whisper model: {WHISPER_MODEL_ID}")
-        # Trigger model download/cache by doing a dummy transcription
-        # The model will be cached for subsequent calls
-        _whisper_model = WHISPER_MODEL_ID
-        print(f"✅ Whisper model ready")
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+        _whisper_model_instance = WhisperModel(WHISPER_MODEL_ID, device=device, compute_type=compute_type)
+        print(f"✅ Whisper model ready on {device}")
+    return _whisper_model_instance
 
 
 # ============== Audio Processor ==============
 
 class AudioProcessor:
     """
-    Audio processing service using MLX-Whisper for transcription.
-    Uses the large-v3-turbo model for optimal M4 performance.
+    Audio processing service using faster-whisper for transcription.
+    Optimized for NVIDIA GPUs and CUDA.
     """
     
     def __init__(self):
-        self.model_id = WHISPER_MODEL_ID
         self.sample_rate = 16000  # Whisper expects 16kHz audio
-        self._mlx_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
     
     def transcribe_buffer(self, audio_data: bytes, sample_rate: int = 16000) -> str:
         """
@@ -102,27 +101,21 @@ class AudioProcessor:
         if sample_rate != 16000:
             audio_array = _resample_audio(audio_array, from_rate=sample_rate, to_rate=16000)
         
-        # Transcribe using mlx_whisper
-        # temperature=0.0 for greedy decoding (most accurate, no randomness)
-        # condition_on_previous_text=False avoids hallucination loops on short audio
-        # compression_ratio_threshold=2.4 filters out repetitive/hallucinated output
-        # no_speech_threshold=0.6 avoids transcribing silence as phantom words
-        # MLX Metal path is sensitive to concurrent transcribe calls.
         # Keep final-pass calls serialized to avoid backend crashes.
-        with self._mlx_lock:
-            result = mlx_whisper.transcribe(
+        model = _ensure_whisper_loaded()
+        with self._inference_lock:
+            segments, info = model.transcribe(
                 audio_array,
-                path_or_hf_repo=self.model_id,
                 language="en",
                 task="transcribe",
                 temperature=0.0,
                 condition_on_previous_text=False,
                 compression_ratio_threshold=2.4,
                 no_speech_threshold=0.6,
-                verbose=False,
             )
+            text = " ".join([segment.text for segment in segments])
         
-        return result.get("text", "").strip()
+        return text.strip()
     
     def transcribe_file(self, file_path: str) -> str:
         """
@@ -134,18 +127,18 @@ class AudioProcessor:
         Returns:
             Transcribed text string
         """
-        _ensure_whisper_loaded()
+        model = _ensure_whisper_loaded()
         
-        with self._mlx_lock:
-            result = mlx_whisper.transcribe(
+        with self._inference_lock:
+            segments, info = model.transcribe(
                 file_path,
-                path_or_hf_repo=self.model_id,
                 language="en",
                 temperature=0.0,
                 condition_on_previous_text=False,
             )
+            text = " ".join([segment.text for segment in segments])
         
-        return result.get("text", "").strip()
+        return text.strip()
     
     async def transcribe_buffer_async(
         self,
@@ -470,6 +463,6 @@ def get_streaming_audio_processor() -> AudioProcessor | WhisperCppStreamingProce
             )
             _streaming_audio_processor = whisper_cpp
         else:
-            print("ℹ️ Streaming STT engine fallback: MLX-Whisper")
+            print("ℹ️ Streaming STT engine fallback: faster-whisper")
             _streaming_audio_processor = get_audio_processor()
     return _streaming_audio_processor

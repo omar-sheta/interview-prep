@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     
     # CORS configuration
     # Set CORS_ORIGINS env var to restrict in production (comma-separated)
-    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"]
+    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://spark.hivehub.org:5173", "http://192.168.0.161:5173"]
     
     # Server configuration
     HOST: str = "0.0.0.0"

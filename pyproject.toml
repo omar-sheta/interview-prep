@@ -18,9 +18,9 @@ langgraph = "^0.2.0"
 langchain-core = "^0.3.0"
 langchain-ollama = "^0.2.0"
 pydantic = "^2.9.0"
-# AI/ML (Apple Silicon Optimized)
-mlx-lm = "^0.20.0"
-mlx-whisper = "^0.4.0"
+# AI/ML (Linux CUDA Optimized)
+faster-whisper = "^1.1.0"
+torch = ">=2.0.0"
 neutts = "*"
 soundfile = "^0.12.1"
 numpy = "^2.0.0"
