@@ -11,6 +11,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from server.services.llm_factory import get_chat_model
+from server.config import settings
 
 
 # ============== JD Inference Prompt ==============
@@ -82,41 +83,32 @@ Consider the company's tech stack and culture if known."""
     ]
     
     # Generate response (proper async call)
-    result = await chat_model.ainvoke(messages)
+    result = await chat_model.ainvoke(
+        messages,
+        json_mode=True,
+        max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+    )
     response_text = result.content
     
     # Extract JSON from response
-    try:
-        # Strip <think>...</think> blocks (qwen3 reasoning traces)
-        response_text = re.sub(r'<think>[\s\S]*?</think>', '', response_text).strip()
-        # Remove trailing commas before } or ]
-        response_text = re.sub(r',(\s*[\}\]])', r'\1', response_text)
-
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
-        if json_match:
-            parsed = json.loads(json_match.group())
-            # Ensure required fields exist
-            parsed.setdefault("job_title", job_title)
-            parsed.setdefault("company", company)
-            parsed.setdefault("must_have_skills", [])
-            parsed.setdefault("core_responsibilities", [])
-            return parsed
-        else:
-            return {
-                "job_title": job_title,
-                "company": company,
-                "must_have_skills": [],
-                "core_responsibilities": [],
-                "error": "Could not parse response"
-            }
-    except json.JSONDecodeError as e:
+    from server.tools.resume_tool import parse_json_safely
+    
+    parsed = parse_json_safely(response_text)
+    if not parsed or not isinstance(parsed, dict):
         return {
             "job_title": job_title,
             "company": company,
             "must_have_skills": [],
             "core_responsibilities": [],
-            "error": f"JSON parse error: {e}"
+            "error": "Could not parse response"
         }
+        
+    # Ensure required fields exist
+    parsed.setdefault("job_title", job_title)
+    parsed.setdefault("company", company)
+    parsed.setdefault("must_have_skills", [])
+    parsed.setdefault("core_responsibilities", [])
+    return parsed
 
 
 def infer_job_requirements_sync(job_title: str, company: str = "a top tech company") -> dict:

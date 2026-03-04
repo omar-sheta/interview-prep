@@ -20,6 +20,13 @@ import {
     DialogTitle,
     DialogContent,
     DialogActions,
+    FormControl,
+    InputLabel,
+    Select,
+    MenuItem,
+    ToggleButtonGroup,
+    ToggleButton,
+    IconButton,
 } from '@mui/material';
 import {
     PlayArrow,
@@ -34,8 +41,12 @@ import {
     TipsAndUpdates,
     Diversity3,
     Gavel,
-    Bolt,
-    ManageSearch,
+    BoltOutlined,
+    Psychology,
+    Code,
+    AccountTree,
+    AutoAwesome,
+    Close,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
@@ -53,19 +64,45 @@ const PERSONA_OPTIONS = [
         icon: Gavel,
         description: 'High bar, direct wording, and precision-focused follow-ups.',
     },
+];
+
+const QUICK_INTERVIEW_TYPES = [
     {
-        id: 'rapid_fire',
-        label: 'Rapid-Fire',
-        icon: Bolt,
-        description: 'Short prompts with faster tempo and tighter expectations.',
+        id: 'behavioral',
+        title: 'Behavioral',
+        description: 'STAR-style storytelling, leadership, and communication.',
+        icon: Psychology,
+        tags: ['STAR', 'Leadership'],
     },
     {
-        id: 'skeptical',
-        label: 'Skeptical',
-        icon: ManageSearch,
-        description: 'Pushes on assumptions, evidence, and trade-off clarity.',
+        id: 'technical',
+        title: 'Technical',
+        description: 'Implementation decisions, trade-offs, and debugging.',
+        icon: Code,
+        tags: ['Problem Solving', 'Architecture'],
+    },
+    {
+        id: 'system_design',
+        title: 'System Design',
+        description: 'Scalability, reliability, and large-scale design.',
+        icon: AccountTree,
+        tags: ['Scalability', 'Trade-offs'],
+    },
+    {
+        id: 'mixed',
+        title: 'Mixed',
+        description: 'Balanced flow across behavioral, technical, and design.',
+        icon: AutoAwesome,
+        tags: ['Balanced', 'Adaptive'],
     },
 ];
+
+function getQuickSkillGaps(interviewType) {
+    if (interviewType === 'behavioral') return ['communication', 'stakeholder management', 'leadership', 'conflict resolution'];
+    if (interviewType === 'technical') return ['technical fundamentals', 'problem solving', 'debugging'];
+    if (interviewType === 'system_design') return ['system design', 'scalability', 'reliability', 'trade-offs'];
+    return [];
+}
 
 function clampQuestionCount(value) {
     const n = Number(value);
@@ -191,10 +228,13 @@ export default function ConfigurationView() {
         jobDescription: storedJobDescription,
         questionCountOverride,
         interviewerPersona,
+        ttsProvider,
         startCareerAnalysis,
+        startInterview,
         setTargetJob,
         setTargetCompany,
         setInterviewerPersona,
+        setTtsProvider,
         savePreferences,
         loadPreferences,
         loadLatestAnalysis,
@@ -212,6 +252,7 @@ export default function ConfigurationView() {
         questionCountOverride !== null && questionCountOverride !== undefined ? String(questionCountOverride) : '5'
     );
     const [defaultPersona, setDefaultPersona] = useState(interviewerPersona || 'friendly');
+    const [voiceEngine, setVoiceEngine] = useState('piper');
     const [resumeBase64, setResumeBase64] = useState('');
     const [resumeFilename, setResumeFilename] = useState('');
     const [status, setStatus] = useState('');
@@ -219,6 +260,13 @@ export default function ConfigurationView() {
     const [skillFilter, setSkillFilter] = useState('actionable');
     const [selectedSkillId, setSelectedSkillId] = useState('');
     const [clearDialogOpen, setClearDialogOpen] = useState(false);
+
+    // Quick Interview state
+    const [quickOpen, setQuickOpen] = useState(false);
+    const [quickRole, setQuickRole] = useState('');
+    const [quickJD, setQuickJD] = useState('');
+    const [quickType, setQuickType] = useState('mixed');
+    const [quickStarting, setQuickStarting] = useState(false);
 
     useEffect(() => {
         connect();
@@ -243,6 +291,14 @@ export default function ConfigurationView() {
         setJobDescription(storedJobDescription || '');
     }, [storedJobDescription]);
 
+    // Dismiss the quick-interview overlay once the session is live
+    useEffect(() => {
+        if (quickStarting && appState === APP_STATES.INTERVIEWING) {
+            setQuickStarting(false);
+            setQuickOpen(false);
+        }
+    }, [appState, quickStarting]);
+
     useEffect(() => {
         if (questionCountOverride === null || questionCountOverride === undefined) return;
         setQuestionCount(String(questionCountOverride));
@@ -253,6 +309,12 @@ export default function ConfigurationView() {
         const normalized = String(interviewerPersona || '').trim().toLowerCase();
         setDefaultPersona(allowed.has(normalized) ? normalized : 'friendly');
     }, [interviewerPersona]);
+
+    useEffect(() => {
+        const next = String(ttsProvider || 'piper').trim().toLowerCase();
+        const allowed = new Set(['piper', 'qwen3_tts_mlx']);
+        setVoiceEngine(allowed.has(next) ? next : 'piper');
+    }, [ttsProvider]);
 
     const skillBoard = useMemo(() => normalizeSkillBoard(skillMapping), [skillMapping]);
     const coverage = useMemo(
@@ -308,12 +370,14 @@ export default function ConfigurationView() {
         setTargetJob(normalizedRole);
         setTargetCompany(normalizedCompany);
         setInterviewerPersona(normalizedPersona);
+        setTtsProvider(voiceEngine);
         savePreferences({
             target_role: normalizedRole,
             target_company: normalizedCompany,
             job_description: normalizedDescription,
             question_count_override: normalizedCount || null,
             interviewer_persona: normalizedPersona,
+            tts_provider: voiceEngine,
             resume_filename: resumeFilename || undefined,
         });
         setStatus('Configuration saved.');
@@ -358,9 +422,56 @@ export default function ConfigurationView() {
         setJobDescription('');
         setQuestionCount('5');
         setDefaultPersona('friendly');
+        setVoiceEngine('piper');
         setResumeBase64('');
         setResumeFilename('');
         setStatus('Configuration cleared.');
+    };
+
+    const openQuickDialog = (typeId = 'mixed') => {
+        setQuickRole(String(jobTitle || targetRole || '').trim());
+        setQuickJD(String(jobDescription || storedJobDescription || '').trim());
+        setQuickType(typeId);
+        setQuickOpen(true);
+    };
+
+    const handleQuickStart = () => {
+        const role = quickRole.trim();
+        const jd = quickJD.trim();
+        if (!role || !jd) return;
+        if (!isConnected) {
+            setError('Not connected to server yet. Please try again in a moment.');
+            return;
+        }
+
+        // Unlock audio playback on user click
+        try {
+            const unlockAudio = new Audio();
+            unlockAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+            unlockAudio.play().catch(() => { });
+        } catch (e) {
+            console.warn('Audio unlock failed:', e);
+        }
+
+        setQuickStarting(true);
+        setError('');
+
+        const qCount = Math.max(1, Math.min(12, Math.trunc(Number(questionCount) || 5)));
+
+        startInterview({
+            job_title: role,
+            skill_gaps: getQuickSkillGaps(quickType),
+            readiness_score: 0.5,
+            job_description: jd,
+            interview_type: quickType,
+            mode: 'practice',
+            coaching_enabled: false,
+            feedback_timing: 'end_only',
+            live_scoring: false,
+            interviewer_persona: defaultPersona,
+            question_count: qCount,
+        });
+
     };
 
     return (
@@ -375,6 +486,112 @@ export default function ConfigurationView() {
                             <Typography variant="body2" sx={{ color: 'text.secondary' }}>
                                 Set target role, job description, resume, and interview defaults.
                             </Typography>
+                        </Paper>
+
+                        {/* ── Quick Interview Section ── */}
+                        <Paper
+                            sx={{
+                                p: { xs: 2, md: 2.5 },
+                                border: '1px solid',
+                                borderColor: darkMode ? 'rgba(99,102,241,0.45)' : 'rgba(99,102,241,0.3)',
+                                background: darkMode
+                                    ? 'linear-gradient(135deg, rgba(99,102,241,0.14), rgba(139,92,246,0.06))'
+                                    : 'linear-gradient(135deg, rgba(99,102,241,0.09), rgba(139,92,246,0.03))',
+                            }}
+                        >
+                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1.2} sx={{ mb: 1.8 }}>
+                                <Stack direction="row" spacing={1.2} alignItems="center">
+                                    <Box
+                                        sx={{
+                                            width: 40,
+                                            height: 40,
+                                            borderRadius: '50%',
+                                            display: 'grid',
+                                            placeItems: 'center',
+                                            background: darkMode
+                                                ? 'linear-gradient(135deg, rgba(99,102,241,0.55), rgba(139,92,246,0.4))'
+                                                : 'linear-gradient(135deg, rgba(99,102,241,0.3), rgba(139,92,246,0.18))',
+                                        }}
+                                    >
+                                        <BoltOutlined sx={{ color: darkMode ? '#c4b5fd' : '#6366f1', fontSize: 22 }} />
+                                    </Box>
+                                    <Box>
+                                        <Typography variant="h6" sx={{ lineHeight: 1.2 }}>Try a Quick Interview</Typography>
+                                        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                            Jump straight in — pick a type and go. No resume or analysis needed.
+                                        </Typography>
+                                    </Box>
+                                </Stack>
+                                <Button
+                                    variant="contained"
+                                    startIcon={<BoltOutlined />}
+                                    onClick={() => openQuickDialog('mixed')}
+                                    disabled={!isConnected}
+                                    sx={{
+                                        whiteSpace: 'nowrap',
+                                        minWidth: 160,
+                                        background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                                        '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
+                                    }}
+                                >
+                                    Quick Start
+                                </Button>
+                            </Stack>
+
+                            <Box
+                                sx={{
+                                    display: 'grid',
+                                    gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                                    gap: 1,
+                                }}
+                            >
+                                {QUICK_INTERVIEW_TYPES.map((type) => {
+                                    const Icon = type.icon;
+                                    return (
+                                        <Paper
+                                            key={type.id}
+                                            role="button"
+                                            tabIndex={0}
+                                            onClick={() => openQuickDialog(type.id)}
+                                            onKeyDown={(event) => {
+                                                if (event.key === 'Enter' || event.key === ' ') {
+                                                    event.preventDefault();
+                                                    openQuickDialog(type.id);
+                                                }
+                                            }}
+                                            sx={{
+                                                p: 1.4,
+                                                cursor: 'pointer',
+                                                transition: 'all 0.18s ease',
+                                                border: '1px solid',
+                                                borderColor: darkMode ? 'rgba(99,102,241,0.25)' : 'rgba(99,102,241,0.15)',
+                                                '&:hover': {
+                                                    borderColor: darkMode ? 'rgba(99,102,241,0.55)' : 'rgba(99,102,241,0.4)',
+                                                    boxShadow: '0 4px 16px rgba(99,102,241,0.15)',
+                                                    transform: 'translateY(-1px)',
+                                                },
+                                            }}
+                                        >
+                                            <Stack spacing={0.6}>
+                                                <Stack direction="row" spacing={0.7} alignItems="center">
+                                                    <Icon sx={{ fontSize: 20, color: darkMode ? '#a5b4fc' : '#6366f1' }} />
+                                                    <Typography variant="subtitle2" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
+                                                        {type.title}
+                                                    </Typography>
+                                                </Stack>
+                                                <Typography variant="caption" sx={{ color: 'text.secondary', lineHeight: 1.3 }}>
+                                                    {type.description}
+                                                </Typography>
+                                                <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap">
+                                                    {type.tags.map((tag) => (
+                                                        <Chip key={`${type.id}-${tag}`} size="small" label={tag} variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
+                                                    ))}
+                                                </Stack>
+                                            </Stack>
+                                        </Paper>
+                                    );
+                                })}
+                            </Box>
                         </Paper>
 
                         <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
@@ -454,6 +671,25 @@ export default function ConfigurationView() {
                                         </Typography>
                                     )}
                                     <Stack spacing={0.8} sx={{ pt: 0.3 }}>
+                                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                                            Voice Engine
+                                        </Typography>
+                                        <FormControl fullWidth size="small">
+                                            <InputLabel id="config-tts-provider-label">Voice Engine</InputLabel>
+                                            <Select
+                                                labelId="config-tts-provider-label"
+                                                label="Voice Engine"
+                                                value={voiceEngine}
+                                                onChange={(event) => setVoiceEngine(String(event.target.value || 'piper'))}
+                                            >
+                                                <MenuItem value="piper">Piper (fast + lightweight)</MenuItem>
+                                                <MenuItem value="qwen3_tts_mlx">Qwen3-TTS MLX (higher quality)</MenuItem>
+                                            </Select>
+                                        </FormControl>
+                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                            This sets the default voice engine for interview question playback.
+                                        </Typography>
+
                                         <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                                             Default Interviewer Persona
                                         </Typography>
@@ -858,6 +1094,123 @@ export default function ConfigurationView() {
                             Clear Configuration
                         </Button>
                     </DialogActions>
+                </Dialog>
+
+                {/* Quick Interview Dialog */}
+                <Dialog
+                    open={quickOpen}
+                    onClose={() => !quickStarting && setQuickOpen(false)}
+                    maxWidth="sm"
+                    fullWidth
+                >
+                    <DialogTitle>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center">
+                            <Stack direction="row" spacing={1} alignItems="center">
+                                <BoltOutlined sx={{ color: '#6366f1' }} />
+                                <span>Quick Interview</span>
+                            </Stack>
+                            <IconButton size="small" onClick={() => setQuickOpen(false)} disabled={quickStarting}>
+                                <Close fontSize="small" />
+                            </IconButton>
+                        </Stack>
+                    </DialogTitle>
+                    <Divider />
+                    <DialogContent>
+                        {quickStarting ? (
+                            <Stack
+                                spacing={2}
+                                alignItems="center"
+                                justifyContent="center"
+                                sx={{ py: { xs: 5, md: 7 }, minHeight: 280 }}
+                            >
+                                <Box
+                                    sx={{
+                                        width: 64,
+                                        height: 64,
+                                        borderRadius: '50%',
+                                        display: 'grid',
+                                        placeItems: 'center',
+                                        background: 'linear-gradient(135deg, rgba(99,102,241,0.18), rgba(139,92,246,0.12))',
+                                    }}
+                                >
+                                    <CircularProgress size={32} sx={{ color: '#8b5cf6' }} />
+                                </Box>
+                                <Typography variant="h6" sx={{ fontWeight: 700 }}>
+                                    Creating Interview…
+                                </Typography>
+                                <Typography variant="body2" sx={{ color: 'text.secondary', textAlign: 'center', maxWidth: 340 }}>
+                                    Generating {QUICK_INTERVIEW_TYPES.find((t) => t.id === quickType)?.title || 'Mixed'} questions for <strong>{quickRole.trim()}</strong>. This usually takes a few seconds.
+                                </Typography>
+                            </Stack>
+                        ) : (
+                            <Stack spacing={2.5} sx={{ pt: 1 }}>
+                                <TextField
+                                    label="Target Role"
+                                    placeholder="e.g. Senior Backend Engineer"
+                                    value={quickRole}
+                                    onChange={(e) => setQuickRole(e.target.value)}
+                                    fullWidth
+                                    autoFocus
+                                />
+                                <TextField
+                                    label="Job Description"
+                                    placeholder="Paste the job description here..."
+                                    value={quickJD}
+                                    onChange={(e) => setQuickJD(e.target.value)}
+                                    fullWidth
+                                    multiline
+                                    minRows={5}
+                                    maxRows={12}
+                                />
+                                <Box>
+                                    <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                                        Interview Type
+                                    </Typography>
+                                    <ToggleButtonGroup
+                                        value={quickType}
+                                        exclusive
+                                        onChange={(_, val) => val && setQuickType(val)}
+                                        size="small"
+                                        fullWidth
+                                    >
+                                        {QUICK_INTERVIEW_TYPES.map((t) => (
+                                            <ToggleButton key={t.id} value={t.id} sx={{ textTransform: 'none', py: 1 }}>
+                                                {t.title}
+                                            </ToggleButton>
+                                        ))}
+                                    </ToggleButtonGroup>
+                                </Box>
+                                {quickRole.trim() && quickJD.trim() && (
+                                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                        Mock mode &bull; {PERSONA_OPTIONS.find((p) => p.id === defaultPersona)?.label || 'Friendly'} persona &bull; {questionCount || 5} questions
+                                    </Typography>
+                                )}
+                            </Stack>
+                        )}
+                    </DialogContent>
+                    {!quickStarting && (
+                        <>
+                            <Divider />
+                            <DialogActions sx={{ px: 3, py: 2 }}>
+                                <Button onClick={() => setQuickOpen(false)}>
+                                    Cancel
+                                </Button>
+                                <Button
+                                    variant="contained"
+                                    size="large"
+                                    startIcon={<PlayArrow />}
+                                    onClick={handleQuickStart}
+                                    disabled={!quickRole.trim() || !quickJD.trim()}
+                                    sx={{
+                                        background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                                        '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
+                                    }}
+                                >
+                                    Start Interview
+                                </Button>
+                            </DialogActions>
+                        </>
+                    )}
                 </Dialog>
             </Box>
         </ThemeProvider>

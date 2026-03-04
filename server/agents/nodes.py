@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from server.agents.state import InterviewState
+from server.config import settings
 from server.services.llm_factory import get_chat_model
 # CHANGED: Updated imports to match the new resume_tool function names
 from server.tools.resume_tool import get_all_skills, parse_resume_node, extract_text_from_pdf_bytes, parse_json_safely
@@ -602,7 +603,7 @@ def _build_skill_coverage_board(required_skills: list[dict], candidate_skills: l
         importance = _clamp(_safe_float(req.get("importance"), 0.7), 0.2, 1.0)
         candidate = candidate_index.get(skill)
         candidate_level = _normalize_skill_level(candidate.get("candidate_level"), default="none") if candidate else "none"
-        confidence = _clamp(_safe_float(candidate.get("confidence"), 0.2 if candidate else 0.05), 0.05, 0.99)
+        confidence = _clamp(_safe_float(candidate.get("confidence"), 0.2) if candidate else 0.05, 0.05, 0.99)
         req_idx = SKILL_LEVEL_ORDER.get(required_level, 2)
         cand_idx = SKILL_LEVEL_ORDER.get(candidate_level, 0)
 
@@ -810,10 +811,14 @@ Rules:
         "job_description_excerpt": str(job_description or "")[:1800],
     }
     chat_model = get_chat_model()
-    response = await chat_model.ainvoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=json.dumps(user_payload))
-    ])
+    response = await chat_model.ainvoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(user_payload))
+        ],
+        json_mode=True,
+        max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+    )
     parsed = parse_json_safely(response.content)
     if not isinstance(parsed, dict):
         return []
@@ -868,10 +873,14 @@ Rules:
 - Include required skills when possible and up to 12 useful extras."""
 
     chat_model = get_chat_model()
-    response = await chat_model.ainvoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=json.dumps(prompt))
-    ])
+    response = await chat_model.ainvoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(prompt))
+        ],
+        json_mode=True,
+        max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+    )
     parsed = parse_json_safely(response.content)
     if not isinstance(parsed, dict):
         return []
@@ -918,10 +927,14 @@ Rules:
 - Include at most 8 adjustments."""
     payload = {"job_title": job_title, "skills": weak_rows}
     chat_model = get_chat_model()
-    response = await chat_model.ainvoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=json.dumps(payload))
-    ])
+    response = await chat_model.ainvoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(payload))
+        ],
+        json_mode=True,
+        max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+    )
     parsed = parse_json_safely(response.content)
     if not isinstance(parsed, dict) or not isinstance(parsed.get("adjustments"), list):
         return []
@@ -989,10 +1002,14 @@ Rules:
 - Keep each question single-part and concrete.
 - Prioritize high-importance missing/uncertain skills."""
     chat_model = get_chat_model()
-    response = await chat_model.ainvoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=json.dumps(payload))
-    ])
+    response = await chat_model.ainvoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(payload))
+        ],
+        json_mode=True,
+        max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+    )
     parsed = parse_json_safely(response.content)
     if not isinstance(parsed, dict) or not isinstance(parsed.get("questions"), list):
         return []
@@ -1195,37 +1212,20 @@ async def generate_interview_loop_node(state: CareerAnalysisState) -> CareerAnal
     try:
         from server.services.llm_factory import get_chat_model
         chat_model = get_chat_model()
-        response = await chat_model.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_msg)
-        ])
+        response = await chat_model.ainvoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_msg)
+            ],
+            json_mode=True,
+            max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+        )
 
-        # Parse JSON safely — robust cleanup for qwen3 quirks
-        content = response.content.strip()
+        # Parse JSON safely using the robust parser
+        loop_plan = parse_json_safely(response.content)
+        if not loop_plan or not isinstance(loop_plan, dict):
+            raise ValueError("LLM returned invalid Architect JSON")
 
-        # Strip <think>...</think> blocks (qwen3 reasoning traces)
-        if "<think>" in content:
-            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
-
-        # Strip markdown code fences
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-
-        content = content.strip()
-
-        # Remove trailing commas before } or ]
-        content = re.sub(r',(\s*[\}\]])', r'\1', content)
-        # Remove single-line comments
-        content = re.sub(r'//.*', '', content)
-
-        try:
-            loop_plan = json.loads(content)
-        except json.JSONDecodeError:
-            # Try json_repair as last resort
-            from json_repair import repair_json
-            loop_plan = json.loads(repair_json(content))
         loop_plan["created_at"] = str(datetime.now())
         
         # --- ENFORCE STABLE IDs (Fix for Caching) ---
@@ -1315,7 +1315,7 @@ def trigger_background_generation(
         from server.services.user_database import get_user_db
         prefs = get_user_db().get_user_preferences(user_id) or {}
         incoming_persona = str(prefs.get("interviewer_persona") or "friendly").strip().lower()
-        if incoming_persona in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        if incoming_persona in {"friendly", "strict"}:
             persona_for_generation = incoming_persona
     except Exception:
         persona_for_generation = "friendly"
@@ -1584,24 +1584,27 @@ async def analyze_career_path(
     emit_progress: Optional[Callable[[str, str], Any]] = None
 ) -> CareerAnalysisState:
     """
-    OPTIMIZED Career Analysis Pipeline with Parallel Execution.
-    
-    Pipeline: 
+    FAST Career Analysis Pipeline — Single LLM Call.
+
+    Pipeline:
     1. Extract PDF text (if needed)
-    2. PARALLEL: Parse resume (LLM) + Infer job requirements (LLM)
-    3. Map skills with streaming (LLM)
-    4. Generate mindmap (rule-based)
-    5. Suggest bridge roles (rule-based)
+    2. SINGLE LLM CALL: Mega-prompt (resume + job + skill analysis)
+    3. Deterministic: Build skill mapping from LLM analysis
+    4. Deterministic: Generate mindmap
+    5. Deterministic: Build interview loop (template-based)
+    6. Deterministic: Suggest bridge roles
     """
-    from server.tools.job_tool import infer_job_requirements
-    # CHANGED: Use the correct function name here
-    from server.tools.resume_tool import parse_resume_node, extract_text_from_pdf_bytes
-    
+    from server.tools.resume_tool import (
+        analyze_resume_and_job,
+        extract_text_from_pdf_bytes,
+        get_all_skills,
+    )
+
     async def _emit(stage: str, message: str):
         if emit_progress:
             await emit_progress(stage, message)
         print(f"📊 [{stage}] {message}")
-    
+
     # Initialize state
     state: CareerAnalysisState = {
         "resume_data": {},
@@ -1616,113 +1619,268 @@ async def analyze_career_path(
         "job_description": job_description,
         "error": None
     }
-    
+
     try:
         # ========== Step 1: Prepare Resume Text ==========
         await _emit("step_1", "📄 Processing resume...")
-        
+
         final_resume_text = ""
         if isinstance(resume_text, bytes):
-             await _emit("step_1", "📄 Extracting text from resume PDF...")
-             # CHANGED: Call the correct function
-             final_resume_text = extract_text_from_pdf_bytes(resume_text)
+            await _emit("step_1", "📄 Extracting text from resume PDF...")
+            final_resume_text = extract_text_from_pdf_bytes(resume_text)
         else:
-             final_resume_text = resume_text
+            final_resume_text = resume_text
 
         if not final_resume_text.strip():
             state["error"] = "Could not extract text from resume"
             return state
-        
+
         await _emit("step_1_done", f"✅ Processed {len(final_resume_text)} characters")
-        
-        # ========== Step 2: PARALLEL - Parse resume + Infer job requirements ==========
-        await _emit("step_2", f"🚀 Parallel processing: parsing resume AND analyzing {target_role} requirements...")
-        
-        resume_bytes_for_parsing = final_resume_text.encode('utf-8')
-        resume_task = parse_resume_node(resume_bytes_for_parsing, mime_type="text/plain")
-        job_task = infer_job_requirements(target_role, target_company, job_description)
-        
-        resume_data, job_requirements = await asyncio.gather(
-            resume_task,
-            job_task,
-            return_exceptions=True
+
+        # ========== Step 2: SINGLE LLM CALL — Mega Analysis ==========
+        await _emit("step_2", f"🧠 Analyzing resume against {target_role} requirements (single-pass)...")
+
+        mega_result = await analyze_resume_and_job(
+            resume_text=final_resume_text,
+            job_title=target_role,
+            company=target_company,
+            job_description=job_description,
         )
-        
-        if isinstance(resume_data, Exception):
-            await _emit("error", f"❌ Resume parsing failed: {resume_data}")
-            resume_data = {"skills": {}, "experience": []}
-        
+
+        await _emit("step_2_done", "✅ Resume and job analysis complete")
+
+        # ========== Step 3: Convert mega_result into CareerAnalysisState ==========
+        await _emit("step_3", "🎯 Building skill coverage board...")
+
+        # Extract resume_data (standard shape the rest of the app expects)
+        resume_data = {
+            "personal_info": mega_result.get("personal_info", {}),
+            "summary": mega_result.get("summary", ""),
+            "skills": mega_result.get("skills", {}),
+            "experience": mega_result.get("experience", []),
+            "education": mega_result.get("education", []),
+            "years_of_experience": mega_result.get("years_of_experience", 0),
+        }
         state["resume_data"] = resume_data
-        
-        if isinstance(job_requirements, Exception):
-            await _emit("error", f"❌ Job inference failed: {job_requirements}")
-            job_requirements = {
-                "job_title": target_role, 
-                "must_have_skills": [], 
-                "nice_to_have_skills": []
-            }
-        
+
+        # Extract job_requirements (standard shape)
+        job_reqs_raw = mega_result.get("job_requirements", {})
+        job_requirements = {
+            "job_title": target_role,
+            "company": target_company,
+            "must_have_skills": job_reqs_raw.get("must_have_skills", []),
+            "nice_to_have_skills": job_reqs_raw.get("nice_to_have_skills", []),
+            "core_responsibilities": job_reqs_raw.get("core_responsibilities", []),
+            "career_level": job_reqs_raw.get("career_level", "mid"),
+            "interview_focus_areas": job_reqs_raw.get("interview_focus_areas", []),
+        }
         state["job_requirements"] = job_requirements
-        
-        # ========== Step 3: Multi-pass skill mapping ==========
-        await _emit("step_3", "🎯 Building required-vs-candidate skill board...")
-        state = await map_skills_node(state)
-        await _emit("step_3_done", "✅ Skill board and readiness scoring complete")
-        missing_skills = state.get("skill_mapping", {}).get("missing", [])
-        partial_skills = state.get("skill_mapping", {}).get("partial", [])
-        uncertain_partial = [item for item in partial_skills if str(item.get("status") or "").lower() == "uncertain"]
-        state["skill_gaps"] = (missing_skills + uncertain_partial)[:12]
-        
-        # ========== Step 4: Generate mindmap ==========
+
+        # Build skill_mapping from the LLM's skill_analysis array
+        skill_analysis = mega_result.get("skill_analysis", [])
+        matched = []
+        partial = []
+        missing = []
+
+        for item in skill_analysis:
+            skill_name = str(item.get("skill", "")).strip()
+            if not skill_name:
+                continue
+
+            status = str(item.get("status", "missing")).lower().replace(" ", "_")
+            priority = str(item.get("priority", "must_have")).lower().replace(" ", "_")
+            evidence = str(item.get("evidence", ""))
+            confidence = float(item.get("confidence", 0.5))
+            candidate_level = str(item.get("candidate_level", "none"))
+            required_level = str(item.get("required_level", "intermediate"))
+
+            entry = {
+                "name": skill_name,
+                "skill": skill_name,
+                "status": status,
+                "priority": priority,
+                "evidence": evidence,
+                "confidence": confidence,
+                "candidate_level": candidate_level,
+                "required_level": required_level,
+            }
+
+            if status == "strong_match":
+                matched.append(entry)
+            elif status == "partial_match":
+                partial.append(entry)
+            else:
+                missing.append(entry)
+
+        readiness_score = float(mega_result.get("readiness_score", 0.5))
+        readiness_score = max(0.0, min(1.0, readiness_score))
+
+        skill_mapping = {
+            "matched": matched,
+            "partial": partial,
+            "missing": missing,
+        }
+        state["skill_mapping"] = skill_mapping
+        state["readiness_score"] = round(readiness_score, 2)
+
+        # Skill gaps = missing + uncertain partial
+        top_gaps = mega_result.get("top_gaps", [])
+        skill_gaps = []
+        for gap_name in top_gaps:
+            skill_gaps.append({"name": str(gap_name), "status": "missing"})
+        # Also add any missing skills not already in top_gaps
+        gap_names_lower = {str(g).lower() for g in top_gaps}
+        for m in missing:
+            if m["name"].lower() not in gap_names_lower:
+                skill_gaps.append(m)
+        state["skill_gaps"] = skill_gaps[:12]
+
+        await _emit("step_3_done", f"✅ Skill board: {len(matched)} matched, {len(partial)} partial, {len(missing)} missing — Readiness: {int(readiness_score * 100)}%")
+
+        # ========== Step 4: Generate mindmap (existing deterministic code) ==========
         await _emit("step_4", "🗺️ Generating visual mindmap...")
         state = await generate_mindmap_node(state)
         await _emit("step_4_done", "✅ Mindmap generated")
-        
-        # ========== Step 5: Suggest bridge roles ==========
-        if state["readiness_score"] < 0.6:
+
+        # ========== Step 5: Suggest bridge roles (existing deterministic code) ==========
+        if readiness_score < 0.6:
             await _emit("step_5", "🌉 Analyzing career path options...")
             state = await suggest_bridge_roles_node(state)
 
-        # ========== Step 6: Generate Interview Loop (LLM-Driven) ==========
-        await _emit("step_6", "🏗️ Architecting your interview loop...")
-        state = await generate_interview_loop_node(state)
-        
-        # Also generate legacy suggestions for backwards compatibility + follow-up drill targets.
-        missing_skills = state["skill_mapping"].get("missing", [])
-        suggestions = generate_dynamic_suggestions(target_role, target_company, missing_skills)
-        followup_targets = state.get("skill_mapping", {}).get("followup_targets", [])
-        followup_drills: list[dict] = []
-        for idx, target in enumerate(followup_targets[:2], start=1):
-            skill_name = str(target.get("name") or target.get("skill") or "Core competency").strip()
-            if not skill_name:
-                continue
-            followup_drills.append({
-                "id": f"focus_{idx}",
-                "title": f"Validation Drill: {skill_name}",
-                "subtitle": "Targeted evidence practice",
-                "description": f"Validate depth in {skill_name} with concrete project examples and trade-offs.",
-                "icon": "FactCheck",
-                "color": "orange",
-                "duration": "12 min",
-                "type": "drill",
-                "focus_topic": skill_name,
-            })
-        if followup_drills:
-            suggestions = followup_drills + suggestions
-        state["suggested_sessions"] = suggestions[:6]
-        
+        # ========== Step 6: Build Interview Loop (Template-Based, No LLM) ==========
+        await _emit("step_6", "🏗️ Building your interview loop...")
+
+        gap_skills = [g.get("name", g) if isinstance(g, dict) else str(g) for g in state["skill_gaps"][:4]]
+        focus_areas = job_requirements.get("interview_focus_areas", [])
+
+        practice_plan = _build_template_interview_loop(
+            target_role=target_role,
+            company=target_company,
+            gap_skills=gap_skills,
+            focus_areas=focus_areas,
+            readiness_score=readiness_score,
+        )
+        practice_plan = normalize_practice_plan_titles(practice_plan)
+        state["practice_plan"] = practice_plan
+
+        # Build suggested_sessions (legacy format for backwards compatibility)
+        suggested_sessions = []
+        session_idx = 0
+        for round_ in practice_plan.get("rounds", []):
+            for sess in round_.get("sessions", []):
+                session_idx += 1
+                suggested_sessions.append({
+                    "id": sess.get("id", f"s{session_idx}"),
+                    "title": sess.get("title", "Interview Session"),
+                    "subtitle": sess.get("description", ""),
+                    "description": sess.get("description", ""),
+                    "icon": "Psychology" if sess.get("type") == "behavioral" else "Code",
+                    "color": "blue" if sess.get("type") == "behavioral" else "green",
+                    "duration": sess.get("duration", "5m"),
+                    "type": sess.get("type", "technical"),
+                    "focus_topic": sess.get("focus_topic", ""),
+                })
+        state["suggested_sessions"] = suggested_sessions[:6]
+
         # ========== Done! ==========
-        score = int(state["readiness_score"] * 100)
+        score = int(readiness_score * 100)
         await _emit("complete", f"🎉 Analysis complete! Readiness: {score}%")
-        
+
         return state
-        
+
     except Exception as e:
         await _emit("error", f"❌ Error: {str(e)}")
         import traceback
         traceback.print_exc()
         state["error"] = str(e)
         return state
+
+
+def _build_template_interview_loop(
+    target_role: str,
+    company: str,
+    gap_skills: list[str],
+    focus_areas: list[str],
+    readiness_score: float,
+) -> dict:
+    """
+    Build a 2-round interview loop using templates.
+    No LLM call needed — generates structure from skill gaps and focus areas.
+    """
+    from datetime import datetime
+
+    behavioral_topics = []
+    technical_topics = []
+
+    # Use focus_areas if available, otherwise derive from gaps
+    if focus_areas:
+        for area in focus_areas[:3]:
+            area_lower = area.lower()
+            if any(kw in area_lower for kw in ["culture", "lead", "team", "behav", "commun", "collab"]):
+                behavioral_topics.append(area)
+            else:
+                technical_topics.append(area)
+
+    # Fill behavioral if empty
+    if not behavioral_topics:
+        behavioral_topics = ["Leadership & Impact", "Problem-Solving Approach", "Cross-Team Collaboration"]
+
+    # Fill technical from gaps (deduplicated)
+    seen_lower = {t.lower() for t in technical_topics}
+    for skill in gap_skills:
+        if len(technical_topics) < 3 and skill.lower() not in seen_lower:
+            technical_topics.append(skill)
+            seen_lower.add(skill.lower())
+
+    if not technical_topics:
+        technical_topics = ["System Design", "Technical Problem-Solving", "Architecture Deep-Dive"]
+
+    # Build sessions
+    behavioral_sessions = []
+    for i, topic in enumerate(behavioral_topics[:2], start=1):
+        behavioral_sessions.append({
+            "id": f"s{i}",
+            "title": f"Behavioral: {topic}",
+            "type": "behavioral",
+            "duration": "5m",
+            "status": "pending",
+            "focus_topic": topic,
+            "description": f"Discuss your experience with {topic.lower()} using the STAR method.",
+        })
+
+    tech_start = len(behavioral_sessions) + 1
+    technical_sessions = []
+    for i, topic in enumerate(technical_topics[:3], start=tech_start):
+        technical_sessions.append({
+            "id": f"s{i}",
+            "title": f"Technical: {topic}",
+            "type": "technical",
+            "duration": "5m",
+            "status": "pending",
+            "focus_topic": topic,
+            "description": f"Demonstrate your knowledge of {topic.lower()} through a verbal deep-dive.",
+        })
+
+    return {
+        "goal": f"{target_role} at {company}",
+        "created_at": str(datetime.now()),
+        "rounds": [
+            {
+                "id": "r1",
+                "name": "Round 1: Behavioral & Leadership",
+                "description": "Assess cultural fit, leadership style, and communication skills.",
+                "status": "active",
+                "sessions": behavioral_sessions,
+            },
+            {
+                "id": "r2",
+                "name": "Round 2: Technical Deep-Dive",
+                "description": "Evaluate technical knowledge, system design thinking, and problem-solving.",
+                "status": "active",
+                "sessions": technical_sessions,
+            },
+        ],
+    }
 
 
 # ============== Regeneration & Background Logic ==============
@@ -1790,10 +1948,14 @@ async def regenerate_suggestions(
         from server.services.llm_factory import get_chat_model
         chat_model = get_chat_model()
         
-        response = await chat_model.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content="Generate new suggestions.")
-        ])
+        response = await chat_model.ainvoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content="Generate new suggestions.")
+            ],
+            json_mode=True,
+            max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+        )
         
         from server.tools.resume_tool import parse_json_safely
         new_suggestions = parse_json_safely(response.content)

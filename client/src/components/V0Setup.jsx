@@ -13,6 +13,14 @@ import {
     Chip,
     Divider,
     CircularProgress,
+    Dialog,
+    DialogTitle,
+    DialogContent,
+    DialogActions,
+    TextField,
+    ToggleButtonGroup,
+    ToggleButton,
+    IconButton,
 } from '@mui/material';
 import {
     ArrowForward,
@@ -25,8 +33,8 @@ import {
     TipsAndUpdates,
     Diversity3,
     Gavel,
-    Bolt,
-    ManageSearch,
+    BoltOutlined,
+    Close,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
@@ -98,18 +106,6 @@ const INTERVIEW_PERSONAS = [
         icon: Gavel,
         description: 'High bar, direct wording, and precision-focused follow-ups.',
     },
-    {
-        id: 'rapid_fire',
-        title: 'Rapid-Fire',
-        icon: Bolt,
-        description: 'Short prompts with faster tempo and tighter expectations.',
-    },
-    {
-        id: 'skeptical',
-        title: 'Skeptical',
-        icon: ManageSearch,
-        description: 'Pushes on assumptions, evidence, and trade-off clarity.',
-    },
 ];
 
 function normalizePersona(value) {
@@ -180,6 +176,20 @@ export default function V0Setup() {
     const [selectedPersona, setSelectedPersona] = useState(normalizePersona(interviewerPersona));
     const [error, setError] = useState('');
 
+    // Quick Interview (cold start) state
+    const [quickOpen, setQuickOpen] = useState(false);
+    const [quickRole, setQuickRole] = useState('');
+    const [quickJD, setQuickJD] = useState('');
+    const [quickType, setQuickType] = useState('mixed');
+    const [quickStarting, setQuickStarting] = useState(false);
+
+    // Pre-fill quick interview fields from saved config when dialog opens
+    const openQuickDialog = () => {
+        setQuickRole(String(targetRole || '').trim());
+        setQuickJD(String(jobDescription || '').trim());
+        setQuickOpen(true);
+    };
+
     useEffect(() => {
         connect();
     }, [connect]);
@@ -214,6 +224,17 @@ export default function V0Setup() {
             return;
         }
 
+        // --- Unlock audio playback on user click ---
+        try {
+            const unlockAudio = new Audio();
+            // A silent 1-second base64 wav file
+            unlockAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+            unlockAudio.play().catch(() => { });
+        } catch (e) {
+            console.warn('Audio unlock failed:', e);
+        }
+        // -------------------------------------------
+
         setError('');
         setStartingType(interviewType.id);
 
@@ -236,6 +257,50 @@ export default function V0Setup() {
         setTimeout(() => setStartingType(null), 3000);
     };
 
+    const handleQuickStart = () => {
+        const role = quickRole.trim();
+        const jd = quickJD.trim();
+        if (!role || !jd) return;
+        if (!isConnected) {
+            setError('Not connected to server yet. Please try again in a moment.');
+            return;
+        }
+
+        // --- Unlock audio playback on user click ---
+        try {
+            const unlockAudio = new Audio();
+            unlockAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+            unlockAudio.play().catch(() => { });
+        } catch (e) {
+            console.warn('Audio unlock failed:', e);
+        }
+        // -------------------------------------------
+
+        setQuickStarting(true);
+        setError('');
+
+        const skillGaps = getSkillGapsForType(quickType, []);
+
+        startInterview({
+            job_title: role,
+            skill_gaps: skillGaps,
+            readiness_score: 0.5,
+            job_description: jd,
+            interview_type: quickType,
+            mode: activeStyle.mode,
+            coaching_enabled: activeStyle.coachingEnabled,
+            feedback_timing: 'end_only',
+            live_scoring: false,
+            interviewer_persona: selectedPersona,
+            question_count: questionCount,
+        });
+
+        setTimeout(() => {
+            setQuickStarting(false);
+            setQuickOpen(false);
+        }, 3000);
+    };
+
     return (
         <ThemeProvider theme={theme}>
             <CssBaseline />
@@ -254,7 +319,7 @@ export default function V0Setup() {
                                 </Box>
                                 <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                                     <Chip size="small" label={isConnected ? 'Connected' : 'Connecting'} color={isConnected ? 'success' : 'default'} variant="outlined" />
-                                    <Chip size="small" label={`Readiness ${readinessPercent}%`} variant="outlined" />
+                                    <Chip size="small" label={readinessPercent > 0 ? `Readiness ${readinessPercent}%` : 'Quick Start'} color={readinessPercent > 0 ? 'default' : 'info'} variant="outlined" />
                                     <Chip size="small" label={`${questionCount} questions`} variant="outlined" />
                                     <Chip size="small" label={activeStyle.title} color={selectedStyle === 'coach' ? 'secondary' : 'default'} variant="outlined" />
                                     <Chip size="small" label={activePersona.title} variant="outlined" />
@@ -396,13 +461,46 @@ export default function V0Setup() {
                             </Box>
                         </Paper>
 
+                        {/* Quick Interview card — always visible */}
+                        <Paper
+                            sx={{
+                                p: { xs: 2, md: 2.5 },
+                                border: '1px solid',
+                                borderColor: 'primary.main',
+                                background: darkMode
+                                    ? 'linear-gradient(135deg, rgba(99,102,241,0.12), rgba(139,92,246,0.04))'
+                                    : 'linear-gradient(135deg, rgba(99,102,241,0.08), rgba(139,92,246,0.03))',
+                            }}
+                        >
+                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1.2}>
+                                <Stack direction="row" spacing={1.2} alignItems="center">
+                                    <BoltOutlined sx={{ color: 'primary.main', fontSize: 28 }} />
+                                    <Box>
+                                        <Typography variant="h6" sx={{ lineHeight: 1.2 }}>Quick Interview</Typography>
+                                        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                            Jump straight in with just a role and job description. No resume or analysis needed.
+                                        </Typography>
+                                    </Box>
+                                </Stack>
+                                <Button
+                                    variant="contained"
+                                    startIcon={<BoltOutlined />}
+                                    onClick={openQuickDialog}
+                                    disabled={!isConnected}
+                                    sx={{ whiteSpace: 'nowrap', minWidth: 150 }}
+                                >
+                                    Start Quick Interview
+                                </Button>
+                            </Stack>
+                        </Paper>
+
                         {!hasConfiguration && (
                             <Paper sx={{ p: 2 }}>
                                 <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-                                    Configuration Required
+                                    Full Interview (with Analysis)
                                 </Typography>
                                 <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.2 }}>
-                                    Set target role and job description first, then return here to start an interview.
+                                    For personalized questions based on your resume, set up your profile and run analysis first.
                                 </Typography>
                                 <Button variant="outlined" endIcon={<ArrowForward />} onClick={() => navigate('/config')}>
                                     Open Configuration
@@ -458,6 +556,90 @@ export default function V0Setup() {
                     </Stack>
                 </Container>
             </Box>
+
+            {/* Quick Interview Dialog */}
+            <Dialog
+                open={quickOpen}
+                onClose={() => !quickStarting && setQuickOpen(false)}
+                maxWidth="sm"
+                fullWidth
+            >
+                <DialogTitle>
+                    <Stack direction="row" justifyContent="space-between" alignItems="center">
+                        <Stack direction="row" spacing={1} alignItems="center">
+                            <BoltOutlined sx={{ color: 'primary.main' }} />
+                            <span>Quick Interview</span>
+                        </Stack>
+                        <IconButton size="small" onClick={() => setQuickOpen(false)} disabled={quickStarting}>
+                            <Close fontSize="small" />
+                        </IconButton>
+                    </Stack>
+                </DialogTitle>
+                <Divider />
+                <DialogContent>
+                    <Stack spacing={2.5} sx={{ pt: 1 }}>
+                        <TextField
+                            label="Target Role"
+                            placeholder="e.g. Senior Backend Engineer"
+                            value={quickRole}
+                            onChange={(e) => setQuickRole(e.target.value)}
+                            fullWidth
+                            disabled={quickStarting}
+                            autoFocus
+                        />
+                        <TextField
+                            label="Job Description"
+                            placeholder="Paste the job description here..."
+                            value={quickJD}
+                            onChange={(e) => setQuickJD(e.target.value)}
+                            fullWidth
+                            multiline
+                            minRows={5}
+                            maxRows={12}
+                            disabled={quickStarting}
+                        />
+                        <Box>
+                            <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                                Interview Type
+                            </Typography>
+                            <ToggleButtonGroup
+                                value={quickType}
+                                exclusive
+                                onChange={(_, val) => val && setQuickType(val)}
+                                size="small"
+                                fullWidth
+                                disabled={quickStarting}
+                            >
+                                {INTERVIEW_TYPES.map((t) => (
+                                    <ToggleButton key={t.id} value={t.id} sx={{ textTransform: 'none', py: 1 }}>
+                                        {t.title.replace(' Interview', '')}
+                                    </ToggleButton>
+                                ))}
+                            </ToggleButtonGroup>
+                        </Box>
+                        {quickRole.trim() && quickJD.trim() && (
+                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                Style: {activeStyle.title} &bull; Persona: {activePersona.title} &bull; {questionCount} questions
+                            </Typography>
+                        )}
+                    </Stack>
+                </DialogContent>
+                <Divider />
+                <DialogActions sx={{ px: 3, py: 2 }}>
+                    <Button onClick={() => setQuickOpen(false)} disabled={quickStarting}>
+                        Cancel
+                    </Button>
+                    <Button
+                        variant="contained"
+                        size="large"
+                        startIcon={quickStarting ? <CircularProgress size={16} color="inherit" /> : <PlayArrow />}
+                        onClick={handleQuickStart}
+                        disabled={!quickRole.trim() || !quickJD.trim() || quickStarting}
+                    >
+                        {quickStarting ? 'Starting...' : 'Start Interview'}
+                    </Button>
+                </DialogActions>
+            </Dialog>
         </ThemeProvider>
     );
 }

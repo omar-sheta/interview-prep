@@ -8,7 +8,7 @@ import json
 import re
 
 from server.services.llm_factory import get_fast_chat_model
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 
 
 async def generate_coaching_hint(
@@ -55,9 +55,23 @@ Be very explicit with a mini-plan, while avoiding giving a full final answer."""
     # Context about what they've said
     transcript_context = f'What they\'ve said so far: "{transcript[:300]}..."' if has_transcript else "They haven't started answering yet."
     
-    prompt = f"""You are an expert Interview Coach helping in real-time.
+    system_prompt = """You are an expert Interview Coach helping in real-time.
+Return STRICT JSON ONLY with this exact schema:
+{
+  "message": "single actionable sentence (max 22 words)",
+  "next_step": "single concrete action to do now",
+  "framework": "short framework name (e.g. STAR, Problem-Approach-Tradeoff-Result)",
+  "starter": "first sentence stem candidate can say next",
+  "must_mention": ["point 1", "point 2", "point 3"],
+  "avoid": "one common mistake to avoid"
+}
 
-QUESTION: "{question_text}"
+Rules:
+- Do not provide the full answer.
+- Keep must_mention to 2-3 short items.
+- No markdown, no preface, no extra keys."""
+
+    human_prompt = f"""QUESTION: "{question_text}"
 CATEGORY: {category}
 SKILL TESTED: {skill or "General"}
 KEY POINTS TO COVER: {', '.join(points[:4]) if points else "Clear explanation with examples"}
@@ -65,26 +79,14 @@ KEY POINTS TO COVER: {', '.join(points[:4]) if points else "Clear explanation wi
 {transcript_context}
 {prev_context}
 
-INSTRUCTION: {directiveness}
-
-Return STRICT JSON ONLY with this exact schema:
-{{
-  "message": "single actionable sentence (max 22 words)",
-  "next_step": "single concrete action to do now",
-  "framework": "short framework name (e.g. STAR, Problem-Approach-Tradeoff-Result)",
-  "starter": "first sentence stem candidate can say next",
-  "must_mention": ["point 1", "point 2", "point 3"],
-  "avoid": "one common mistake to avoid"
-}}
-
-Rules:
-- Do not provide the full answer.
-- Keep must_mention to 2-3 short items.
-- No markdown, no preface, no extra keys."""
+INSTRUCTION: {directiveness}"""
 
     chat_model = get_fast_chat_model()
     try:
-        response = await chat_model.ainvoke([SystemMessage(content=prompt)])
+        response = await chat_model.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_prompt)
+        ])
         content = response.content.strip()
 
         # Extract JSON block safely, even if model adds wrappers.

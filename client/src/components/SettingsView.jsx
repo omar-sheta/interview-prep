@@ -7,7 +7,6 @@ import {
     Paper,
     Stack,
     Typography,
-    TextField,
     Button,
     Divider,
     Alert,
@@ -15,6 +14,7 @@ import {
     InputLabel,
     Select,
     MenuItem,
+    TextField,
     Dialog,
     DialogTitle,
     DialogContent,
@@ -25,47 +25,10 @@ import useInterviewStore from '@/store/useInterviewStore';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
 
-const DEFAULT_THRESHOLDS = {
-    low_relevance_threshold: 0.12,
-    repetition_ratio_cap: 0.42,
-    unique_word_ratio_min: 0.4,
-    coverage_min: 0.4,
-    structure_markers_min: 2,
-    structure_sentence_cap: 2,
-    gibberish_ratio_threshold: 0.28,
-    low_transcript_penalty: 1.0,
-    low_transcript_confidence_cap: 0.45,
-    accuracy_cap_low_relevance: 3,
-    clarity_cap_repetition: 3,
-    completeness_cap_low_coverage: 4,
-    structure_cap_weak: 4,
-};
-
 const DEFAULT_RECORDING_THRESHOLDS = {
     silence_auto_stop_seconds: 5.0,
     silence_rms_threshold: 0.008,
 };
-
-const FIELD_META = [
-    { key: 'low_relevance_threshold', label: 'Low relevance threshold (0-1)', type: 'float', min: 0.01, max: 0.9 },
-    { key: 'repetition_ratio_cap', label: 'Repetition cap threshold (0-1)', type: 'float', min: 0.1, max: 0.95 },
-    { key: 'unique_word_ratio_min', label: 'Min lexical diversity (0-1)', type: 'float', min: 0.1, max: 0.95 },
-    { key: 'coverage_min', label: 'Min rubric coverage (0-1)', type: 'float', min: 0.05, max: 0.95 },
-    { key: 'structure_markers_min', label: 'Min structure markers', type: 'int', min: 0, max: 8 },
-    { key: 'structure_sentence_cap', label: 'Weak structure sentence cap', type: 'int', min: 1, max: 8 },
-    { key: 'gibberish_ratio_threshold', label: 'Gibberish threshold (0-1)', type: 'float', min: 0.05, max: 0.95 },
-    { key: 'low_transcript_penalty', label: 'Low transcript score penalty', type: 'float', min: 0, max: 4 },
-    { key: 'low_transcript_confidence_cap', label: 'Low transcript confidence cap', type: 'float', min: 0.1, max: 0.95 },
-    { key: 'accuracy_cap_low_relevance', label: 'Accuracy cap (low relevance)', type: 'float', min: 0, max: 10 },
-    { key: 'clarity_cap_repetition', label: 'Clarity cap (repetition)', type: 'float', min: 0, max: 10 },
-    { key: 'completeness_cap_low_coverage', label: 'Completeness cap (low coverage)', type: 'float', min: 0, max: 10 },
-    { key: 'structure_cap_weak', label: 'Structure cap (weak flow)', type: 'float', min: 0, max: 10 },
-];
-
-const RECORDING_FIELD_META = [
-    { key: 'silence_auto_stop_seconds', label: 'Auto-stop silence duration (seconds)', type: 'float', min: 1, max: 20 },
-    { key: 'silence_rms_threshold', label: 'Silence RMS threshold', type: 'float', min: 0.001, max: 0.05 },
-];
 
 function clampNumber(value, min, max, fallback) {
     const n = Number(value);
@@ -73,30 +36,20 @@ function clampNumber(value, min, max, fallback) {
     return Math.max(min, Math.min(max, n));
 }
 
-function normalizeThresholds(input) {
-    const src = (input && typeof input === 'object') ? input : {};
-    const merged = { ...DEFAULT_THRESHOLDS, ...src };
-    const normalized = {};
-    for (const field of FIELD_META) {
-        const fallback = DEFAULT_THRESHOLDS[field.key];
-        const raw = merged[field.key];
-        const clamped = clampNumber(raw, field.min, field.max, fallback);
-        normalized[field.key] = field.type === 'int' ? Math.round(clamped) : Number(clamped.toFixed(3));
-    }
-    return normalized;
-}
-
 function normalizeRecordingThresholds(input) {
     const src = (input && typeof input === 'object') ? input : {};
-    const merged = { ...DEFAULT_RECORDING_THRESHOLDS, ...src };
-    const normalized = {};
-    for (const field of RECORDING_FIELD_META) {
-        const fallback = DEFAULT_RECORDING_THRESHOLDS[field.key];
-        const raw = merged[field.key];
-        const clamped = clampNumber(raw, field.min, field.max, fallback);
-        normalized[field.key] = Number(clamped.toFixed(3));
-    }
-    return normalized;
+    return {
+        silence_auto_stop_seconds: clampNumber(
+            src.silence_auto_stop_seconds,
+            1, 20,
+            DEFAULT_RECORDING_THRESHOLDS.silence_auto_stop_seconds
+        ),
+        silence_rms_threshold: clampNumber(
+            src.silence_rms_threshold,
+            0.001, 0.05,
+            DEFAULT_RECORDING_THRESHOLDS.silence_rms_threshold
+        ),
+    };
 }
 
 export default function SettingsView() {
@@ -106,16 +59,17 @@ export default function SettingsView() {
         loadPreferences,
         savePreferences,
         resetAllData,
-        evaluationThresholds,
         recordingThresholds,
         piperStyle,
+        ttsProvider,
         setPiperStyle,
+        setTtsProvider,
     } = useInterviewStore();
 
     const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
-    const [strictnessDraft, setStrictnessDraft] = useState(normalizeThresholds(evaluationThresholds));
     const [recordingDraft, setRecordingDraft] = useState(normalizeRecordingThresholds(recordingThresholds));
     const [voiceStyleDraft, setVoiceStyleDraft] = useState('interviewer');
+    const [ttsProviderDraft, setTtsProviderDraft] = useState('piper');
     const [status, setStatus] = useState('');
     const [statusSeverity, setStatusSeverity] = useState('success');
     const [resetDialogOpen, setResetDialogOpen] = useState(false);
@@ -123,10 +77,6 @@ export default function SettingsView() {
     useEffect(() => {
         if (isConnected) loadPreferences();
     }, [isConnected, loadPreferences]);
-
-    useEffect(() => {
-        setStrictnessDraft(normalizeThresholds(evaluationThresholds));
-    }, [evaluationThresholds]);
 
     useEffect(() => {
         setRecordingDraft(normalizeRecordingThresholds(recordingThresholds));
@@ -138,43 +88,41 @@ export default function SettingsView() {
         setVoiceStyleDraft(allowed.has(next) ? next : 'interviewer');
     }, [piperStyle]);
 
-    const onStrictnessFieldChange = (key, value) => {
-        setStrictnessDraft((prev) => ({ ...prev, [key]: value }));
-    };
-
-    const onRecordingFieldChange = (key, value) => {
-        setRecordingDraft((prev) => ({ ...prev, [key]: value }));
-    };
+    useEffect(() => {
+        const next = String(ttsProvider || 'piper').trim().toLowerCase();
+        const allowed = new Set(['piper', 'qwen3_tts_mlx']);
+        setTtsProviderDraft(allowed.has(next) ? next : 'piper');
+    }, [ttsProvider]);
 
     const save = () => {
-        const normalizedStrictness = normalizeThresholds(strictnessDraft);
         const normalizedRecording = normalizeRecordingThresholds(recordingDraft);
-        setStrictnessDraft(normalizedStrictness);
         setRecordingDraft(normalizedRecording);
         savePreferences({
-            evaluation_thresholds: normalizedStrictness,
             recording_thresholds: normalizedRecording,
             piper_style: voiceStyleDraft,
+            tts_provider: ttsProviderDraft,
         });
         setPiperStyle(voiceStyleDraft);
+        setTtsProvider(ttsProviderDraft);
         setStatusSeverity('success');
-        setStatus('Saved settings. New evaluations and recording sessions will use these values.');
+        setStatus('Settings saved.');
         setTimeout(() => setStatus(''), 2500);
     };
 
     const resetDefaults = () => {
-        const strictDefaults = normalizeThresholds(DEFAULT_THRESHOLDS);
         const recordingDefaults = normalizeRecordingThresholds(DEFAULT_RECORDING_THRESHOLDS);
         const voiceDefault = 'interviewer';
-        setStrictnessDraft(strictDefaults);
+        const ttsDefault = 'piper';
         setRecordingDraft(recordingDefaults);
         setVoiceStyleDraft(voiceDefault);
+        setTtsProviderDraft(ttsDefault);
         savePreferences({
-            evaluation_thresholds: strictDefaults,
             recording_thresholds: recordingDefaults,
             piper_style: voiceDefault,
+            tts_provider: ttsDefault,
         });
         setPiperStyle(voiceDefault);
+        setTtsProvider(ttsDefault);
         setStatusSeverity('success');
         setStatus('Reset to default settings.');
         setTimeout(() => setStatus(''), 2500);
@@ -203,13 +151,13 @@ export default function SettingsView() {
                     <Paper sx={{ p: { xs: 2, md: 2.5 }, mb: 2.2 }}>
                         <Typography variant="h4">Settings</Typography>
                         <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                            Tune scoring strictness thresholds used by evaluation and retry scoring.
+                            Configure voice synthesis and recording behavior.
                         </Typography>
                     </Paper>
 
                     <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
                         <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} spacing={1.2} sx={{ mb: 1.2 }}>
-                            <Typography variant="h6">Feedback Strictness</Typography>
+                            <Typography variant="h6">Voice &amp; Recording</Typography>
                             <Stack direction="row" spacing={1}>
                                 <Button variant="outlined" startIcon={<RestartAlt />} onClick={resetDefaults}>
                                     Reset Defaults
@@ -219,57 +167,69 @@ export default function SettingsView() {
                                 </Button>
                             </Stack>
                         </Stack>
-                        <Divider sx={{ mb: 1.2 }} />
+                        <Divider sx={{ mb: 1.8 }} />
 
-                        <Typography variant="h6" sx={{ mb: 1.2 }}>Voice Synthesis</Typography>
-                        <Box sx={{ maxWidth: 360, mb: 1.8 }}>
+                        <Typography variant="subtitle2" sx={{ mb: 1 }}>Question Voice Style</Typography>
+                        <Box sx={{ maxWidth: 420, mb: 1.2 }}>
                             <FormControl fullWidth size="small">
-                                <InputLabel id="piper-style-label">Question Voice Style</InputLabel>
+                                <InputLabel id="tts-provider-label">Voice Engine</InputLabel>
+                                <Select
+                                    labelId="tts-provider-label"
+                                    label="Voice Engine"
+                                    value={ttsProviderDraft}
+                                    onChange={(event) => setTtsProviderDraft(String(event.target.value || 'piper'))}
+                                >
+                                    <MenuItem value="piper">Piper (fast + lightweight)</MenuItem>
+                                    <MenuItem value="qwen3_tts_mlx">Qwen3-TTS MLX (higher quality)</MenuItem>
+                                </Select>
+                            </FormControl>
+                        </Box>
+
+                        <Typography variant="subtitle2" sx={{ mb: 1 }}>Piper Voice Style</Typography>
+                        <Box sx={{ maxWidth: 420, mb: 2.5 }}>
+                            <FormControl fullWidth size="small">
+                                <InputLabel id="piper-style-label">Voice Style</InputLabel>
                                 <Select
                                     labelId="piper-style-label"
-                                    label="Question Voice Style"
+                                    label="Voice Style"
                                     value={voiceStyleDraft}
                                     onChange={(event) => setVoiceStyleDraft(String(event.target.value || 'interviewer'))}
+                                    disabled={ttsProviderDraft !== 'piper'}
                                 >
                                     <MenuItem value="interviewer">Interviewer (clear + polished)</MenuItem>
                                     <MenuItem value="balanced">Balanced (default cadence)</MenuItem>
                                     <MenuItem value="fast">Fast (lower latency)</MenuItem>
                                 </Select>
                             </FormControl>
+                            {ttsProviderDraft !== 'piper' && (
+                                <Typography variant="caption" sx={{ color: 'text.secondary', mt: 0.6, display: 'block' }}>
+                                    Piper style presets apply only when Voice Engine is set to Piper.
+                                </Typography>
+                            )}
                         </Box>
 
-                        <Divider sx={{ mb: 1.2 }} />
-
+                        <Typography variant="subtitle2" sx={{ mb: 1 }}>Recording</Typography>
                         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.2 }}>
-                            {FIELD_META.map((field) => (
-                                <TextField
-                                    key={field.key}
-                                    label={field.label}
-                                    value={strictnessDraft[field.key] ?? ''}
-                                    onChange={(event) => onStrictnessFieldChange(field.key, event.target.value)}
-                                    type="number"
-                                    inputProps={{ min: field.min, max: field.max, step: field.type === 'int' ? 1 : 0.01 }}
-                                    size="small"
-                                    fullWidth
-                                />
-                            ))}
-                        </Box>
-
-                        <Divider sx={{ my: 1.8 }} />
-                        <Typography variant="h6" sx={{ mb: 1.2 }}>Recording</Typography>
-                        <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.2 }}>
-                            {RECORDING_FIELD_META.map((field) => (
-                                <TextField
-                                    key={field.key}
-                                    label={field.label}
-                                    value={recordingDraft[field.key] ?? ''}
-                                    onChange={(event) => onRecordingFieldChange(field.key, event.target.value)}
-                                    type="number"
-                                    inputProps={{ min: field.min, max: field.max, step: 0.001 }}
-                                    size="small"
-                                    fullWidth
-                                />
-                            ))}
+                            <TextField
+                                label="Auto-stop silence duration (seconds)"
+                                value={recordingDraft.silence_auto_stop_seconds ?? ''}
+                                onChange={(e) => setRecordingDraft((prev) => ({ ...prev, silence_auto_stop_seconds: e.target.value }))}
+                                type="number"
+                                inputProps={{ min: 1, max: 20, step: 0.5 }}
+                                size="small"
+                                fullWidth
+                                helperText="Recording stops automatically after this many seconds of silence."
+                            />
+                            <TextField
+                                label="Silence RMS threshold"
+                                value={recordingDraft.silence_rms_threshold ?? ''}
+                                onChange={(e) => setRecordingDraft((prev) => ({ ...prev, silence_rms_threshold: e.target.value }))}
+                                type="number"
+                                inputProps={{ min: 0.001, max: 0.05, step: 0.001 }}
+                                size="small"
+                                fullWidth
+                                helperText="Lower = more sensitive to quiet speech. Increase if recording stops too early."
+                            />
                         </Box>
 
                         {status && (

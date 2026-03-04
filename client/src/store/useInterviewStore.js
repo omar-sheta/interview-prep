@@ -27,6 +27,15 @@ const normalizePiperStyle = (style, fallback = 'interviewer') => {
     return ALLOWED_PIPER_STYLES.has(normalized) ? normalized : fallbackNormalized;
 };
 
+const ALLOWED_TTS_PROVIDERS = new Set(['piper', 'qwen3_tts_mlx']);
+const normalizeTtsProvider = (provider, fallback = 'piper') => {
+    const fallbackNormalized = ALLOWED_TTS_PROVIDERS.has(String(fallback || '').trim().toLowerCase())
+        ? String(fallback || '').trim().toLowerCase()
+        : 'piper';
+    const normalized = String(provider || '').trim().toLowerCase();
+    return ALLOWED_TTS_PROVIDERS.has(normalized) ? normalized : fallbackNormalized;
+};
+
 // Socket.IO instance managed in state
 const useInterviewStore = create(
     persist(
@@ -60,6 +69,7 @@ const useInterviewStore = create(
             questionCountOverride: null,
             interviewerPersona: 'friendly',
             piperStyle: 'interviewer',
+            ttsProvider: 'piper',
             evaluationThresholds: {},
             recordingThresholds: {},
             focusAreas: [],
@@ -88,6 +98,7 @@ const useInterviewStore = create(
             allEvaluations: [],
             interviewSummary: null,
             answerSubmitPending: false,
+            generatingReport: false,
 
             // Thinking terminal (not persisted)
             thinkingLog: [],
@@ -204,6 +215,7 @@ const useInterviewStore = create(
                                     : null,
                             interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
                             piperStyle: normalizePiperStyle(prefs.piper_style, 'interviewer'),
+                            ttsProvider: normalizeTtsProvider(prefs.tts_provider, 'piper'),
                             evaluationThresholds: (prefs.evaluation_thresholds && typeof prefs.evaluation_thresholds === 'object') ? prefs.evaluation_thresholds : {},
                             recordingThresholds: (prefs.recording_thresholds && typeof prefs.recording_thresholds === 'object') ? prefs.recording_thresholds : {},
                             focusAreas: prefs.focus_areas || [],
@@ -272,6 +284,24 @@ const useInterviewStore = create(
                         nextState.sessionToken = data.session_token;
                         localStorage.setItem('session_token', data.session_token);
                     }
+
+                    // If an interview is active, only update user/prefs — do NOT
+                    // reset interview state, which would wipe the current question.
+                    const { appState: currentAppState, interviewActive: currentlyInterviewing } = get();
+                    const isInInterview = currentlyInterviewing || currentAppState === APP_STATES.INTERVIEWING;
+
+                    if (isInInterview) {
+                        set({
+                            ...nextState,
+                            interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
+                            piperStyle: normalizePiperStyle(prefs.piper_style, get().piperStyle || 'interviewer'),
+                            ttsProvider: normalizeTtsProvider(prefs.tts_provider, get().ttsProvider || 'piper'),
+                            recordingThresholds: (prefs.recording_thresholds && typeof prefs.recording_thresholds === 'object') ? prefs.recording_thresholds : {},
+                        });
+                        get().addThinking('🔄 Reconnected — interview state preserved');
+                        return;
+                    }
+
                     set({
                         ...nextState,
                         targetRole: prefs.target_role || '',
@@ -283,6 +313,7 @@ const useInterviewStore = create(
                                 : null,
                         interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
                         piperStyle: normalizePiperStyle(prefs.piper_style, get().piperStyle || 'interviewer'),
+                        ttsProvider: normalizeTtsProvider(prefs.tts_provider, get().ttsProvider || 'piper'),
                         evaluationThresholds: (prefs.evaluation_thresholds && typeof prefs.evaluation_thresholds === 'object') ? prefs.evaluation_thresholds : {},
                         recordingThresholds: (prefs.recording_thresholds && typeof prefs.recording_thresholds === 'object') ? prefs.recording_thresholds : {},
                         focusAreas: prefs.focus_areas || [],
@@ -344,6 +375,9 @@ const useInterviewStore = create(
                 // Handle career analysis (both fresh and loaded from DB)
                 onSafe('career_analysis', (data) => {
                     const analysis = data.analysis;
+                    const { appState: currentAppState, interviewActive: currentlyInterviewing } = get();
+                    const isInInterview = currentlyInterviewing || currentAppState === APP_STATES.INTERVIEWING;
+
                     if (analysis) {
                         const topLevelSkillGaps = Array.isArray(analysis.skill_gaps) ? analysis.skill_gaps : [];
                         const analysisSkillMapping = analysis.analysis_data?.skill_mapping;
@@ -354,7 +388,10 @@ const useInterviewStore = create(
                             }
                             : analysisSkillMapping;
                         get().addThinking('✅ Career analysis loaded');
-                        set({
+
+                        // During an active interview, update analysis data silently
+                        // but do NOT change appState — that would kill the interview.
+                        const nextState = {
                             mindmap: analysis.analysis_data?.mindmap || analysis.analysis_data?.mindmap_code,
                             readinessScore: analysis.readiness_score,
                             skillMapping: mergedSkillMapping,
@@ -368,8 +405,11 @@ const useInterviewStore = create(
                             jobDescription: analysis.job_description || analysis.analysis_data?.job_description || get().jobDescription || '',
                             lastAnalysisTime: analysis.created_at || Date.now(),
                             analysisProgress: 'Analysis Complete!',
-                            appState: APP_STATES.MAP_READY
-                        });
+                        };
+                        if (!isInInterview) {
+                            nextState.appState = APP_STATES.MAP_READY;
+                        }
+                        set(nextState);
                     } else {
                         set((state) => ({
                             mindmap: '',
@@ -405,6 +445,7 @@ const useInterviewStore = create(
                         interviewFeedbackTiming: data.feedback_timing || 'end_only',
                         interviewerPersona: String(data.interviewer_persona || get().interviewerPersona || 'friendly').trim().toLowerCase() || 'friendly',
                         piperStyle: normalizePiperStyle(data.piper_style, get().piperStyle || 'interviewer'),
+                        ttsProvider: normalizeTtsProvider(data.tts_provider, get().ttsProvider || 'piper'),
                         coachingEnabled: !!data.coaching_enabled,
                         appState: APP_STATES.INTERVIEWING,
                         answerSubmitPending: false,
@@ -460,9 +501,18 @@ const useInterviewStore = create(
                     set({ currentTokens: get().currentTokens + data.token });
                 });
 
+                onSafe('generating_report', () => {
+                    set({
+                        generatingReport: true,
+                        answerSubmitPending: false,
+                    });
+                    get().addThinking('📊 Generating your interview report…');
+                });
+
                 onSafe('interview_complete', (data) => {
                     set({
                         interviewActive: false,
+                        generatingReport: false,
                         currentSessionId: data.session_id || get().currentSessionId,
                         interviewSummary: data.summary,
                         allEvaluations: data.evaluations,
@@ -479,6 +529,7 @@ const useInterviewStore = create(
 
                 // TTS audio for interview questions
                 onSafe('tts_audio', (data) => {
+                    console.log('[TTS] tts_audio received, has audio:', !!data.audio, 'audio length:', data.audio?.length || 0, 'question_index:', data.question_index);
                     if (data.audio) {
                         const qIdx = Number.isInteger(data.question_index)
                             ? Number(data.question_index)
@@ -486,13 +537,16 @@ const useInterviewStore = create(
                         // Ignore stale question audio that arrives for an old question.
                         if (qIdx !== null) {
                             const currentQ = Number(get().questionNumber || 0);
+                            console.log('[TTS] stale check: qIdx=', qIdx, 'currentQ=', currentQ, 'pass=', !(currentQ > 0 && qIdx !== (currentQ - 1)));
                             if (currentQ > 0 && qIdx !== (currentQ - 1)) {
+                                console.log('[TTS] DROPPED stale audio');
                                 return;
                             }
                         }
                         set((state) => ({
                             ttsAudioQueue: [...state.ttsAudioQueue, data.audio]
                         }));
+                        console.log('[TTS] Audio queued, queue length:', get().ttsAudioQueue.length);
                         get().addThinking('🔊 Playing interviewer audio');
                     }
                 });
@@ -580,6 +634,7 @@ const useInterviewStore = create(
                         questionCountOverride: null,
                         interviewerPersona: 'friendly',
                         piperStyle: 'interviewer',
+                        ttsProvider: 'piper',
                         focusAreas: [],
                         lastAnalysisTime: null,
                         mindmap: '',
@@ -624,6 +679,7 @@ const useInterviewStore = create(
                         questionCountOverride: null,
                         interviewerPersona: 'friendly',
                         piperStyle: 'interviewer',
+                        ttsProvider: 'piper',
                         focusAreas: [],
                         lastAnalysisTime: null,
                         mindmap: '',
@@ -652,6 +708,7 @@ const useInterviewStore = create(
                                 : null,
                         interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
                         piperStyle: normalizePiperStyle(prefs.piper_style, get().piperStyle || 'interviewer'),
+                        ttsProvider: normalizeTtsProvider(prefs.tts_provider, get().ttsProvider || 'piper'),
                         evaluationThresholds: (prefs.evaluation_thresholds && typeof prefs.evaluation_thresholds === 'object') ? prefs.evaluation_thresholds : {},
                         recordingThresholds: (prefs.recording_thresholds && typeof prefs.recording_thresholds === 'object') ? prefs.recording_thresholds : {},
                         focusAreas: prefs.focus_areas || [],
@@ -897,6 +954,7 @@ const useInterviewStore = create(
                 questionCountOverride: null,
                 interviewerPersona: 'friendly',
                 piperStyle: 'interviewer',
+                ttsProvider: 'piper',
                 evaluationThresholds: {},
                 recordingThresholds: {},
                 lastAnalysisTime: null,
@@ -926,7 +984,7 @@ const useInterviewStore = create(
             // Reset for new analysis (clears old CV/job data before new upload)
             resetForNewAnalysis: () => {
                 console.log('🔄 Resetting for new analysis...');
-                const { targetRole, targetCompany, jobDescription, questionCountOverride, interviewerPersona, piperStyle } = get();
+                const { targetRole, targetCompany, jobDescription, questionCountOverride, interviewerPersona, piperStyle, ttsProvider } = get();
                 set({
                     appState: APP_STATES.ANALYZING,
                     mindmap: '',
@@ -943,6 +1001,7 @@ const useInterviewStore = create(
                     questionCountOverride: questionCountOverride ?? null,
                     interviewerPersona: interviewerPersona || 'friendly',
                     piperStyle: normalizePiperStyle(piperStyle, 'interviewer'),
+                    ttsProvider: normalizeTtsProvider(ttsProvider, 'piper'),
                     evaluationThresholds: {},
                     recordingThresholds: {},
                     lastAnalysisTime: null,
@@ -1150,7 +1209,7 @@ const useInterviewStore = create(
                     setTimeout(() => {
                         try {
                             socket.disconnect();
-                        } catch (_) {}
+                        } catch (_) { }
                     }, 120);
                 } else if (socket) {
                     socket.disconnect();
@@ -1187,6 +1246,7 @@ const useInterviewStore = create(
                     questionCountOverride: null,
                     interviewerPersona: 'friendly',
                     piperStyle: 'interviewer',
+                    ttsProvider: 'piper',
                     evaluationThresholds: {},
                     recordingThresholds: {},
                     focusAreas: [],
@@ -1229,7 +1289,7 @@ const useInterviewStore = create(
 
             // Start interview with context from analysis
             startInterviewPractice: (mode = 'practice') => {
-                const { skillMapping, jobRequirements, readinessScore, focusAreas, jobDescription, questionCountOverride, interviewerPersona, piperStyle } = get();
+                const { skillMapping, jobRequirements, readinessScore, focusAreas, jobDescription, questionCountOverride, interviewerPersona, piperStyle, ttsProvider } = get();
 
                 const { socket } = get();
                 if (!socket?.connected) {
@@ -1253,6 +1313,7 @@ const useInterviewStore = create(
                     live_scoring: false,
                     interviewer_persona: interviewerPersona || 'friendly',
                     piper_style: normalizePiperStyle(piperStyle, 'interviewer'),
+                    tts_provider: normalizeTtsProvider(ttsProvider, 'piper'),
                 });
 
                 set({
@@ -1345,13 +1406,18 @@ const useInterviewStore = create(
             // Set default interviewer persona for upcoming sessions.
             setInterviewerPersona: (persona) => {
                 const normalized = String(persona || '').trim().toLowerCase();
-                const allowed = new Set(['friendly', 'strict', 'rapid_fire', 'skeptical']);
+                const allowed = new Set(['friendly', 'strict']);
                 set({ interviewerPersona: allowed.has(normalized) ? normalized : 'friendly' });
             },
 
             // Set default Piper voice style for upcoming sessions.
             setPiperStyle: (style) => {
                 set({ piperStyle: normalizePiperStyle(style, 'interviewer') });
+            },
+
+            // Set default TTS provider for upcoming sessions.
+            setTtsProvider: (provider) => {
+                set({ ttsProvider: normalizeTtsProvider(provider, 'piper') });
             },
 
             // Save user preferences to backend
@@ -1378,13 +1444,19 @@ const useInterviewStore = create(
                     }
                     if (Object.prototype.hasOwnProperty.call(preferences, 'interviewer_persona')) {
                         const normalized = String(preferences.interviewer_persona || '').trim().toLowerCase();
-                        const allowed = new Set(['friendly', 'strict', 'rapid_fire', 'skeptical']);
+                        const allowed = new Set(['friendly', 'strict']);
                         nextState.interviewerPersona = allowed.has(normalized) ? normalized : 'friendly';
                     }
                     if (Object.prototype.hasOwnProperty.call(preferences, 'piper_style')) {
                         nextState.piperStyle = normalizePiperStyle(
                             preferences.piper_style,
                             get().piperStyle || 'interviewer'
+                        );
+                    }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'tts_provider')) {
+                        nextState.ttsProvider = normalizeTtsProvider(
+                            preferences.tts_provider,
+                            get().ttsProvider || 'piper'
                         );
                     }
                     if (Object.keys(nextState).length > 0) {
@@ -1562,6 +1634,7 @@ const useInterviewStore = create(
                 questionCountOverride: state.questionCountOverride,
                 interviewerPersona: state.interviewerPersona,
                 piperStyle: state.piperStyle,
+                ttsProvider: state.ttsProvider,
                 evaluationThresholds: state.evaluationThresholds,
                 recordingThresholds: state.recordingThresholds,
                 focusAreas: state.focusAreas,

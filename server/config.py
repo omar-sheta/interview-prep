@@ -25,12 +25,37 @@ class Settings(BaseSettings):
     # Embedding dimensions (optimized for nomic-embed-text)
     EMBEDDING_DIM: int = 768
     
-    # LLM Model (Ollama Tag)
-    # Available: qwen2.5:7b (FAST), qwen3:14b (slow), deepseek-r1:14b
-    LLM_MODEL_ID: str = "qwen3:8b"
+    # LLM provider: lmstudio (OpenAI-compatible API) or ollama.
+    LLM_PROVIDER: str = "lmstudio"
 
-    # Fast LLM for coaching hints (defaults to same as main model for stability)
-    FAST_LLM_MODEL_ID: str = "qwen3:8b"
+    # Base URL for selected provider.
+    # LM Studio default endpoint includes /v1.
+    LLM_BASE_URL: str = "http://127.0.0.1:1234/v1"
+
+    # API key used by OpenAI-compatible clients (LM Studio accepts any non-empty value).
+    LLM_API_KEY: str = "lm-studio"
+
+    # Default model for agentic flows in BeePrepared.
+    # For LM Studio this must match a loaded model id, but factory includes auto-fallback.
+    LLM_MODEL_ID: str = "mlx-community/qwen3.5-35b-a3b"
+
+    # Fast model for short coaching calls. Set equal to main model for consistency.
+    FAST_LLM_MODEL_ID: str = "mlx-community/qwen3.5-35b-a3b"
+
+    # Reuse one shared model client instance for all flows (analysis/interview/coaching)
+    # to avoid loading/seating multiple model sessions on constrained memory machines.
+    LLM_SINGLE_INSTANCE: bool = True
+    # Max concurrent LLM requests in-process. Set to 1 to avoid multi-slot contention.
+    LLM_MAX_CONCURRENCY: int = 1
+
+    # LM Studio / OpenAI-compatible generation guards.
+    # Disables model "thinking" traces for Qwen chat templates when supported.
+    LLM_DISABLE_THINKING: bool = True
+    # Cap completion tokens to avoid very long reasoning dumps.
+    LLM_MAX_TOKENS: int = 8192
+    # Tighter cap for JSON-extraction style calls (resume/JD/skill extraction).
+    # Increased to 2500 to allow room for "Thinking Process" traces from reasoning models.
+    LLM_JSON_MAX_TOKENS: int = 6000
 
     # Streaming STT (partial transcripts)
     PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
@@ -46,7 +71,10 @@ class Settings(BaseSettings):
     # Audio chunk timing for low-latency partials and end-of-utterance finalization
     STT_PARTIAL_CHUNK_MS: int = 700
     STT_PARTIAL_COOLDOWN_MS: int = 450
-    STT_FINALIZE_SILENCE_MS: int = 700
+    # Silence duration before finalizing an utterance.  700ms is too aggressive
+    # for natural speech with pauses; 1800ms avoids mid-sentence finalizations
+    # while still feeling responsive.
+    STT_FINALIZE_SILENCE_MS: int = 1800
     
     # CORS configuration
     # Set CORS_ORIGINS env var to restrict in production (comma-separated)
