@@ -17,7 +17,9 @@ python-multipart = "^0.0.12"
 langgraph = "^0.2.0"
 langchain-core = "^0.3.0"
 langchain-ollama = "^0.2.0"
+langchain-openai = "^0.3.0"
 pydantic = "^2.9.0"
+httpx = "^0.28.0"
 # AI/ML (Apple Silicon Optimized)
 mlx-lm = "^0.20.0"
 mlx-whisper = "^0.4.0"
@@ -36,7 +38,6 @@ pydantic-settings = "^2.6.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
-httpx = "^0.28.0"
 
 [build-system]
 requires = ["poetry-core"]

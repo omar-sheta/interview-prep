@@ -167,6 +167,7 @@ class UserDatabase:
                 question_count_override INTEGER,
                 interviewer_persona TEXT DEFAULT 'friendly',
                 piper_style TEXT DEFAULT 'interviewer',
+                tts_provider TEXT DEFAULT 'piper',
                 evaluation_thresholds TEXT,  -- JSON object for strictness tuning
                 recording_thresholds TEXT,  -- JSON object for recording/silence tuning
                 focus_areas TEXT,  -- JSON array
@@ -192,6 +193,9 @@ class UserDatabase:
         if "piper_style" not in pref_columns:
             print("📦 Migrating database: Adding piper_style to user_preferences")
             cursor.execute("ALTER TABLE user_preferences ADD COLUMN piper_style TEXT DEFAULT 'interviewer'")
+        if "tts_provider" not in pref_columns:
+            print("📦 Migrating database: Adding tts_provider to user_preferences")
+            cursor.execute("ALTER TABLE user_preferences ADD COLUMN tts_provider TEXT DEFAULT 'piper'")
         if "evaluation_thresholds" not in pref_columns:
             print("📦 Migrating database: Adding evaluation_thresholds to user_preferences")
             cursor.execute("ALTER TABLE user_preferences ADD COLUMN evaluation_thresholds TEXT")
@@ -818,11 +822,26 @@ class UserDatabase:
         conn = self._get_connection()
         cursor = conn.cursor()
         
-        # Calculate answered/skipped from total and performance breakdown
-        total_q = summary.get("total_questions", 0)
-        performance = summary.get("performance_breakdown", {})
-        answered = performance.get("excellent", 0) + performance.get("good", 0) + performance.get("needs_work", 0)
-        skipped = total_q - answered if total_q > answered else 0
+        # Prefer explicit counts from summary (skip-aware); fallback to score buckets.
+        total_q = max(0, int(summary.get("total_questions", 0) or 0))
+        answered_raw = summary.get("answered_questions")
+        skipped_raw = summary.get("skipped_questions")
+
+        if answered_raw is None and skipped_raw is None:
+            performance = summary.get("performance_breakdown", {}) or {}
+            answered = int(performance.get("excellent", 0) or 0) + int(performance.get("good", 0) or 0) + int(performance.get("needs_work", 0) or 0)
+            skipped = max(0, total_q - answered)
+        else:
+            answered = max(0, int(answered_raw or 0))
+            skipped = max(0, int(skipped_raw or 0)) if skipped_raw is not None else max(0, total_q - answered)
+
+            # Normalize inconsistent totals defensively.
+            if answered > total_q:
+                answered = total_q
+            if answered + skipped > total_q:
+                skipped = max(0, total_q - answered)
+            elif answered + skipped < total_q:
+                skipped = max(0, total_q - answered)
 
         cursor.execute("""
             UPDATE interview_sessions
@@ -1131,6 +1150,7 @@ class UserDatabase:
                 - question_count_override: Optional per-session question count override
                 - interviewer_persona: Interviewer behavior style
                 - piper_style: Question/response voice style preset (interviewer|balanced|fast)
+                - tts_provider: Question voice engine (piper|qwen3_tts_mlx)
                 - focus_areas: List of focus topics
                 - onboarding_complete: bool
                 - mic_permission_granted: bool
@@ -1148,17 +1168,20 @@ class UserDatabase:
             except Exception:
                 question_count_override = None
         interviewer_persona = str(preferences.get("interviewer_persona") or "friendly").strip().lower()
-        if interviewer_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        if interviewer_persona not in {"friendly", "strict"}:
             interviewer_persona = "friendly"
         piper_style = str(preferences.get("piper_style") or "interviewer").strip().lower()
         if piper_style not in {"interviewer", "balanced", "fast"}:
             piper_style = "interviewer"
+        tts_provider = str(preferences.get("tts_provider") or "piper").strip().lower()
+        if tts_provider not in {"piper", "qwen3_tts_mlx"}:
+            tts_provider = "piper"
         
         cursor.execute("""
             INSERT OR REPLACE INTO user_preferences 
-            (user_id, resume_text, resume_filename, target_role, target_company, job_description, question_count_override, interviewer_persona, piper_style, evaluation_thresholds, recording_thresholds,
+            (user_id, resume_text, resume_filename, target_role, target_company, job_description, question_count_override, interviewer_persona, piper_style, tts_provider, evaluation_thresholds, recording_thresholds,
              focus_areas, onboarding_complete, mic_permission_granted, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
             user_id,
             preferences.get("resume_text"),
@@ -1169,6 +1192,7 @@ class UserDatabase:
             question_count_override,
             interviewer_persona,
             piper_style,
+            tts_provider,
             json.dumps(preferences.get("evaluation_thresholds")) if isinstance(preferences.get("evaluation_thresholds"), dict) else None,
             json.dumps(preferences.get("recording_thresholds")) if isinstance(preferences.get("recording_thresholds"), dict) else None,
             focus_areas_json,
@@ -1187,7 +1211,7 @@ class UserDatabase:
         
         cursor.execute("""
             SELECT resume_text, resume_filename, target_role, target_company, job_description, question_count_override, interviewer_persona,
-                   piper_style, evaluation_thresholds, recording_thresholds,
+                   piper_style, tts_provider, evaluation_thresholds, recording_thresholds,
                    focus_areas, onboarding_complete, mic_permission_granted, updated_at
             FROM user_preferences
             WHERE user_id = ?
@@ -1200,11 +1224,11 @@ class UserDatabase:
             thresholds = {}
             recording_thresholds = {}
             try:
-                thresholds = json.loads(row[8]) if row[8] else {}
+                thresholds = json.loads(row[9]) if row[9] else {}
             except Exception:
                 thresholds = {}
             try:
-                recording_thresholds = json.loads(row[9]) if row[9] else {}
+                recording_thresholds = json.loads(row[10]) if row[10] else {}
             except Exception:
                 recording_thresholds = {}
             return {
@@ -1216,12 +1240,13 @@ class UserDatabase:
                 "question_count_override": int(row[5]) if row[5] is not None else None,
                 "interviewer_persona": str(row[6] or "friendly").strip().lower() or "friendly",
                 "piper_style": str(row[7] or "interviewer").strip().lower() or "interviewer",
+                "tts_provider": str(row[8] or "piper").strip().lower() or "piper",
                 "evaluation_thresholds": thresholds if isinstance(thresholds, dict) else {},
                 "recording_thresholds": recording_thresholds if isinstance(recording_thresholds, dict) else {},
-                "focus_areas": json.loads(row[10]) if row[10] else [],
-                "onboarding_complete": bool(row[11]),
-                "mic_permission_granted": bool(row[12]),
-                "updated_at": row[13]
+                "focus_areas": json.loads(row[11]) if row[11] else [],
+                "onboarding_complete": bool(row[12]),
+                "mic_permission_granted": bool(row[13]),
+                "updated_at": row[14]
             }
         return None
 
@@ -1294,6 +1319,7 @@ class UserDatabase:
                 question_count_override = NULL,
                 interviewer_persona = 'friendly',
                 piper_style = 'interviewer',
+                tts_provider = 'piper',
                 focus_areas = '[]',
                 updated_at = CURRENT_TIMESTAMP
             WHERE user_id = ?
@@ -1644,14 +1670,14 @@ class UserDatabase:
         conn = self._get_connection()
         cursor = conn.cursor()
         persona = str(interviewer_persona or "friendly").strip().lower()
-        if persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        if persona not in {"friendly", "strict"}:
             persona = "friendly"
-        
+
         try:
             # Get latest analysis
             cursor.execute("""
-                SELECT analysis_data 
-                FROM career_analyses 
+                SELECT analysis_data
+                FROM career_analyses
                 WHERE user_id = ? 
                 ORDER BY created_at DESC LIMIT 1
             """, (user_id,))
@@ -1700,7 +1726,7 @@ class UserDatabase:
             return
 
         persona = str(interviewer_persona or "friendly").strip().lower()
-        if persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        if persona not in {"friendly", "strict"}:
             persona = "friendly"
 
         conn = self._get_connection()

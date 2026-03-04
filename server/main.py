@@ -23,6 +23,7 @@ import socketio
 import tempfile
 import os
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.graph import END, START, StateGraph
 
@@ -47,6 +48,7 @@ TTS_STARTUP_WARMUP_TEXT = os.getenv(
 ).strip()
 TTS_WARMUP_AWAIT_ON_FIRST_TTS = os.getenv("TTS_WARMUP_AWAIT_ON_FIRST_TTS", "1").lower() in {"1", "true", "yes", "on"}
 TTS_WARMUP_WAIT_SEC = float(os.getenv("TTS_WARMUP_WAIT_SEC", "180"))
+DISCONNECT_TASK_CANCEL_GRACE_SEC = float(os.getenv("DISCONNECT_TASK_CANCEL_GRACE_SEC", "90"))
 
 _tts_warmup_task: Optional[asyncio.Task] = None
 
@@ -100,7 +102,7 @@ class SessionState:
     """Per-session state for audio streaming and conversation."""
     
     # Buffer constants
-    MAX_BUFFER_SIZE = 960000  # 30 seconds at 16kHz mono 16-bit
+    MAX_BUFFER_SIZE = 4_800_000  # ~150 seconds at 16kHz mono 16-bit
     NEW_AUDIO_THRESHOLD = int(32000 * (settings.STT_PARTIAL_CHUNK_MS / 1000.0))
     TRANSCRIBE_COOLDOWN = max(0.1, settings.STT_PARTIAL_COOLDOWN_MS / 1000.0)
     FINALIZE_SILENCE_SECONDS = max(0.3, settings.STT_FINALIZE_SILENCE_MS / 1000.0)
@@ -137,6 +139,7 @@ class SessionState:
         self.live_scoring_enabled: bool = False
         self.interviewer_persona: str = "friendly"
         self.tts_style: str = "interviewer"
+        self.tts_provider: str = "piper"
         self.coaching_enabled: bool = False
         self.answer_start_time: float = None
         self.current_answer_transcript: str = ""
@@ -204,6 +207,8 @@ user_connection_count: dict[str, int] = defaultdict(int)
 
 # Maps User ID -> Active asyncio Task (for cancellation on disconnect or restart)
 active_tasks: dict[str, asyncio.Task] = {}
+# Maps User ID -> delayed cancellation task (disconnect grace window)
+pending_disconnect_cancels: dict[str, asyncio.Task] = {}
 
 # Feedback loop metrics (v2 rollout visibility)
 feedback_metrics = {
@@ -300,12 +305,44 @@ def _normalize_latest_analysis_payload(user_id: str, saved_analysis: Optional[di
 
 
 def _cancel_user_task_if_idle(user_id: str):
-    """Cancel active long-running task when user has no active connections."""
-    if user_connection_count.get(user_id, 0) == 0:
+    """Cancel or schedule cancellation for active long-running task when user is idle."""
+    if user_connection_count.get(user_id, 0) != 0:
+        return
+
+    # Clear any existing scheduled cancel for this user before creating a new one.
+    existing = pending_disconnect_cancels.pop(user_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+
+    if DISCONNECT_TASK_CANCEL_GRACE_SEC <= 0:
         task = active_tasks.pop(user_id, None)
         if task and not task.done():
             task.cancel()
             print(f"🛑 No active connections: cancelled task for {user_id}")
+        return
+
+    async def _cancel_after_grace():
+        try:
+            await asyncio.sleep(DISCONNECT_TASK_CANCEL_GRACE_SEC)
+            if user_connection_count.get(user_id, 0) != 0:
+                return
+            task = active_tasks.pop(user_id, None)
+            if task and not task.done():
+                task.cancel()
+                print(
+                    f"🛑 No reconnect within {DISCONNECT_TASK_CANCEL_GRACE_SEC:.0f}s: "
+                    f"cancelled task for {user_id}"
+                )
+        except asyncio.CancelledError:
+            return
+        finally:
+            pending_disconnect_cancels.pop(user_id, None)
+
+    pending_disconnect_cancels[user_id] = asyncio.create_task(_cancel_after_grace())
+    print(
+        f"⏳ No active connections for {user_id}; waiting "
+        f"{DISCONNECT_TASK_CANCEL_GRACE_SEC:.0f}s before cancelling task"
+    )
 
 
 async def _bind_sid_identity(
@@ -337,6 +374,10 @@ async def _bind_sid_identity(
     await sio.enter_room(sid, str(new_user_id))
     sid_to_user[sid] = new_user_id
     user_connection_count[new_user_id] += 1
+    # User reconnected / switched identity; cancel any pending idle-task cancellation.
+    pending = pending_disconnect_cancels.pop(new_user_id, None)
+    if pending and not pending.done():
+        pending.cancel()
 
     session.user_id = new_user_id
     session.is_authenticated = is_authenticated
@@ -605,9 +646,22 @@ async def _finalize_current_utterance(session: SessionState, reason: str = "sile
 
         session.current_partial_transcript = ""
         session.current_answer_transcript = session.finalized_answer_transcript
-        session.last_finalized_position = end_pos
-        session.current_utterance_start_position = end_pos
-        session.last_transcribed_position = end_pos
+
+        # Reclaim finalized audio from the buffer to prevent unbounded growth.
+        # Keep a small tail (~0.5s) so the next utterance has context for the
+        # noise-gate to avoid a hard cut at the boundary.
+        keep_tail = 16000  # ~0.5s at 16kHz mono 16-bit
+        discard = max(0, end_pos - keep_tail)
+        if discard > 0:
+            del session.audio_buffer[:discard]
+            session.last_finalized_position = max(0, end_pos - discard)
+            session.current_utterance_start_position = max(0, end_pos - discard)
+            session.last_transcribed_position = max(0, end_pos - discard)
+        else:
+            session.last_finalized_position = end_pos
+            session.current_utterance_start_position = end_pos
+            session.last_transcribed_position = end_pos
+
         session.last_transcribe_time = time.time()
         session.was_speaking = False
         session.silence_start_time = None
@@ -648,7 +702,10 @@ async def lifespan(app: FastAPI):
     # Startup
     print("🚀 Starting Interview Agent Server...")
     print(f"📁 Model path: {settings.MODEL_PATH}")
+    print(f"🧠 LLM Provider: {getattr(settings, 'LLM_PROVIDER', 'ollama')}")
     print(f"🤖 LLM Model: {settings.LLM_MODEL_ID}")
+    print(f"🧩 LLM Single Instance: {getattr(settings, 'LLM_SINGLE_INSTANCE', True)}")
+    print(f"🌐 LLM Base URL: {settings.LLM_BASE_URL}")
     print(f"💾 Qdrant path: {settings.QDRANT_PATH}")
     
     # Initialize vector database
@@ -712,7 +769,10 @@ fast_app.add_middleware(
 
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins=settings.CORS_ORIGINS
+    cors_allowed_origins=settings.CORS_ORIGINS,
+    ping_timeout=60,
+    ping_interval=25,
+    max_http_buffer_size=10_000_000,  # 10 MB — allow large audio payloads
 )
 
 # Wrap FastAPI with Socket.IO ASGI application
@@ -803,6 +863,318 @@ async def get_session_details_api(
         raise HTTPException(status_code=403, detail="Forbidden")
     
     return session_details
+
+
+@fast_app.get("/api/session/{session_id}/export")
+async def export_session_pdf(
+    session_id: str,
+    auth_user_id: str = Depends(_get_authenticated_rest_user_id),
+):
+    """Export interview session as a downloadable PDF report using ReportLab."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        HRFlowable, KeepTogether,
+    )
+    from reportlab.lib.colors import HexColor
+
+    user_db = get_user_db()
+    details = user_db.get_session_details(session_id)
+    if not details:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if details.get("user_id") != auth_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    summary = details.get("summary") or {}
+    answers = details.get("answers") or []
+    job_title = details.get("job_title") or "Interview"
+    avg_score = details.get("average_score") or summary.get("average_score", 0)
+    started = (details.get("started_at") or "")[:19]
+    total_q = details.get("total_questions")
+    if total_q is None:
+        total_q = len(answers)
+    answered_q = details.get("answered_questions")
+    if answered_q is None:
+        answered_q = len(answers)
+
+    dim_labels = {
+        "relevance": "Relevance", "depth": "Depth", "structure": "Structure",
+        "specificity": "Specificity", "communication": "Communication",
+        "clarity": "Clarity", "accuracy": "Accuracy", "completeness": "Completeness",
+    }
+
+    # ── Colours ──
+    BRAND   = HexColor("#6366F1")
+    BRAND_L = HexColor("#EEF2FF")
+    DARK    = HexColor("#1E293B")
+    MUTED   = HexColor("#64748B")
+    SUCCESS = HexColor("#22C55E")
+    WARN    = HexColor("#EAB308")
+    DANGER  = HexColor("#EF4444")
+    BORDER  = HexColor("#E2E8F0")
+    LIGHT   = HexColor("#F8FAFC")
+
+    def _score_color(s):
+        try:
+            v = float(s)
+        except (TypeError, ValueError):
+            return MUTED
+        if v >= 7: return SUCCESS
+        if v >= 5: return WARN
+        return DANGER
+
+    def _esc(text):
+        """Escape XML special chars for Paragraph markup."""
+        if not text:
+            return ""
+        return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # ── Styles ──
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle("Title2", parent=styles["Title"], fontSize=20,
+                              textColor=DARK, spaceAfter=4, leading=24))
+    styles.add(ParagraphStyle("Subtitle", parent=styles["Normal"], fontSize=12,
+                              textColor=BRAND, spaceAfter=12))
+    styles.add(ParagraphStyle("SectionHead", parent=styles["Heading2"], fontSize=13,
+                              textColor=DARK, spaceBefore=14, spaceAfter=6,
+                              borderWidth=0))
+    styles.add(ParagraphStyle("SubHead", parent=styles["Heading3"], fontSize=10,
+                              textColor=DARK, spaceBefore=8, spaceAfter=4))
+    styles.add(ParagraphStyle("Body", parent=styles["Normal"], fontSize=9,
+                              textColor=DARK, leading=13, spaceAfter=4))
+    styles.add(ParagraphStyle("BodyItalic", parent=styles["Body"], fontName="Helvetica-Oblique"))
+    styles.add(ParagraphStyle("Meta", parent=styles["Normal"], fontSize=9,
+                              textColor=MUTED, leading=12))
+    # Override the built-in 'Bullet' style (already exists in getSampleStyleSheet)
+    _bullet = styles["Bullet"]
+    _bullet.parent = styles["Body"]
+    _bullet.leftIndent = 14
+    _bullet.bulletIndent = 4
+    _bullet.spaceBefore = 1
+    _bullet.spaceAfter = 1
+    styles.add(ParagraphStyle("Footer", parent=styles["Normal"], fontSize=8,
+                              textColor=MUTED, alignment=TA_CENTER, spaceBefore=20))
+    styles.add(ParagraphStyle("QHeader", parent=styles["Normal"], fontSize=10,
+                              fontName="Helvetica-Bold", textColor=DARK, leading=13))
+    styles.add(ParagraphStyle("SmallMuted", parent=styles["Normal"], fontSize=8,
+                              textColor=MUTED, leading=11))
+
+    story = []
+
+    # ── Title ──
+    story.append(Paragraph("Interview Report", styles["Title2"]))
+    story.append(Paragraph(_esc(job_title), styles["Subtitle"]))
+
+    # ── Meta ──
+    meta_lines = [
+        f"<b>Date:</b> {_esc(started or 'N/A')}",
+        f"<b>Questions:</b> {answered_q}/{total_q} answered",
+        f"<b>Average Score:</b> {avg_score}/10",
+    ]
+    story.append(Paragraph("<br/>".join(meta_lines), styles["Meta"]))
+    story.append(Spacer(1, 8))
+
+    # ── Dimension Scores ──
+    breakdown = summary.get("overall_breakdown") or summary.get("score_breakdown") or {}
+    if breakdown:
+        story.append(Paragraph("Dimension Scores", styles["SectionHead"]))
+        story.append(HRFlowable(width="30%", thickness=2, color=BRAND, spaceAfter=6))
+
+        table_data = [["Dimension", "Score"]]
+        row_colors = []
+        for dim, val in breakdown.items():
+            label = dim_labels.get(dim, dim.title())
+            table_data.append([label, f"{val}/10"])
+            row_colors.append(_score_color(val))
+
+        t = Table(table_data, colWidths=[140, 60])
+        style_cmds = [
+            ("BACKGROUND", (0, 0), (-1, 0), BRAND),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ALIGN", (1, 0), (1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.5, BORDER),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [LIGHT, colors.white]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]
+        for i, c in enumerate(row_colors):
+            style_cmds.append(("TEXTCOLOR", (1, i + 1), (1, i + 1), c))
+            style_cmds.append(("FONTNAME", (1, i + 1), (1, i + 1), "Helvetica-Bold"))
+        t.setStyle(TableStyle(style_cmds))
+        story.append(t)
+        story.append(Spacer(1, 8))
+
+    # ── Speech Analytics ──
+    telemetry = summary.get("telemetry") or {}
+    if telemetry:
+        story.append(Paragraph("Speech Analytics", styles["SectionHead"]))
+        story.append(HRFlowable(width="30%", thickness=2, color=BRAND, spaceAfter=6))
+        sa_lines = [
+            f"<b>Filler Words:</b> {telemetry.get('fillerWords', 0)}  ({telemetry.get('fillersPerMinute', 0)}/min)",
+            f"<b>Hedge Words:</b> {telemetry.get('hedge_words', 0)}",
+            f"<b>Confidence:</b> {_esc(str(telemetry.get('confidence', 'N/A')))}",
+        ]
+        star = telemetry.get("star_analysis") or {}
+        if star:
+            comps = ["Situation", "Task", "Action", "Result"]
+            detected = [c for c in comps if star.get(c.lower())]
+            sa_lines.append(
+                f"<b>STAR Framework:</b> {star.get('score', 0)}/4"
+                f" ({', '.join(detected) if detected else 'None detected'})"
+            )
+        story.append(Paragraph("<br/>".join(sa_lines), styles["Meta"]))
+        story.append(Spacer(1, 8))
+
+    # ── Overall Feedback ──
+    overall_feedback = summary.get("overall_feedback")
+    top_strengths = summary.get("top_strengths") or []
+    improvements = summary.get("areas_to_improve") or []
+    actions = summary.get("action_items") or []
+    comm = summary.get("communication_feedback")
+
+    if overall_feedback or top_strengths or improvements:
+        story.append(Paragraph("Overall Feedback", styles["SectionHead"]))
+        story.append(HRFlowable(width="30%", thickness=2, color=BRAND, spaceAfter=6))
+        if overall_feedback:
+            story.append(Paragraph(_esc(overall_feedback), styles["Body"]))
+        if top_strengths:
+            story.append(Paragraph("Strengths", styles["SubHead"]))
+            for s in top_strengths:
+                story.append(Paragraph(_esc(s), styles["Bullet"], bulletText="\u2022"))
+        if improvements:
+            story.append(Paragraph("Areas to Improve", styles["SubHead"]))
+            for a in improvements:
+                story.append(Paragraph(_esc(a), styles["Bullet"], bulletText="\u2022"))
+        if actions:
+            story.append(Paragraph("Action Items", styles["SubHead"]))
+            for a in actions:
+                story.append(Paragraph(_esc(a), styles["Bullet"], bulletText="\u2022"))
+        if comm:
+            story.append(Paragraph("Communication Feedback", styles["SubHead"]))
+            story.append(Paragraph(_esc(comm), styles["Body"]))
+        story.append(Spacer(1, 6))
+
+    # ── Per-Question Breakdown ──
+    if answers:
+        story.append(Paragraph("Per-Question Breakdown", styles["SectionHead"]))
+        story.append(HRFlowable(width="30%", thickness=2, color=BRAND, spaceAfter=8))
+
+        for ans in answers:
+            q_num = ans.get("question_number", "?")
+            q_text = ans.get("question_text", "Question")
+            evaluation = ans.get("evaluation") or {}
+            score = evaluation.get("score", 0)
+            skipped = ans.get("skipped", False)
+            sc = _score_color(score)
+
+            q_elements = []
+
+            # Question header with score
+            skip_tag = " <i>(Skipped)</i>" if skipped else ""
+            score_html = f'<font color="{sc.hexval()}">{score}/10</font>'
+            q_elements.append(Paragraph(
+                f"Q{q_num}: {_esc(q_text)}  —  {score_html}{skip_tag}",
+                styles["QHeader"],
+            ))
+
+            # Category + dimension breakdown
+            cat = ans.get("category", "General")
+            sb = evaluation.get("score_breakdown") or {}
+            meta_parts = [f"Category: {_esc(cat)}"]
+            if sb:
+                dims_str = " | ".join(
+                    f"{dim_labels.get(d, d.title())}: {v}" for d, v in sb.items()
+                )
+                meta_parts.append(dims_str)
+            q_elements.append(Paragraph(" &nbsp;&nbsp; ".join(meta_parts), styles["SmallMuted"]))
+            q_elements.append(Spacer(1, 4))
+
+            # User answer
+            user_answer = ans.get("user_answer") or ""
+            if user_answer and user_answer != "(Skipped)":
+                snippet = user_answer[:600] + ("..." if len(user_answer) > 600 else "")
+                q_elements.append(Paragraph("Your Answer", styles["SubHead"]))
+                q_elements.append(Paragraph(
+                    f"<i>{_esc(snippet)}</i>", styles["Body"]
+                ))
+
+            # Assessment
+            reasoning = evaluation.get("evaluation_reasoning") or evaluation.get("feedback") or ""
+            if reasoning:
+                q_elements.append(Paragraph("Assessment", styles["SubHead"]))
+                q_elements.append(Paragraph(_esc(reasoning), styles["Body"]))
+
+            # Strengths & gaps
+            q_strengths = evaluation.get("strengths") or []
+            gaps = (evaluation.get("gaps") or evaluation.get("rubric_misses")
+                    or evaluation.get("missing_concepts") or [])
+            if q_strengths:
+                q_elements.append(Paragraph(
+                    f'<font color="{SUCCESS.hexval()}"><b>Strengths:</b> {_esc(", ".join(q_strengths[:4]))}</font>',
+                    styles["Body"],
+                ))
+            if gaps:
+                q_elements.append(Paragraph(
+                    f'<font color="{DANGER.hexval()}"><b>Gaps:</b> {_esc(", ".join(gaps[:4]))}</font>',
+                    styles["Body"],
+                ))
+
+            # Coaching tip
+            tip = evaluation.get("coaching_tip")
+            if tip:
+                q_elements.append(Paragraph(
+                    f'<font color="{BRAND.hexval()}"><b>Tip:</b></font> {_esc(tip)}',
+                    styles["Body"],
+                ))
+
+            # Model answer
+            model = evaluation.get("model_answer") or evaluation.get("optimized_answer") or ""
+            if model:
+                q_elements.append(Paragraph("Model Answer", styles["SubHead"]))
+                q_elements.append(Paragraph(
+                    _esc(model[:800] + ("..." if len(model) > 800 else "")),
+                    styles["BodyItalic"],
+                ))
+
+            q_elements.append(HRFlowable(width="100%", thickness=0.5, color=BORDER,
+                                         spaceBefore=6, spaceAfter=8))
+
+            # Keep question block together when possible
+            story.append(KeepTogether(q_elements))
+
+    # ── Footer ──
+    story.append(Paragraph("Generated by HiveMind Prep", styles["Footer"]))
+
+    # ── Build PDF to bytes ──
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=20 * mm, rightMargin=20 * mm,
+        topMargin=18 * mm, bottomMargin=18 * mm,
+        title=f"Interview Report - {job_title}",
+        author="HiveMind Prep",
+    )
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+
+    safe_title = "".join(c for c in job_title if c.isalnum() or c in " -_")[:40].strip() or "interview"
+    filename = f"HiveMindPrep_{safe_title}_{started[:10]}.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @fast_app.get("/api/user/{user_id}/career_analyses")
@@ -1163,6 +1535,7 @@ def _normalize_recording_thresholds(overrides):
 
 
 ALLOWED_PIPER_STYLES = {"interviewer", "balanced", "fast"}
+ALLOWED_TTS_PROVIDERS = {"piper", "qwen3_tts_mlx"}
 
 
 def _normalize_piper_style(style_value, fallback: str = "interviewer") -> str:
@@ -1174,6 +1547,27 @@ def _normalize_piper_style(style_value, fallback: str = "interviewer") -> str:
     if normalized_value in ALLOWED_PIPER_STYLES:
         return normalized_value
     return normalized_fallback
+
+
+def _normalize_tts_provider(provider_value, fallback: str = "piper") -> str:
+    """Normalize TTS provider to supported engines."""
+    normalized_fallback = str(fallback or "piper").strip().lower()
+    if normalized_fallback not in ALLOWED_TTS_PROVIDERS:
+        normalized_fallback = "piper"
+    normalized_value = str(provider_value or "").strip().lower()
+    if normalized_value in ALLOWED_TTS_PROVIDERS:
+        return normalized_value
+    return normalized_fallback
+
+
+def _first_present(data: dict, keys: tuple[str, ...], default=None):
+    """Return the first non-None value for the provided keys."""
+    if not isinstance(data, dict):
+        return default
+    for key in keys:
+        if key in data and data.get(key) is not None:
+            return data.get(key)
+    return default
 
 
 def _get_user_feedback_thresholds(user_id: str) -> dict:
@@ -1212,22 +1606,46 @@ async def save_preferences(sid, data):
     incoming_recording_thresholds = data.get("recording_thresholds", existing.get("recording_thresholds", {}))
     normalized_recording_thresholds = _normalize_recording_thresholds(incoming_recording_thresholds)
     incoming_persona = str(data.get("interviewer_persona", existing.get("interviewer_persona", "friendly")) or "friendly").strip().lower()
-    if incoming_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+    if incoming_persona not in {"friendly", "strict"}:
         incoming_persona = str(existing.get("interviewer_persona") or "friendly").strip().lower() or "friendly"
     incoming_piper_style = _normalize_piper_style(
         data.get("piper_style", existing.get("piper_style", "interviewer")),
         fallback=existing.get("piper_style", "interviewer"),
     )
+    incoming_tts_provider = _normalize_tts_provider(
+        data.get("tts_provider", existing.get("tts_provider", "piper")),
+        fallback=existing.get("tts_provider", "piper"),
+    )
+    incoming_target_role = _first_present(
+        data,
+        ("target_role", "job_title", "targetRole", "jobTitle"),
+        existing.get("target_role"),
+    )
+    incoming_target_company = _first_present(
+        data,
+        ("target_company", "company", "targetCompany"),
+        existing.get("target_company"),
+    )
+    incoming_job_description = _first_present(
+        data,
+        ("job_description", "jobDescription"),
+        existing.get("job_description"),
+    )
+    incoming_job_description = str(incoming_job_description or "").strip()
+    # Guard against accidental blank-overwrite from partial preference payloads.
+    if not incoming_job_description and str(existing.get("job_description") or "").strip():
+        incoming_job_description = str(existing.get("job_description") or "")
     
     preferences = {
         "resume_text": data.get("resume_text", existing.get("resume_text")),
         "resume_filename": data.get("resume_filename", existing.get("resume_filename")),
-        "target_role": data.get("target_role", existing.get("target_role")),
-        "target_company": data.get("target_company", existing.get("target_company")),
-        "job_description": data.get("job_description", existing.get("job_description")),
+        "target_role": incoming_target_role,
+        "target_company": incoming_target_company,
+        "job_description": incoming_job_description,
         "question_count_override": question_override,
         "interviewer_persona": incoming_persona,
         "piper_style": incoming_piper_style,
+        "tts_provider": incoming_tts_provider,
         "evaluation_thresholds": normalized_thresholds,
         "recording_thresholds": normalized_recording_thresholds,
         "focus_areas": data.get("focus_areas", existing.get("focus_areas", [])),
@@ -1266,6 +1684,30 @@ async def start_career_analysis(sid, data=None):
 
     user_db = get_user_db()
     existing_prefs = user_db.get_user_preferences(user_id) or {}
+    incoming_resume = _first_present(data, ("resume", "resume_base64", "resumeBase64"), "")
+    incoming_job_title = _first_present(
+        data,
+        ("job_title", "target_role", "jobTitle", "targetRole"),
+        existing_prefs.get("target_role"),
+    )
+    incoming_company = _first_present(
+        data,
+        ("company", "target_company", "targetCompany"),
+        existing_prefs.get("target_company", "Tech Company"),
+    )
+    incoming_job_description = _first_present(
+        data,
+        ("job_description", "jobDescription"),
+        existing_prefs.get("job_description", ""),
+    )
+    incoming_job_description = str(incoming_job_description or "").strip()
+    if not incoming_job_description and str(existing_prefs.get("job_description") or "").strip():
+        incoming_job_description = str(existing_prefs.get("job_description") or "")
+    print(
+        "🧾 Career analysis request context: "
+        f"job_title='{incoming_job_title}', company='{incoming_company}', "
+        f"jd_len={len(incoming_job_description)}"
+    )
     if force_refresh:
         try:
             from server.services.cache import get_question_cache
@@ -1274,7 +1716,7 @@ async def start_career_analysis(sid, data=None):
             print(f"⚠️ Failed to clear cache for force refresh: {e}")
 
     # Check if new resume/role provided in request
-    if data and data.get("resume") and data.get("job_title"):
+    if data and incoming_resume and incoming_job_title:
         print(f"📝 New resume provided, saving preferences first...")
 
         # Extract resume text from base64 PDF
@@ -1282,7 +1724,7 @@ async def start_career_analysis(sid, data=None):
         try:
             from server.tools.resume_tool import extract_text_from_pdf_bytes
             import base64
-            pdf_bytes = base64.b64decode(data["resume"].split(",")[-1])
+            pdf_bytes = base64.b64decode(str(incoming_resume).split(",")[-1])
             resume_text = extract_text_from_pdf_bytes(pdf_bytes)
         except Exception as e:
             print(f"❌ Resume extraction failed: {e}")
@@ -1293,29 +1735,31 @@ async def start_career_analysis(sid, data=None):
         preferences = {
             "resume_text": resume_text,
             "resume_filename": f"resume_{user_id}.pdf",
-            "target_role": data["job_title"],
-            "target_company": data.get("company", "Tech Company"),
-            "job_description": data.get("job_description", ""),
+            "target_role": incoming_job_title,
+            "target_company": incoming_company,
+            "job_description": incoming_job_description,
             "question_count_override": existing_prefs.get("question_count_override"),
             "interviewer_persona": existing_prefs.get("interviewer_persona", "friendly"),
             "piper_style": existing_prefs.get("piper_style", "interviewer"),
+            "tts_provider": existing_prefs.get("tts_provider", "piper"),
             "evaluation_thresholds": existing_prefs.get("evaluation_thresholds", {}),
             "recording_thresholds": existing_prefs.get("recording_thresholds", {}),
             "focus_areas": []
         }
         user_db.save_user_preferences(user_id, preferences)
         print(f"✅ Saved new preferences for {user_id}")
-    elif data and any(k in data for k in ("job_title", "company", "job_description")):
+    elif data and any(k in data for k in ("job_title", "company", "job_description", "target_role", "target_company", "jobDescription", "jobTitle", "targetRole", "targetCompany")):
         # Persist latest targets/JD even when resume is reused from existing prefs.
         preferences = {
             "resume_text": existing_prefs.get("resume_text"),
             "resume_filename": existing_prefs.get("resume_filename"),
-            "target_role": data.get("job_title", existing_prefs.get("target_role")),
-            "target_company": data.get("company", existing_prefs.get("target_company", "Tech Company")),
-            "job_description": data.get("job_description", existing_prefs.get("job_description", "")),
+            "target_role": incoming_job_title,
+            "target_company": incoming_company,
+            "job_description": incoming_job_description,
             "question_count_override": existing_prefs.get("question_count_override"),
             "interviewer_persona": existing_prefs.get("interviewer_persona", "friendly"),
             "piper_style": existing_prefs.get("piper_style", "interviewer"),
+            "tts_provider": existing_prefs.get("tts_provider", "piper"),
             "evaluation_thresholds": existing_prefs.get("evaluation_thresholds", {}),
             "recording_thresholds": existing_prefs.get("recording_thresholds", {}),
             "focus_areas": existing_prefs.get("focus_areas", []),
@@ -1326,6 +1770,11 @@ async def start_career_analysis(sid, data=None):
 
     # Load preferences (either just saved or existing)
     prefs = user_db.get_user_preferences(user_id)
+    print(
+        "📌 Loaded preferences for analysis: "
+        f"target_role='{prefs.get('target_role') if prefs else ''}', "
+        f"jd_len={len(str((prefs or {}).get('job_description') or ''))}"
+    )
 
     if not prefs or not prefs.get("resume_text") or not prefs.get("target_role"):
         print(f"❌ Analysis failed: Missing prefs for {user_id}. Prefs: {prefs}")
@@ -1629,7 +2078,7 @@ async def submit_retry_answer(sid, data=None):
     expected_points = original_eval.get("expected_points_used") or []
     if not isinstance(expected_points, list) or not expected_points:
         expected_points = (
-            (original_eval.get("rubric_hits") or []) + (original_eval.get("rubric_misses") or [])
+            (original_eval.get("strengths") or []) + (original_eval.get("gaps") or original_eval.get("rubric_misses") or [])
         )[:5]
     if not expected_points:
         expected_points = [
@@ -2014,7 +2463,12 @@ async def user_audio_chunk(sid, data):
         # Append to circular buffer
         trimmed = session.append_audio(audio_bytes)
         if trimmed > 0:
-            print(f"📦 Buffer trimmed {trimmed} bytes (circular)")
+            import time as _time
+            _now = _time.time()
+            _last = getattr(session, '_last_trim_log', 0)
+            if _now - _last > 5.0:
+                session._last_trim_log = _now
+                print(f"📦 Buffer trimmed {trimmed} bytes (circular) — buffer full at {session.MAX_BUFFER_SIZE} bytes")
 
     except Exception as e:
         print(f"❌ Error decoding audio chunk: {e}")
@@ -2062,6 +2516,21 @@ async def user_audio_chunk(sid, data):
             session.was_speaking and
             silence_duration >= session.FINALIZE_SILENCE_SECONDS
         )
+
+        # Auto-finalize during long continuous speech to prevent buffer overflow
+        # and keep partial transcriptions accurate.  The partial window is capped
+        # at ~15s, so we finalize every ~15s to ensure the full-accuracy MLX
+        # Whisper pass covers the audio before the partial window moves on.
+        _MAX_UTTERANCE_BYTES = 480_000  # ~15s at 16kHz mono 16-bit
+        unfinalized_bytes = len(session.audio_buffer) - session.last_finalized_position
+        if (
+            session.interview_active
+            and session.was_speaking
+            and unfinalized_bytes > _MAX_UTTERANCE_BYTES
+            and not should_finalize_utterance
+        ):
+            should_finalize_utterance = True
+
         should_process_chat = (not session.interview_active) and is_extended_silence
 
         if not (should_partial_transcribe or should_finalize_utterance or should_process_chat):
@@ -2080,6 +2549,11 @@ async def user_audio_chunk(sid, data):
             if session.interview_active:
                 if should_partial_transcribe:
                     start_pos = max(0, min(session.current_utterance_start_position, len(session.audio_buffer)))
+                    # Cap partial window to ~15s — streaming Whisper degrades on longer clips
+                    # and re-transcribing 2+ minutes per chunk is wasteful.
+                    _MAX_PARTIAL_BYTES = 480_000  # ~15s at 16kHz mono 16-bit
+                    if (len(session.audio_buffer) - start_pos) > _MAX_PARTIAL_BYTES:
+                        start_pos = len(session.audio_buffer) - _MAX_PARTIAL_BYTES
                     audio_to_transcribe = bytes(session.audio_buffer[start_pos:])
                     if len(audio_to_transcribe) >= 6400:  # ~200ms minimum
                         transcript = await streaming_audio_processor.transcribe_buffer_async(audio_to_transcribe)
@@ -2327,6 +2801,7 @@ async def process_text_and_respond(sid: str, session: SessionState, text: str):
             tts_service.speak_wav_base64_async(
                 full_response,
                 style=getattr(session, "tts_style", "interviewer"),
+                provider=getattr(session, "tts_provider", "piper"),
             ),
             timeout=tts_timeout,
         )
@@ -2335,7 +2810,7 @@ async def process_text_and_respond(sid: str, session: SessionState, text: str):
         await sio.emit("tts_audio", {
             "audio": audio_base64,
             "format": "wav",
-            "sample_rate": tts_service.sample_rate,
+            "sample_rate": tts_service.sample_rate_for_provider(getattr(session, "tts_provider", "piper")),
             "user_id": session.user_id
         }, room=str(session.user_id))
     except asyncio.TimeoutError:
@@ -2412,12 +2887,13 @@ async def send_question_tts(session, question_text: str, question_index: Optiona
         await _await_tts_warmup_if_needed()
         tts_service = get_tts_service()
         tts_style = getattr(session, "tts_style", "interviewer")
+        tts_provider = getattr(session, "tts_provider", "piper")
         print(
-            f"🔈 Generating question TTS (q_index={question_index}, chars={len(question_text or '')}, style={tts_style})"
+            f"🔈 Generating question TTS (q_index={question_index}, chars={len(question_text or '')}, provider={tts_provider}, style={tts_style})"
         )
         tts_timeout = _compute_tts_timeout(question_text)
         audio_b64 = await asyncio.wait_for(
-            tts_service.speak_wav_base64_async(question_text, style=tts_style),
+            tts_service.speak_wav_base64_async(question_text, style=tts_style, provider=tts_provider),
             timeout=tts_timeout,
         )
         if not session.interview_active:
@@ -2428,7 +2904,7 @@ async def send_question_tts(session, question_text: str, question_index: Optiona
         await sio.emit("tts_audio", {
             "audio": audio_b64,
             "format": "wav",
-            "sample_rate": tts_service.sample_rate,
+            "sample_rate": tts_service.sample_rate_for_provider(tts_provider),
             "question_index": question_index,
             "user_id": session.user_id
         }, room=str(session.user_id))
@@ -2470,8 +2946,9 @@ async def start_interview(sid, data):
         "skill_gaps": ["Python", "System Design"],
         "readiness_score": 0.65,
         "interview_type": "behavioral|technical|system_design|mixed",
-        "interviewer_persona": "friendly|strict|rapid_fire|skeptical",
+        "interviewer_persona": "friendly|strict",
         "piper_style": "interviewer|balanced|fast",
+        "tts_provider": "piper|qwen3_tts_mlx",
         "question_count": 3,  // optional debug/demo override (1-12)
         "mode": "practice" | "coaching"
     }
@@ -2490,6 +2967,7 @@ async def start_interview(sid, data):
         requested_feedback_timing = "end_only"
     requested_persona = str(data.get("interviewer_persona", "") or "").strip().lower()
     requested_tts_style = str(data.get("piper_style", "") or "").strip().lower()
+    requested_tts_provider = str(data.get("tts_provider", "") or "").strip().lower()
 
     explicit_coaching = data.get("coaching_enabled")
     coaching_enabled = bool(explicit_coaching) if explicit_coaching is not None else requested_mode == "coaching"
@@ -2517,13 +2995,13 @@ async def start_interview(sid, data):
                     requested_question_count = max(1, min(12, int(pref_count)))
             except Exception:
                 requested_question_count = None
-        if requested_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        if requested_persona not in {"friendly", "strict"}:
             try:
                 prefs_for_persona = get_user_db().get_user_preferences(session.user_id) or {}
                 requested_persona = str(prefs_for_persona.get("interviewer_persona") or "friendly").strip().lower()
             except Exception:
                 requested_persona = "friendly"
-        if requested_persona not in {"friendly", "strict", "rapid_fire", "skeptical"}:
+        if requested_persona not in {"friendly", "strict"}:
             requested_persona = "friendly"
         if requested_tts_style not in ALLOWED_PIPER_STYLES:
             try:
@@ -2535,6 +3013,16 @@ async def start_interview(sid, data):
             except Exception:
                 requested_tts_style = "interviewer"
         requested_tts_style = _normalize_piper_style(requested_tts_style, fallback="interviewer")
+        if requested_tts_provider not in ALLOWED_TTS_PROVIDERS:
+            try:
+                prefs_for_tts_provider = get_user_db().get_user_preferences(session.user_id) or {}
+                requested_tts_provider = _normalize_tts_provider(
+                    prefs_for_tts_provider.get("tts_provider"),
+                    fallback="piper",
+                )
+            except Exception:
+                requested_tts_provider = "piper"
+        requested_tts_provider = _normalize_tts_provider(requested_tts_provider, fallback="piper")
         
         # CRITICAL FIX: Generate unique DB ID for every interview attempt
         db_session_id = str(uuid.uuid4())
@@ -2576,11 +3064,17 @@ async def start_interview(sid, data):
                 f"{session.user_id}_{suggestion_id}",               # Short: user_s1
                 f"{session.user_id}_{session_id}",                  # Short with session_id
             ]
+            # Build lookup chain: most specific first, then broader fallbacks.
+            # Pre-gen caches WITHOUT question_suffix, so we must try those too.
             persona_keys = [f"{k}{question_suffix}{persona_suffix}" for k in base_keys]
+            # Persona-only keys (no question count) — matches pre-gen format
+            persona_no_q_keys = [f"{k}{persona_suffix}" for k in base_keys] if question_suffix else []
             legacy_keys = []
             if requested_persona == "friendly":
-                legacy_keys = [f"{k}{question_suffix}" for k in base_keys] if question_suffix else list(base_keys)
-            possible_keys = persona_keys + legacy_keys
+                legacy_keys = [f"{k}{question_suffix}" for k in base_keys] if question_suffix else []
+                # Plain base keys (legacy pre-gen compat)
+                legacy_keys += list(base_keys)
+            possible_keys = persona_keys + persona_no_q_keys + legacy_keys
             
             for key in possible_keys:
                 if key:
@@ -2683,6 +3177,7 @@ async def start_interview(sid, data):
         session.live_scoring_enabled = live_scoring
         session.interviewer_persona = requested_persona
         session.tts_style = requested_tts_style
+        session.tts_provider = requested_tts_provider
         session.coaching_enabled = coaching_enabled
         session.evaluations = []
         session.hints_given = []  # Clear hint history
@@ -2717,6 +3212,7 @@ async def start_interview(sid, data):
             "coaching_enabled": session.coaching_enabled,
             "interviewer_persona": session.interviewer_persona,
             "piper_style": session.tts_style,
+            "tts_provider": session.tts_provider,
             "feedback_timing": session.interview_feedback_timing,
             "live_scoring": session.live_scoring_enabled,
             "user_id": session.user_id
@@ -2771,8 +3267,8 @@ async def start_interview(sid, data):
 async def submit_interview_answer(sid, data):
     """
     Submit answer to current interview question.
-    Triggers evaluation and shows next question.
-    
+    Immediately advances to the next question; evaluation runs in the background.
+
     Expected data:
     {
         "answer": "text answer",
@@ -2787,16 +3283,15 @@ async def submit_interview_answer(sid, data):
     if session.answer_submission_in_flight:
         await sio.emit("status", {"stage": "answer_already_submitting", "user_id": session.user_id}, room=str(session.user_id))
         return
-    
+
     session.answer_submission_in_flight = True
     try:
-        from server.agents.interview_nodes import evaluate_answer_stream
-        
         # Get current question
         current_q = session.interview_questions[session.current_question_index]
+        q_index = session.current_question_index
         await _finalize_current_utterance(session, reason="force")
         user_answer = data.get("answer", "")
-        
+
         # Prefer finalized high-accuracy transcript over partial.
         if not user_answer.strip():
             user_answer = (
@@ -2804,79 +3299,83 @@ async def submit_interview_answer(sid, data):
                 session.current_answer_transcript.strip()
             )
             print(f"📝 Using finalized transcript ({len(user_answer)} chars)")
-        
+
         if not user_answer.strip():
             await sio.emit("interview_error", {"error": "No answer detected. Please speak your answer.", "user_id": session.user_id}, room=str(session.user_id))
             return
-        
-        # Evaluation callback for streaming
-        async def eval_callback(msg_type, content):
-            if msg_type == "token":
-                await sio.emit("evaluation_token", {"token": content, "user_id": session.user_id}, room=str(session.user_id))
-            elif msg_type == "status":
-                await sio.emit("status", {"stage": content, "user_id": session.user_id}, room=str(session.user_id))
-        
-        await sio.emit("status", {"stage": "evaluating", "user_id": session.user_id}, room=str(session.user_id))
-        user_thresholds = _get_user_feedback_thresholds(session.user_id)
-        
-        # Evaluate answer
-        evaluation = await evaluate_answer_stream(
-            current_q,
-            user_answer,
-            eval_callback,
-            thresholds=user_thresholds,
-        )
-        _record_evaluation_metrics(evaluation)
-        
-        # Store evaluation
-        session.evaluations.append({
+
+        duration = data.get("duration_seconds", 0)
+
+        # Placeholder for the evaluation — filled asynchronously by the
+        # background task.  We append immediately so the index stays stable.
+        eval_entry = {
             "question": current_q,
             "answer": user_answer,
-            "evaluation": evaluation,
-            "duration": data.get("duration_seconds", 0)
-        })
-        
-        # Save answer to database using the proper DB session ID (not socket ID)
-        user_db = get_user_db()
-        db_sid = getattr(session, 'db_session_id', None)
-        if db_sid:
-            user_db.save_answer(
-                session_id=db_sid,
-                question_number=session.current_question_index + 1,
-                question_text=current_q.get("text", ""),
-                question_category=current_q.get("category", "Technical"),
-                question_difficulty=current_q.get("difficulty", "intermediate"),
-                user_answer=user_answer,
-                evaluation=evaluation,
-                duration_seconds=data.get("duration_seconds", 0),
-                skipped=False
-            )
-        else:
-            print(f"⚠️ No db_session_id found for session {sid}, answer not saved to DB")
-        
-        # Live per-question scoring is optional. Default flow grades silently and shows report at session end.
-        if session.live_scoring_enabled:
-            await sio.emit("answer_evaluated", {
-                "question_number": session.current_question_index + 1,
-                "evaluation": evaluation,
-                "user_id": session.user_id
-            }, room=str(session.user_id))
+            "evaluation": None,  # will be filled by background task
+            "duration": duration,
+        }
+        session.evaluations.append(eval_entry)
 
-        # If user pressed End Session while this answer was being evaluated,
-        # finish immediately after persisting this attempt.
+        # ---- Launch background evaluation ----
+        # This runs the LLM evaluation concurrently while the user answers
+        # the next question, so there's no blocking pause between questions.
+        if not hasattr(session, '_pending_eval_tasks'):
+            session._pending_eval_tasks = []
+
+        async def _bg_evaluate(entry, q_idx):
+            from server.agents.interview_nodes import evaluate_answer_stream
+            try:
+                user_thresholds = _get_user_feedback_thresholds(session.user_id)
+
+                # Evaluation callback (silent — no streaming tokens to client
+                # since the user has already moved on to the next question).
+                async def eval_callback(msg_type, content):
+                    pass
+
+                evaluation = await evaluate_answer_stream(
+                    entry["question"],
+                    entry["answer"],
+                    eval_callback,
+                    thresholds=user_thresholds,
+                )
+                _record_evaluation_metrics(evaluation)
+                entry["evaluation"] = evaluation
+                print(f"📝 Evaluation: Score {evaluation.get('score', '?')}/10 (Q{q_idx + 1}, background)")
+
+                # Persist to database
+                db_sid = getattr(session, 'db_session_id', None)
+                if db_sid:
+                    user_db = get_user_db()
+                    user_db.save_answer(
+                        session_id=db_sid,
+                        question_number=q_idx + 1,
+                        question_text=entry["question"].get("text", ""),
+                        question_category=entry["question"].get("category", "Technical"),
+                        question_difficulty=entry["question"].get("difficulty", "intermediate"),
+                        user_answer=entry["answer"],
+                        evaluation=evaluation,
+                        duration_seconds=entry["duration"],
+                        skipped=False,
+                    )
+            except Exception as e:
+                print(f"⚠️ Background evaluation failed (Q{q_idx + 1}): {e}")
+                entry["evaluation"] = {"score": 0, "feedback": "Evaluation failed.", "error": True}
+
+        task = asyncio.create_task(_bg_evaluate(eval_entry, q_index))
+        session._pending_eval_tasks.append(task)
+
+        # ---- Immediately advance to next question ----
         if session.end_requested:
             await finish_interview(sid, session)
             return
-        
-        # Move to next question or finish
+
         session.current_question_index += 1
-        
+
         if session.current_question_index < len(session.interview_questions):
-            # Next question - clear buffer state properly
             next_q = session.interview_questions[session.current_question_index]
-            session.clear_for_new_question()  # Use proper method
+            session.clear_for_new_question()
             session.answer_start_time = time.time()
-            
+
             await sio.emit("interview_question", {
                 "question": next_q,
                 "question_number": session.current_question_index + 1,
@@ -2884,7 +3383,6 @@ async def submit_interview_answer(sid, data):
                 "user_id": session.user_id
             }, room=str(session.user_id))
 
-            # TTS: Read next question aloud (cancel stale previous task first)
             _cancel_question_tts(session)
             session.question_tts_task = asyncio.create_task(
                 send_question_tts(
@@ -2894,11 +3392,10 @@ async def submit_interview_answer(sid, data):
                 )
             )
         else:
-            # Interview complete
             await finish_interview(sid, session)
 
     except Exception as e:
-        print(f"❌ Error evaluating answer: {e}")
+        print(f"❌ Error submitting answer: {e}")
         import traceback
         traceback.print_exc()
         await sio.emit("interview_error", {"error": str(e), "user_id": session.user_id}, room=str(session.user_id))
@@ -2909,29 +3406,53 @@ async def submit_interview_answer(sid, data):
 async def finish_interview(sid: str, session: SessionState):
     """Complete interview and generate summary report."""
     from server.agents.interview_nodes import generate_interview_summary
-    
+
     session.accept_audio_chunks = False
     session.end_requested = False
     _cancel_question_tts(session)
+
+    # Tell the frontend to show a "generating report" loading screen.
+    await sio.emit("generating_report", {"user_id": session.user_id}, room=str(session.user_id))
+
+    # Wait for all background evaluations to complete before generating summary.
+    pending_tasks = getattr(session, '_pending_eval_tasks', [])
+    if pending_tasks:
+        n_pending = sum(1 for t in pending_tasks if not t.done())
+        if n_pending:
+            print(f"⏳ Waiting for {n_pending} pending evaluation(s)…")
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        session._pending_eval_tasks = []
+
+    # Fill in any evaluations that failed / are still None with a safe fallback.
+    for entry in session.evaluations:
+        if entry.get("evaluation") is None:
+            entry["evaluation"] = {"score": 0, "feedback": "Evaluation unavailable.", "error": True}
 
     try:
         summary = await generate_interview_summary(session.evaluations)
     except Exception as e:
         print(f"⚠️ Summary generation failed in finish_interview: {e}")
+        total_questions = len(session.evaluations)
+        skipped_questions = sum(1 for entry in session.evaluations if entry.get("skipped"))
+        answered_questions = max(0, total_questions - skipped_questions)
         summary = {
-            "total_questions": len(session.evaluations),
+            "total_questions": total_questions,
+            "answered_questions": answered_questions,
+            "skipped_questions": skipped_questions,
             "average_score": 0,
             "overall_breakdown": {
-                "clarity": 0.0,
-                "accuracy": 0.0,
-                "completeness": 0.0,
+                "relevance": 0.0,
+                "depth": 0.0,
                 "structure": 0.0,
+                "specificity": 0.0,
+                "communication": 0.0,
             },
             "score_breakdown": {
-                "clarity": 0.0,
-                "accuracy": 0.0,
-                "completeness": 0.0,
+                "relevance": 0.0,
+                "depth": 0.0,
                 "structure": 0.0,
+                "specificity": 0.0,
+                "communication": 0.0,
             },
             "top_strengths": [],
             "strengths": [],
@@ -2939,10 +3460,11 @@ async def finish_interview(sid: str, session: SessionState):
             "overall_feedback": "Interview ended. Summary generation failed; please retry report generation.",
             "action_items": [],
             "communication_feedback": "",
-            "performance_breakdown": {"excellent": 0, "good": 0, "needs_work": len(session.evaluations)},
+            "performance_breakdown": {"excellent": 0, "good": 0, "needs_work": answered_questions},
+            "evaluation_status": ("partial" if skipped_questions > 0 else "complete"),
             "telemetry": {
-                "pace": 0,
                 "fillerWords": 0,
+                "fillersPerMinute": 0,
                 "confidence": "N/A",
                 "word_count": 0,
                 "filler_detail": {},
@@ -3072,13 +3594,10 @@ async def skip_question(sid, data):
         # Record skip
         current_q = session.interview_questions[session.current_question_index]
         skip_eval = {
-            "evaluation_version": "v2",
             "score": 0,
-            "score_breakdown": {"clarity": 0, "accuracy": 0, "completeness": 0, "structure": 0},
+            "score_breakdown": {"relevance": 0, "depth": 0, "structure": 0, "specificity": 0, "communication": 0},
             "strengths": [],
-            "missing_concepts": ["Question skipped"],
-            "rubric_hits": [],
-            "rubric_misses": ["Question skipped"],
+            "gaps": ["Question skipped"],
             "quality_flags": ["skipped"],
             "confidence": 0.0,
             "evidence_quotes": [],
@@ -3100,8 +3619,8 @@ async def skip_question(sid, data):
                 "target_points": ["Direct answer", "Specific example", "Outcome"],
             },
             "coaching_tip": "Answer this question in full to unlock useful feedback.",
-            "optimized_answer": "",
-            "feedback": "Question was skipped.",
+            "model_answer": "",
+            "evaluation_reasoning": "Question was skipped.",
         }
         session.evaluations.append({
             "question": current_q,
@@ -3142,6 +3661,7 @@ async def skip_question(sid, data):
             }, room=str(session.user_id))
 
             # TTS: Read next question aloud
+            _cancel_question_tts(session)
             session.question_tts_task = asyncio.create_task(
                 send_question_tts(
                     session,
@@ -3191,13 +3711,10 @@ async def end_interview_early(sid, data=None):
                 duration = max(0, time.time() - session.answer_start_time)
 
             partial_eval = {
-                "evaluation_version": "v2",
                 "score": 0,
-                "score_breakdown": {"clarity": 0, "accuracy": 0, "completeness": 0, "structure": 0},
+                "score_breakdown": {"relevance": 0, "depth": 0, "structure": 0, "specificity": 0, "communication": 0},
                 "strengths": [],
-                "missing_concepts": [],
-                "rubric_hits": [],
-                "rubric_misses": ["Answer was incomplete"],
+                "gaps": ["Answer was incomplete"],
                 "quality_flags": ["partial_answer"],
                 "confidence": 0.2,
                 "evidence_quotes": [],
@@ -3219,8 +3736,8 @@ async def end_interview_early(sid, data=None):
                     "target_points": ["Direct answer", "Reasoning", "Outcome"],
                 },
                 "coaching_tip": "Complete your full thought and submit before ending for a stronger evaluation.",
-                "optimized_answer": "",
-                "feedback": "Session ended mid-answer. Partial response saved.",
+                "model_answer": "",
+                "evaluation_reasoning": "Session ended mid-answer. Partial response saved.",
             }
 
             session.evaluations.append({

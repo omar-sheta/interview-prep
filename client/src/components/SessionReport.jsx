@@ -18,12 +18,14 @@ import {
     TextField,
     Alert,
     LinearProgress,
+    Tooltip,
 } from '@mui/material';
 import {
     ExpandMore,
     Replay,
     TipsAndUpdates,
     TrendingUp,
+    PictureAsPdfOutlined,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
@@ -53,11 +55,162 @@ function scoreToneColor(score) {
 }
 
 const SCORE_KEYS = [
-    { key: 'clarity', label: 'Clarity' },
-    { key: 'accuracy', label: 'Accuracy' },
-    { key: 'completeness', label: 'Completeness' },
+    { key: 'relevance', label: 'Relevance' },
+    { key: 'depth', label: 'Depth' },
     { key: 'structure', label: 'Structure' },
+    { key: 'specificity', label: 'Specificity' },
+    { key: 'communication', label: 'Communication' },
 ];
+
+// ---- Radar Chart (SVG) ----
+function RadarChart({ data, size = 200 }) {
+    const pad = 40; // extra space for labels
+    const cx = size / 2 + pad;
+    const cy = size / 2 + pad;
+    const r = size * 0.38;
+    const vbW = size + pad * 2;
+    const vbH = size + pad * 2;
+    const levels = 5;
+    const labels = SCORE_KEYS.map((k) => k.label);
+    const values = SCORE_KEYS.map((k) => Math.max(0, Math.min(10, Number(data[k.key]) || 0)));
+    const n = labels.length;
+    const angleStep = (2 * Math.PI) / n;
+    const startAngle = -Math.PI / 2;
+
+    const pointAt = (i, val) => {
+        const angle = startAngle + i * angleStep;
+        const dist = (val / 10) * r;
+        return [cx + dist * Math.cos(angle), cy + dist * Math.sin(angle)];
+    };
+
+    const gridLines = [];
+    for (let lvl = 1; lvl <= levels; lvl++) {
+        const pts = [];
+        for (let i = 0; i < n; i++) {
+            pts.push(pointAt(i, (lvl / levels) * 10).join(','));
+        }
+        gridLines.push(
+            <polygon key={`grid-${lvl}`} points={pts.join(' ')} fill="none" stroke="rgba(148,163,184,0.25)" strokeWidth="1" />
+        );
+    }
+
+    const axes = [];
+    for (let i = 0; i < n; i++) {
+        const [ex, ey] = pointAt(i, 10);
+        axes.push(<line key={`axis-${i}`} x1={cx} y1={cy} x2={ex} y2={ey} stroke="rgba(148,163,184,0.2)" strokeWidth="1" />);
+    }
+
+    const dataPts = values.map((v, i) => pointAt(i, v).join(',')).join(' ');
+    const labelEls = labels.map((label, i) => {
+        const [lx, ly] = pointAt(i, 12);
+        return (
+            <text key={`label-${i}`} x={lx} y={ly} textAnchor="middle" dominantBaseline="central" fontSize="10" fill="currentColor" opacity="0.7">
+                {label}
+            </text>
+        );
+    });
+    const valueEls = values.map((v, i) => {
+        const [px, py] = pointAt(i, v);
+        return (
+            <circle key={`dot-${i}`} cx={px} cy={py} r="3.5" fill="#F97316" stroke="#fff" strokeWidth="1.5" />
+        );
+    });
+
+    return (
+        <svg viewBox={`0 0 ${vbW} ${vbH}`} width={size} height={size} style={{ display: 'block', margin: '0 auto' }}>
+            {gridLines}
+            {axes}
+            <polygon points={dataPts} fill="rgba(249,115,22,0.18)" stroke="#F97316" strokeWidth="2" />
+            {valueEls}
+            {labelEls}
+        </svg>
+    );
+}
+
+// ---- Speech Telemetry Panel ----
+function SpeechTelemetry({ telemetry, communicationFeedback }) {
+    if (!telemetry) return null;
+    const fillers = Number(telemetry.fillerWords) || 0;
+    const fillersPerMin = Number(telemetry.fillersPerMinute) || 0;
+    const confidence = telemetry.confidence || 'N/A';
+    const hedgeWords = Number(telemetry.hedge_words) || 0;
+    const star = telemetry.star_analysis || {};
+    const fillerDetail = telemetry.filler_detail || {};
+    const hedgeDetail = telemetry.hedge_detail || {};
+
+    const fillerStatus = fillersPerMin <= 2 ? 'success' : fillersPerMin <= 5 ? 'warning' : 'error';
+
+    const starComponents = ['situation', 'task', 'action', 'result'];
+
+    return (
+        <Paper sx={{ p: { xs: 2, md: 2.5 }, mb: 2.5, borderRadius: 3 }}>
+            <Typography variant="h6" sx={{ mb: 1.2 }}>Speech Analytics</Typography>
+            <Grid container spacing={1.2}>
+                <Grid size={{ xs: 6, md: 4 }}>
+                    <Tooltip title={Object.entries(fillerDetail).map(([w, c]) => `${w}: ${c}`).join(', ') || 'None'} arrow>
+                        <Paper sx={{ p: 1.2, textAlign: 'center', borderRadius: 2, cursor: 'help' }}>
+                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>Filler Words</Typography>
+                            <Typography variant="h5" sx={{ fontWeight: 700, mt: 0.3 }}>{fillers}</Typography>
+                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>{fillersPerMin}/min</Typography>
+                            <Box sx={{ mt: 0.5 }}>
+                                <Chip size="small" label={fillersPerMin <= 2 ? 'Low' : fillersPerMin <= 5 ? 'Moderate' : 'High'} color={fillerStatus} variant="outlined" />
+                            </Box>
+                        </Paper>
+                    </Tooltip>
+                </Grid>
+                <Grid size={{ xs: 6, md: 4 }}>
+                    <Tooltip title={Object.entries(hedgeDetail).map(([w, c]) => `${w}: ${c}`).join(', ') || 'None'} arrow>
+                        <Paper sx={{ p: 1.2, textAlign: 'center', borderRadius: 2, cursor: 'help' }}>
+                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>Hedge Words</Typography>
+                            <Typography variant="h5" sx={{ fontWeight: 700, mt: 0.3 }}>{hedgeWords}</Typography>
+                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>weakening phrases</Typography>
+                            <Box sx={{ mt: 0.5 }}>
+                                <Chip size="small" label={hedgeWords <= 2 ? 'Confident' : hedgeWords <= 5 ? 'Some hedging' : 'Uncertain'} color={hedgeWords <= 2 ? 'success' : hedgeWords <= 5 ? 'warning' : 'error'} variant="outlined" />
+                            </Box>
+                        </Paper>
+                    </Tooltip>
+                </Grid>
+                <Grid size={{ xs: 6, md: 4 }}>
+                    <Paper sx={{ p: 1.2, textAlign: 'center', borderRadius: 2 }}>
+                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>Confidence</Typography>
+                        <Typography variant="h5" sx={{ fontWeight: 700, mt: 0.3 }}>{confidence}</Typography>
+                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>overall level</Typography>
+                        <Box sx={{ mt: 0.5 }}>
+                            <Chip size="small" label={confidence} color={confidence === 'High' ? 'success' : confidence === 'Low' ? 'error' : 'warning'} variant="outlined" />
+                        </Box>
+                    </Paper>
+                </Grid>
+            </Grid>
+
+            {star.score !== undefined && (
+                <Paper sx={{ p: 1.2, mt: 1.2, borderRadius: 2, bgcolor: 'rgba(249,115,22,0.05)' }}>
+                    <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 0.6 }}>
+                        <Typography variant="subtitle2">STAR Framework Usage</Typography>
+                        <Chip size="small" label={`${star.score}/4 components`} color={star.complete ? 'success' : star.score >= 2 ? 'warning' : 'error'} variant="outlined" />
+                    </Stack>
+                    <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap">
+                        {starComponents.map((comp) => (
+                            <Chip
+                                key={comp}
+                                size="small"
+                                label={comp.charAt(0).toUpperCase() + comp.slice(1)}
+                                color={star[comp] ? 'success' : 'default'}
+                                variant={star[comp] ? 'filled' : 'outlined'}
+                                sx={{ opacity: star[comp] ? 1 : 0.5 }}
+                            />
+                        ))}
+                    </Stack>
+                </Paper>
+            )}
+
+            {communicationFeedback && (
+                <Typography variant="body2" sx={{ color: 'text.secondary', mt: 1.2, fontStyle: 'italic' }}>
+                    {communicationFeedback}
+                </Typography>
+            )}
+        </Paper>
+    );
+}
 
 function toStringArray(value, limit = 6) {
     if (!Array.isArray(value)) return [];
@@ -69,7 +222,7 @@ function toStringArray(value, limit = 6) {
 
 function deriveImprovementPlan(evaluation, questionText) {
     const plan = (evaluation && typeof evaluation.improvement_plan === 'object') ? evaluation.improvement_plan : {};
-    const misses = toStringArray(evaluation?.rubric_misses || evaluation?.missing_concepts, 5);
+    const misses = toStringArray(evaluation?.gaps || evaluation?.rubric_misses || evaluation?.missing_concepts, 5);
     const focus = String(plan.focus || misses[0] || `Answer "${questionText}" with clearer structure`).trim();
     const steps = toStringArray(plan.steps, 3);
     const successCriteria = toStringArray(plan.success_criteria, 3);
@@ -125,6 +278,7 @@ export default function SessionReport() {
         retryErrors,
         loadRetryAttempts,
         submitRetryAnswer,
+        sessionToken,
     } = useInterviewStore();
 
     const [expanded, setExpanded] = useState(false);
@@ -143,17 +297,21 @@ export default function SessionReport() {
                 const score = normalizeScore(evaluation?.score || 0);
                 const breakdown = evaluation?.score_breakdown || {};
                 const normalizedBreakdown = {
-                    clarity: normalizeScore(breakdown?.clarity ?? score),
-                    accuracy: normalizeScore(breakdown?.accuracy ?? score),
-                    completeness: normalizeScore(breakdown?.completeness ?? score),
+                    relevance: normalizeScore(breakdown?.relevance ?? breakdown?.accuracy ?? score),
+                    depth: normalizeScore(breakdown?.depth ?? breakdown?.completeness ?? score),
                     structure: normalizeScore(breakdown?.structure ?? score),
+                    specificity: normalizeScore(breakdown?.specificity ?? breakdown?.clarity ?? score),
+                    communication: normalizeScore(breakdown?.communication ?? score),
                 };
 
                 const confidence = normalizeConfidence(evaluation?.confidence);
                 const evidenceQuotes = toStringArray(evaluation?.evidence_quotes, 2);
-                const rubricMisses = toStringArray(evaluation?.rubric_misses || evaluation?.missing_concepts, 5);
-                const rubricHits = toStringArray(evaluation?.rubric_hits || evaluation?.strengths, 5);
+                const evalGaps = toStringArray(evaluation?.gaps || evaluation?.rubric_misses || evaluation?.missing_concepts, 5);
+                const evalStrengths = toStringArray(evaluation?.strengths, 5);
                 const qualityFlags = toStringArray(evaluation?.quality_flags, 6);
+                const isSkipped = Boolean(ev?.skipped)
+                    || qualityFlags.some((flag) => String(flag).toLowerCase() === 'skipped')
+                    || String(ev?.answer || '').trim().toLowerCase() === '(skipped)';
                 const improvementPlan = deriveImprovementPlan(evaluation, ev?.question?.text || 'this question');
                 const retryDrill = (evaluation?.retry_drill && typeof evaluation.retry_drill === 'object')
                     ? evaluation.retry_drill
@@ -167,13 +325,15 @@ export default function SessionReport() {
                     score,
                     breakdown: normalizedBreakdown,
                     answer: ev?.answer || '',
-                    improved: evaluation?.optimized_answer || '',
-                    strengths: rubricHits,
-                    gaps: rubricMisses,
+                    modelAnswer: evaluation?.model_answer || evaluation?.optimized_answer || '',
+                    strengths: evalStrengths,
+                    gaps: evalGaps,
                     tip: evaluation?.coaching_tip || '',
+                    evaluationReasoning: evaluation?.evaluation_reasoning || evaluation?.feedback || '',
                     confidence,
                     evidenceQuotes,
                     qualityFlags,
+                    isSkipped,
                     improvementPlan,
                     retryPrompt: String(retryDrill?.prompt || '').trim(),
                     retryTargetPoints: toStringArray(retryDrill?.target_points, 3),
@@ -182,69 +342,54 @@ export default function SessionReport() {
         [allEvaluations]
     );
 
+    const scorableQuestions = useMemo(
+        () => questions.filter((q) => !q.isSkipped),
+        [questions]
+    );
+
     const computedAverageScore = useMemo(() => {
-        if (!questions.length) return 0;
-        const total = questions.reduce((sum, q) => sum + normalizeScore(q.score), 0);
-        return round1(total / questions.length);
-    }, [questions]);
+        if (!scorableQuestions.length) return 0;
+        const total = scorableQuestions.reduce((sum, q) => sum + normalizeScore(q.score), 0);
+        return round1(total / scorableQuestions.length);
+    }, [scorableQuestions]);
 
     const computedOverallBreakdown = useMemo(() => {
-        if (!questions.length) {
-            return {
-                clarity: 0,
-                accuracy: 0,
-                completeness: 0,
-                structure: 0,
-            };
+        const dims = SCORE_KEYS.map((k) => k.key);
+        if (!scorableQuestions.length) {
+            return Object.fromEntries(dims.map((d) => [d, 0]));
         }
-        const totals = {
-            clarity: 0,
-            accuracy: 0,
-            completeness: 0,
-            structure: 0,
-        };
-        for (const q of questions) {
-            totals.clarity += normalizeScore(q.breakdown?.clarity);
-            totals.accuracy += normalizeScore(q.breakdown?.accuracy);
-            totals.completeness += normalizeScore(q.breakdown?.completeness);
-            totals.structure += normalizeScore(q.breakdown?.structure);
+        const totals = Object.fromEntries(dims.map((d) => [d, 0]));
+        for (const q of scorableQuestions) {
+            for (const d of dims) {
+                totals[d] += normalizeScore(q.breakdown?.[d]);
+            }
         }
-        return {
-            clarity: round1(totals.clarity / questions.length),
-            accuracy: round1(totals.accuracy / questions.length),
-            completeness: round1(totals.completeness / questions.length),
-            structure: round1(totals.structure / questions.length),
-        };
-    }, [questions]);
+        return Object.fromEntries(dims.map((d) => [d, round1(totals[d] / scorableQuestions.length)]));
+    }, [scorableQuestions]);
 
     const summaryBreakdown = (summary.overall_breakdown && typeof summary.overall_breakdown === 'object')
         ? summary.overall_breakdown
         : ((summary.score_breakdown && typeof summary.score_breakdown === 'object') ? summary.score_breakdown : {});
 
     const overallBreakdown = useMemo(
-        () => ({
-            clarity: Number.isFinite(Number(summaryBreakdown?.clarity))
-                ? normalizeScore(summaryBreakdown.clarity)
-                : computedOverallBreakdown.clarity,
-            accuracy: Number.isFinite(Number(summaryBreakdown?.accuracy))
-                ? normalizeScore(summaryBreakdown.accuracy)
-                : computedOverallBreakdown.accuracy,
-            completeness: Number.isFinite(Number(summaryBreakdown?.completeness))
-                ? normalizeScore(summaryBreakdown.completeness)
-                : computedOverallBreakdown.completeness,
-            structure: Number.isFinite(Number(summaryBreakdown?.structure))
-                ? normalizeScore(summaryBreakdown.structure)
-                : computedOverallBreakdown.structure,
-        }),
+        () => {
+            const result = {};
+            for (const { key } of SCORE_KEYS) {
+                result[key] = Number.isFinite(Number(summaryBreakdown?.[key]))
+                    ? normalizeScore(summaryBreakdown[key])
+                    : computedOverallBreakdown[key];
+            }
+            return result;
+        },
         [summaryBreakdown, computedOverallBreakdown]
     );
 
-    const averageScore = questions.length > 0
+    const averageScore = scorableQuestions.length > 0
         ? computedAverageScore
         : normalizeScore(summary.average_score || 0);
 
     const performanceBreakdown = useMemo(() => {
-        if (!questions.length) {
+        if (!scorableQuestions.length) {
             const pb = summary.performance_breakdown || {};
             return {
                 excellent: Number(pb.excellent || 0),
@@ -253,16 +398,35 @@ export default function SessionReport() {
             };
         }
         return {
-            excellent: questions.filter((q) => q.score >= 8).length,
-            good: questions.filter((q) => q.score >= 6 && q.score < 8).length,
-            needs_work: questions.filter((q) => q.score < 6).length,
+            excellent: scorableQuestions.filter((q) => q.score >= 8).length,
+            good: scorableQuestions.filter((q) => q.score >= 6 && q.score < 8).length,
+            needs_work: scorableQuestions.filter((q) => q.score < 6).length,
         };
-    }, [questions, summary.performance_breakdown]);
+    }, [scorableQuestions, summary.performance_breakdown]);
 
-    const totalQuestions = Number(summary.total_questions || questions.length || 0);
-    const answeredQuestions = Number(summary.answered_questions || questions.length || 0);
-    const scorePercent = Math.round((averageScore / 10) * 100);
-    const scoreAngle = Math.round((averageScore / 10) * 360);
+    const parsedTotalQuestions = Number(summary.total_questions);
+    const parsedAnsweredQuestions = Number(summary.answered_questions);
+    const parsedSkippedQuestions = Number(summary.skipped_questions);
+    const hasEvaluationRows = questions.length > 0;
+
+    const totalQuestions = hasEvaluationRows
+        ? questions.length
+        : (Number.isFinite(parsedTotalQuestions) && parsedTotalQuestions >= 0
+            ? parsedTotalQuestions
+            : questions.length);
+    const answeredQuestions = hasEvaluationRows
+        ? scorableQuestions.length
+        : (Number.isFinite(parsedAnsweredQuestions) && parsedAnsweredQuestions >= 0
+            ? parsedAnsweredQuestions
+            : scorableQuestions.length);
+    const skippedQuestions = hasEvaluationRows
+        ? Math.max(0, questions.length - scorableQuestions.length)
+        : (Number.isFinite(parsedSkippedQuestions) && parsedSkippedQuestions >= 0
+            ? parsedSkippedQuestions
+            : Math.max(0, totalQuestions - answeredQuestions));
+    const hasScorableAnswers = answeredQuestions > 0;
+    const scorePercent = hasScorableAnswers ? Math.round((averageScore / 10) * 100) : 0;
+    const scoreAngle = hasScorableAnswers ? Math.round((averageScore / 10) * 360) : 0;
     const summaryStrengths = summary.top_strengths || summary.strengths || [];
     const summaryImprovements = summary.areas_to_improve || [];
     const summaryActions = summary.action_items || [];
@@ -316,6 +480,36 @@ export default function SessionReport() {
 
     const handleRetryChange = (questionId, value) => {
         setRetryDrafts((prev) => ({ ...prev, [questionId]: value }));
+    };
+
+    const [exporting, setExporting] = useState(false);
+
+    const handleExport = async () => {
+        if (!reportSessionId || exporting) return;
+        setExporting(true);
+        try {
+            const token = sessionToken || localStorage.getItem('session_token');
+            const res = await fetch(`/api/session/${reportSessionId}/export`, {
+                headers: token ? { 'X-Session-Token': token } : {},
+            });
+            if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+            const blob = await res.blob();
+            const disposition = res.headers.get('Content-Disposition') || '';
+            const filenameMatch = disposition.match(/filename="?([^"]+)"?/);
+            const filename = filenameMatch ? filenameMatch[1] : `interview-report-${reportSessionId.slice(0, 8)}.pdf`;
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            console.error('Export error:', err);
+        } finally {
+            setExporting(false);
+        }
     };
 
     const handleRetrySubmit = (question) => {
@@ -399,9 +593,29 @@ export default function SessionReport() {
                                     Overall performance first, then per-question coaching.
                                 </Typography>
                             </Box>
-                            <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap">
+                            <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" alignItems="center">
                                 <Chip size="small" label={`${answeredQuestions}/${totalQuestions || answeredQuestions} answered`} variant="outlined" />
-                                <Chip size="small" label={`Score ${scorePercent}%`} color="secondary" variant="outlined" />
+                                {skippedQuestions > 0 && (
+                                    <Chip size="small" label={`${skippedQuestions} skipped`} color="warning" variant="outlined" />
+                                )}
+                                <Chip
+                                    size="small"
+                                    label={hasScorableAnswers ? `Score ${scorePercent}%` : 'Score N/A'}
+                                    color={hasScorableAnswers ? 'secondary' : 'default'}
+                                    variant="outlined"
+                                />
+                                {reportSessionId && (
+                                    <Button
+                                        size="small"
+                                        variant="outlined"
+                                        startIcon={<PictureAsPdfOutlined />}
+                                        onClick={handleExport}
+                                        disabled={exporting}
+                                        sx={{ textTransform: 'none', borderRadius: 2 }}
+                                    >
+                                        {exporting ? 'Exporting...' : 'Export PDF'}
+                                    </Button>
+                                )}
                             </Stack>
                         </Stack>
                     </Paper>
@@ -435,124 +649,126 @@ export default function SessionReport() {
                                 <Box>
                                     <Typography variant="h6">Overall Interview Score</Typography>
                                     <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                        Based on {answeredQuestions}/{totalQuestions || answeredQuestions} answered questions.
+                                        {hasScorableAnswers
+                                            ? `Based on ${answeredQuestions}/${totalQuestions || answeredQuestions} answered questions.`
+                                            : `No scorable answers yet (${answeredQuestions}/${totalQuestions || answeredQuestions} answered).`}
                                     </Typography>
                                 </Box>
                                 <Chip
                                     size="small"
-                                    label={`${averageScore.toFixed(1)}/10 • ${tone(averageScore).label}`}
-                                    color={tone(averageScore).color}
+                                    label={hasScorableAnswers ? `${averageScore.toFixed(1)}/10 • ${tone(averageScore).label}` : 'Not scored'}
+                                    color={hasScorableAnswers ? tone(averageScore).color : 'default'}
                                     variant="outlined"
                                 />
                             </Stack>
 
                             <Grid container spacing={1.2} alignItems="stretch">
                                 <Grid size={{ xs: 12, md: 4 }}>
-                                    <Paper
-                                        sx={{
-                                            p: 1.4,
-                                            height: '100%',
-                                            borderRadius: 2.2,
-                                            backgroundColor: 'rgba(15, 23, 42, 0.06)',
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            justifyContent: 'space-between',
-                                            gap: 1.2,
-                                        }}
-                                    >
-                                        <Box>
-                                            <Typography variant="overline" sx={{ color: 'text.secondary', lineHeight: 1.1 }}>
-                                                Final Score
-                                            </Typography>
-                                            <Typography variant="h2" sx={{ lineHeight: 1.02, fontWeight: 800 }}>
-                                                {averageScore.toFixed(1)}
-                                            </Typography>
-                                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                                out of 10
-                                            </Typography>
-                                        </Box>
-                                        <Box
+                                    <Stack spacing={1.2} sx={{ height: '100%' }}>
+                                        <Paper
                                             sx={{
-                                                width: 112,
-                                                height: 112,
-                                                borderRadius: '50%',
-                                                display: 'grid',
-                                                placeItems: 'center',
-                                                background: `conic-gradient(${scoreToneColor(averageScore)} ${scoreAngle}deg, rgba(148,163,184,0.25) 0deg)`,
-                                                boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.15)',
+                                                p: 1.4,
+                                                borderRadius: 2.2,
+                                                backgroundColor: 'rgba(15, 23, 42, 0.06)',
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                justifyContent: 'space-between',
+                                                gap: 1.2,
                                             }}
                                         >
-                                            <Box
-                                                sx={{
-                                                    width: 78,
-                                                    height: 78,
-                                                    borderRadius: '50%',
-                                                    bgcolor: 'background.paper',
-                                                    display: 'grid',
-                                                    placeItems: 'center',
-                                                    border: '1px solid',
-                                                    borderColor: 'divider',
-                                                }}
-                                            >
-                                                <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                                                    {scorePercent}%
+                                            <Box>
+                                                <Typography variant="overline" sx={{ color: 'text.secondary', lineHeight: 1.1 }}>
+                                                    Final Score
+                                                </Typography>
+                                                <Typography variant="h2" sx={{ lineHeight: 1.02, fontWeight: 800 }}>
+                                                    {hasScorableAnswers ? averageScore.toFixed(1) : 'N/A'}
+                                                </Typography>
+                                                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                    {hasScorableAnswers ? 'out of 10' : 'insufficient answers'}
                                                 </Typography>
                                             </Box>
-                                        </Box>
-                                    </Paper>
-                                </Grid>
-                                <Grid size={{ xs: 12, md: 8 }}>
-                                    <Paper sx={{ p: 1.3, height: '100%', borderRadius: 2.2 }}>
-                                        <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                                            Overall Breakdown
-                                        </Typography>
-                                        <Grid container spacing={1}>
-                                            {SCORE_KEYS.map(({ key, label }) => {
-                                                const value = normalizeScore(overallBreakdown[key]);
-                                                return (
-                                                    <Grid key={`overall-${key}`} size={{ xs: 12, sm: 6 }}>
-                                                        <Paper
-                                                            sx={{
-                                                                p: 1,
-                                                                borderRadius: 1.8,
-                                                                backgroundColor: 'rgba(15,23,42,0.03)',
-                                                            }}
-                                                        >
-                                                            <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.45 }}>
-                                                                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                                                    {label}
-                                                                </Typography>
-                                                                <Typography variant="caption" sx={{ fontWeight: 700 }}>
-                                                                    {value.toFixed(1)}/10
-                                                                </Typography>
-                                                            </Stack>
-                                                            <LinearProgress
-                                                                variant="determinate"
-                                                                value={value * 10}
-                                                                sx={{
-                                                                    height: 8,
-                                                                    borderRadius: 99,
-                                                                    '& .MuiLinearProgress-bar': {
-                                                                        borderRadius: 99,
-                                                                        backgroundColor: scoreToneColor(value),
-                                                                    },
-                                                                }}
-                                                            />
-                                                        </Paper>
-                                                    </Grid>
-                                                );
-                                            })}
-                                        </Grid>
-                                        <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
+                                            <Box
+                                                sx={{
+                                                    width: 112,
+                                                    height: 112,
+                                                    borderRadius: '50%',
+                                                    display: 'grid',
+                                                    placeItems: 'center',
+                                                    background: `conic-gradient(${scoreToneColor(averageScore)} ${scoreAngle}deg, rgba(148,163,184,0.25) 0deg)`,
+                                                    boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.15)',
+                                                }}
+                                            >
+                                                <Box
+                                                    sx={{
+                                                        width: 78,
+                                                        height: 78,
+                                                        borderRadius: '50%',
+                                                        bgcolor: 'background.paper',
+                                                        display: 'grid',
+                                                        placeItems: 'center',
+                                                        border: '1px solid',
+                                                        borderColor: 'divider',
+                                                    }}
+                                                >
+                                                    <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                                                        {scorePercent}%
+                                                    </Typography>
+                                                </Box>
+                                            </Box>
+                                        </Paper>
+                                        <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap">
                                             <Chip size="small" variant="outlined" label={`Excellent ${performanceBreakdown.excellent}`} />
                                             <Chip size="small" variant="outlined" label={`Good ${performanceBreakdown.good}`} />
                                             <Chip size="small" variant="outlined" label={`Needs work ${performanceBreakdown.needs_work}`} />
+                                        </Stack>
+                                    </Stack>
+                                </Grid>
+                                <Grid size={{ xs: 12, md: 4 }}>
+                                    <Paper sx={{ p: 1.3, height: '100%', borderRadius: 2.2, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                        <RadarChart data={overallBreakdown} size={210} />
+                                    </Paper>
+                                </Grid>
+                                <Grid size={{ xs: 12, md: 4 }}>
+                                    <Paper sx={{ p: 1.3, height: '100%', borderRadius: 2.2 }}>
+                                        <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                                            Dimension Scores
+                                        </Typography>
+                                        <Stack spacing={0.8}>
+                                            {SCORE_KEYS.map(({ key, label }) => {
+                                                const value = normalizeScore(overallBreakdown[key]);
+                                                return (
+                                                    <Box key={`overall-${key}`}>
+                                                        <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.3 }}>
+                                                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                                {label}
+                                                            </Typography>
+                                                            <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                                                                {value.toFixed(1)}
+                                                            </Typography>
+                                                        </Stack>
+                                                        <LinearProgress
+                                                            variant="determinate"
+                                                            value={value * 10}
+                                                            sx={{
+                                                                height: 6,
+                                                                borderRadius: 99,
+                                                                '& .MuiLinearProgress-bar': {
+                                                                    borderRadius: 99,
+                                                                    backgroundColor: scoreToneColor(value),
+                                                                },
+                                                            }}
+                                                        />
+                                                    </Box>
+                                                );
+                                            })}
                                         </Stack>
                                     </Paper>
                                 </Grid>
                             </Grid>
                         </Stack>
                     </Paper>
+
+                    <SpeechTelemetry telemetry={summary.telemetry} communicationFeedback={summary.communication_feedback} />
 
                     <Paper sx={{ p: { xs: 2, md: 2.5 }, mb: 2.5, borderRadius: 3 }}>
                         <Stack direction={{ xs: 'column', md: 'row' }} spacing={1.2} justifyContent="space-between" alignItems={{ xs: 'flex-start', md: 'center' }}>
@@ -625,8 +841,8 @@ export default function SessionReport() {
                                                     </Typography>
                                                     <Chip
                                                         size="small"
-                                                        label={`${q.score.toFixed(1)}/10`}
-                                                        color={tone(q.score).color}
+                                                        label={q.isSkipped ? 'Skipped' : `${q.score.toFixed(1)}/10`}
+                                                        color={q.isSkipped ? 'warning' : tone(q.score).color}
                                                         variant="outlined"
                                                     />
                                                 </Stack>
@@ -654,10 +870,16 @@ export default function SessionReport() {
                                                             Why this score
                                                         </Typography>
 
+                                                        {q.evaluationReasoning && (
+                                                            <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1, fontStyle: 'italic' }}>
+                                                                {q.evaluationReasoning}
+                                                            </Typography>
+                                                        )}
+
                                                         <Grid container spacing={0.8} sx={{ mb: 1 }}>
                                                             {SCORE_KEYS.map(({ key, label }) => (
-                                                                <Grid key={`${q.id}-score-${key}`} size={{ xs: 6, md: 3 }}>
-                                                                    <Paper sx={{ p: 1, borderStyle: 'dashed' }}>
+                                                                <Grid key={`${q.id}-score-${key}`} size={{ xs: 6, sm: 4, md: 'auto' }}>
+                                                                    <Paper sx={{ p: 1, borderStyle: 'dashed', minWidth: 80 }}>
                                                                         <Typography variant="caption" sx={{ color: 'text.secondary' }}>{label}</Typography>
                                                                         <Typography variant="body2" sx={{ fontWeight: 700 }}>
                                                                             {normalizeScore(q.breakdown[key]).toFixed(1)}/10
@@ -738,10 +960,10 @@ export default function SessionReport() {
 
                                                         <Paper sx={{ p: 1, bgcolor: 'rgba(251, 191, 36, 0.1)' }}>
                                                             <Typography variant="caption" sx={{ color: 'secondary.main' }}>
-                                                                Better answer pattern
+                                                                Model answer
                                                             </Typography>
                                                             <Typography variant="body2">
-                                                                {q.improved || 'State context, describe your action, and end with measurable impact.'}
+                                                                {q.modelAnswer || 'State context, describe your action, and end with measurable impact.'}
                                                             </Typography>
                                                         </Paper>
                                                     </Paper>

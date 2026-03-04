@@ -94,6 +94,7 @@ export default function InterviewView() {
         interviewFeedbackTiming,
         coachingEnabled,
         interviewerPersona,
+        generatingReport,
     } = useInterviewStore();
 
     const [draft, setDraft] = useState('');
@@ -117,6 +118,7 @@ export default function InterviewView() {
     const muteGainNodeRef = useRef(null);
     const recordingEpochRef = useRef(0);
     const questionAudioRef = useRef(null);
+    const questionAudioPlayingRef = useRef(false);
     const autoHintQuestionRef = useRef(0);
     const silenceAutoStopSeconds = Math.max(
         1,
@@ -154,7 +156,7 @@ export default function InterviewView() {
             streamRef.current = null;
         }
         if (audioContextRef.current) {
-            audioContextRef.current.close().catch(() => {});
+            audioContextRef.current.close().catch(() => { });
             audioContextRef.current = null;
         }
     }, []);
@@ -204,7 +206,7 @@ export default function InterviewView() {
             // If user already stopped before startup completed, abort this start cleanly.
             if (recordingEpochRef.current !== epoch) {
                 stream.getTracks().forEach((track) => track.stop());
-                audioContext.close().catch(() => {});
+                audioContext.close().catch(() => { });
                 return;
             }
 
@@ -217,6 +219,8 @@ export default function InterviewView() {
 
             processor.onaudioprocess = (event) => {
                 if (!isRecordingRef.current || recordingEpochRef.current !== epoch) return;
+                // Gate: skip sending mic audio while TTS plays to avoid echo feedback
+                if (questionAudioPlayingRef.current) return;
                 const input = event.inputBuffer.getChannelData(0);
 
                 let sumSquares = 0;
@@ -269,48 +273,61 @@ export default function InterviewView() {
             questionAudioRef.current = null;
         }
         setQuestionAudioPlaying(false);
+        questionAudioPlayingRef.current = false;
     }, []);
 
     const playQuestionAudio = useCallback(async (audioBase64) => {
         if (!audioBase64) return false;
+        console.log('[TTS] playQuestionAudio called, audioBase64 length:', audioBase64.length);
         stopQuestionAudio();
 
         const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
         audio.preload = 'auto';
         questionAudioRef.current = audio;
         setQuestionAudioPlaying(true);
+        questionAudioPlayingRef.current = true;
 
         audio.onended = () => {
+            console.log('[TTS] Audio playback ended');
             if (questionAudioRef.current === audio) {
                 questionAudioRef.current = null;
             }
             setQuestionAudioPlaying(false);
+            // Brief cooldown before un-gating mic to let trailing speaker resonance fade
+            setTimeout(() => { questionAudioPlayingRef.current = false; }, 250);
         };
 
-        audio.onerror = () => {
+        audio.onerror = (e) => {
+            console.error('[TTS] Audio playback error:', e);
             if (questionAudioRef.current === audio) {
                 questionAudioRef.current = null;
             }
             setQuestionAudioPlaying(false);
+            questionAudioPlayingRef.current = false;
         };
 
         try {
             await audio.play();
+            console.log('[TTS] audio.play() succeeded');
             return true;
         } catch (err) {
+            console.error('[TTS] audio.play() failed:', err);
             if (questionAudioRef.current === audio) {
                 questionAudioRef.current = null;
             }
             setQuestionAudioPlaying(false);
+            questionAudioPlayingRef.current = false;
             return false;
         }
     }, [stopQuestionAudio]);
 
     useEffect(() => {
+        console.log('[TTS] Playback effect: enabled=', questionAudioEnabled, 'playing=', questionAudioPlaying, 'queueLen=', ttsAudioQueue.length, 'pending=', !!pendingQuestionAudio);
         if (!questionAudioEnabled || questionAudioPlaying) return;
 
         const nextAudio = pendingQuestionAudio || popAudio();
         if (!nextAudio) return;
+        console.log('[TTS] Attempting playback, audio length:', nextAudio.length);
 
         let isMounted = true;
         playQuestionAudio(nextAudio).then((started) => {
@@ -443,8 +460,6 @@ export default function InterviewView() {
     const personaLabel = ({
         friendly: 'Friendly',
         strict: 'Strict',
-        rapid_fire: 'Rapid-Fire',
-        skeptical: 'Skeptical',
     }[String(interviewerPersona || '').trim().toLowerCase()] || 'Friendly');
     const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
 
@@ -492,7 +507,31 @@ export default function InterviewView() {
                     }}
                 >
                     <Stack spacing={2.2}>
-                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
+                        {/* Generating report overlay */}
+                        {generatingReport && (
+                            <Paper
+                                sx={{
+                                    p: { xs: 4, md: 6 },
+                                    textAlign: 'center',
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    alignItems: 'center',
+                                    gap: 2.5,
+                                    minHeight: 320,
+                                    justifyContent: 'center',
+                                }}
+                            >
+                                <CircularProgress size={48} color="secondary" />
+                                <Typography variant="h5" sx={{ fontWeight: 600 }}>
+                                    Generating Your Report
+                                </Typography>
+                                <Typography variant="body1" color="text.secondary" sx={{ maxWidth: 420 }}>
+                                    Evaluating your answers and building a detailed performance report. This usually takes a few seconds…
+                                </Typography>
+                            </Paper>
+                        )}
+
+                        {!generatingReport && (<><Paper sx={{ p: { xs: 2, md: 2.5 } }}>
                             <Stack spacing={1.2} sx={{ mb: 1.2 }}>
                                 <Stack
                                     direction={{ xs: 'column', sm: 'row' }}
@@ -563,202 +602,202 @@ export default function InterviewView() {
                             )}
                         </Paper>
 
-                        {showTipsPanel && (
-                            <Fade in timeout={160}>
-                                <Paper sx={{ p: { xs: 1.6, md: 2 } }}>
-                                    <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
-                                        <Box>
-                                            <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-                                                {isCoachSession ? 'Coach Hint' : 'Hint'}
-                                            </Typography>
-                                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                                {hintMessage || 'Ask for a hint when you need guidance.'}
-                                            </Typography>
-                                        </Box>
-                                        <Stack direction="row" spacing={0.6} useFlexGap flexWrap="wrap" alignItems="center">
-                                            {hintLevel > 0 && <Chip size="small" label={`L${hintLevel}`} color="secondary" variant="outlined" />}
-                                            <Button size="small" variant="outlined" onClick={requestHint}>
-                                                Refresh
-                                            </Button>
-                                            <Button size="small" variant="text" onClick={() => setShowHintDetails((prev) => !prev)}>
-                                                {showHintDetails ? 'Less' : 'Details'}
-                                            </Button>
-                                        </Stack>
-                                    </Stack>
-
-                                    {hintNextStep && (
-                                        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                            <strong>Next:</strong> {hintNextStep}
-                                        </Typography>
-                                    )}
-
-                                    {showHintDetails && (
-                                        <Paper elevation={0} sx={{ mt: 1, p: 1.1, borderStyle: 'dashed' }}>
-                                            {hintFramework && (
-                                                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}>
-                                                    Framework: {hintFramework}
+                            {showTipsPanel && (
+                                <Fade in timeout={160}>
+                                    <Paper sx={{ p: { xs: 1.6, md: 2 } }}>
+                                        <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
+                                            <Box>
+                                                <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                                                    {isCoachSession ? 'Coach Hint' : 'Hint'}
                                                 </Typography>
-                                            )}
-                                            {hintStarter && (
-                                                <Typography variant="body2" sx={{ mb: 0.7 }}>
-                                                    <strong>Starter:</strong> "{hintStarter}"
+                                                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                    {hintMessage || 'Ask for a hint when you need guidance.'}
                                                 </Typography>
-                                            )}
-                                            {hintMustMention.length > 0 && (
-                                                <Stack direction="row" spacing={0.6} useFlexGap flexWrap="wrap" sx={{ mb: 0.7 }}>
-                                                    {hintMustMention.map((point) => (
-                                                        <Chip key={point} size="small" label={point} variant="outlined" />
-                                                    ))}
-                                                </Stack>
-                                            )}
-                                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                                <strong>Avoid:</strong> {hintAvoid || 'Stay concrete and include one clear outcome.'}
-                                            </Typography>
-                                        </Paper>
-                                    )}
-                                </Paper>
-                            </Fade>
-                        )}
-
-                        {!showTipsPanel && !isCoachSession && (
-                            <Paper sx={{ p: 1.2, bgcolor: darkMode ? 'rgba(245,158,11,0.05)' : 'rgba(249,115,22,0.05)' }}>
-                                <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} alignItems={{ sm: 'center' }}>
-                                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                        Need help? Enable hints for one focused coaching prompt.
-                                    </Typography>
-                                    <Button
-                                        size="small"
-                                        variant="outlined"
-                                        color="secondary"
-                                        startIcon={<LightbulbOutlined />}
-                                        onClick={handleToggleHintsPanel}
-                                    >
-                                        Enable Coach Hints
-                                    </Button>
-                                </Stack>
-                            </Paper>
-                        )}
-
-                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
-                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1} sx={{ mb: 1.1 }}>
-                                <Typography variant="h6">Your Answer</Typography>
-                                <Tabs
-                                    value={inputMode}
-                                    onChange={handleModeChange}
-                                    textColor="secondary"
-                                    indicatorColor="secondary"
-                                    sx={{ minHeight: 34, '& .MuiTab-root': { minHeight: 34, px: 1.6 } }}
-                                >
-                                    <Tab icon={<GraphicEq sx={{ fontSize: 18 }} />} iconPosition="start" value="record" label="Record" />
-                                    <Tab icon={<EditNote sx={{ fontSize: 18 }} />} iconPosition="start" value="type" label="Type" />
-                                </Tabs>
-                            </Stack>
-
-                            {inputMode === 'record' ? (
-                                <Stack spacing={1.2}>
-                                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ sm: 'center' }}>
-                                        <Button
-                                            variant={isMicRecording ? 'contained' : 'outlined'}
-                                            color={isMicRecording ? 'error' : 'primary'}
-                                            startIcon={isMicRecording ? <MicOff /> : <Mic />}
-                                            onClick={isMicRecording ? () => stopRecording(true) : startRecording}
-                                            disabled={isMicStarting}
-                                        >
-                                            {isMicStarting
-                                                ? 'Starting...'
-                                                : isMicRecording
-                                                    ? 'Stop Recording'
-                                                    : 'Start Recording'}
-                                        </Button>
-                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                            {isMicRecording ? 'Listening' : isMicStarting ? 'Starting mic' : 'Recorder idle'} • Auto-stop after {silenceAutoStopSeconds.toFixed(1)}s of silence
-                                        </Typography>
-                                    </Stack>
-
-                                    {micError && (
-                                        <Typography variant="body2" color="error">
-                                            {micError}
-                                        </Typography>
-                                    )}
-
-                                    <Paper
-                                        elevation={0}
-                                        sx={{
-                                            p: 1.2,
-                                            minHeight: 140,
-                                            maxHeight: 220,
-                                            overflowY: 'auto',
-                                            bgcolor: 'rgba(249, 115, 22, 0.06)',
-                                            border: '1px solid rgba(249, 115, 22, 0.2)',
-                                            position: 'relative',
-                                        }}
-                                    >
-                                        {!transcriptText && !micError && (
-                                            <Stack
-                                                spacing={0.8}
-                                                alignItems="center"
-                                                justifyContent="center"
-                                                sx={{
-                                                    position: 'absolute',
-                                                    inset: 0,
-                                                    pointerEvents: 'none',
-                                                    color: 'rgba(107, 114, 128, 0.35)',
-                                                }}
-                                            >
-                                                <Mic sx={{ fontSize: 34 }} />
-                                                <Typography variant="caption" sx={{ letterSpacing: '0.05em' }}>
-                                                    Live transcript waits for your voice
-                                                </Typography>
+                                            </Box>
+                                            <Stack direction="row" spacing={0.6} useFlexGap flexWrap="wrap" alignItems="center">
+                                                {hintLevel > 0 && <Chip size="small" label={`L${hintLevel}`} color="secondary" variant="outlined" />}
+                                                <Button size="small" variant="outlined" onClick={requestHint}>
+                                                    Refresh
+                                                </Button>
+                                                <Button size="small" variant="text" onClick={() => setShowHintDetails((prev) => !prev)}>
+                                                    {showHintDetails ? 'Less' : 'Details'}
+                                                </Button>
                                             </Stack>
+                                        </Stack>
+
+                                        {hintNextStep && (
+                                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                <strong>Next:</strong> {hintNextStep}
+                                            </Typography>
                                         )}
-                                        <Typography
-                                            variant="body2"
-                                            sx={{
-                                                color: transcriptText ? 'text.primary' : 'text.secondary',
-                                                whiteSpace: 'pre-wrap',
-                                                overflowWrap: 'anywhere',
-                                                position: 'relative',
-                                                zIndex: 1,
-                                            }}
-                                        >
-                                            {transcriptText}
-                                        </Typography>
+
+                                        {showHintDetails && (
+                                            <Paper elevation={0} sx={{ mt: 1, p: 1.1, borderStyle: 'dashed' }}>
+                                                {hintFramework && (
+                                                    <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}>
+                                                        Framework: {hintFramework}
+                                                    </Typography>
+                                                )}
+                                                {hintStarter && (
+                                                    <Typography variant="body2" sx={{ mb: 0.7 }}>
+                                                        <strong>Starter:</strong> "{hintStarter}"
+                                                    </Typography>
+                                                )}
+                                                {hintMustMention.length > 0 && (
+                                                    <Stack direction="row" spacing={0.6} useFlexGap flexWrap="wrap" sx={{ mb: 0.7 }}>
+                                                        {hintMustMention.map((point) => (
+                                                            <Chip key={point} size="small" label={point} variant="outlined" />
+                                                        ))}
+                                                    </Stack>
+                                                )}
+                                                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                    <strong>Avoid:</strong> {hintAvoid || 'Stay concrete and include one clear outcome.'}
+                                                </Typography>
+                                            </Paper>
+                                        )}
                                     </Paper>
-                                </Stack>
-                            ) : (
-                                <TextField
-                                    fullWidth
-                                    multiline
-                                    minRows={8}
-                                    value={draft}
-                                    onChange={(e) => setDraft(e.target.value)}
-                                    placeholder="Type your answer..."
-                                />
+                                </Fade>
                             )}
 
-                            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} justifyContent="space-between" sx={{ mt: 1.4 }}>
-                                <Button
-                                    variant="outlined"
-                                    startIcon={<SkipNext />}
-                                    onClick={handleSkip}
-                                    disabled={answerSubmitPending}
-                                >
-                                    Skip Question
-                                </Button>
-                                <Button
-                                    variant="contained"
-                                    startIcon={answerSubmitPending ? <CircularProgress size={14} color="inherit" /> : <Send />}
-                                    onClick={handleSubmit}
-                                    disabled={submitDisabled}
-                                >
-                                    {answerSubmitPending
-                                        ? 'Submitting...'
-                                        : inputMode === 'record'
-                                            ? 'Submit Transcript'
-                                            : 'Submit Answer'}
-                                </Button>
-                            </Stack>
-                        </Paper>
+                            {!showTipsPanel && !isCoachSession && (
+                                <Paper sx={{ p: 1.2, bgcolor: darkMode ? 'rgba(245,158,11,0.05)' : 'rgba(249,115,22,0.05)' }}>
+                                    <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} alignItems={{ sm: 'center' }}>
+                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                            Need help? Enable hints for one focused coaching prompt.
+                                        </Typography>
+                                        <Button
+                                            size="small"
+                                            variant="outlined"
+                                            color="secondary"
+                                            startIcon={<LightbulbOutlined />}
+                                            onClick={handleToggleHintsPanel}
+                                        >
+                                            Enable Coach Hints
+                                        </Button>
+                                    </Stack>
+                                </Paper>
+                            )}
+
+                            <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
+                                <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1} sx={{ mb: 1.1 }}>
+                                    <Typography variant="h6">Your Answer</Typography>
+                                    <Tabs
+                                        value={inputMode}
+                                        onChange={handleModeChange}
+                                        textColor="secondary"
+                                        indicatorColor="secondary"
+                                        sx={{ minHeight: 34, '& .MuiTab-root': { minHeight: 34, px: 1.6 } }}
+                                    >
+                                        <Tab icon={<GraphicEq sx={{ fontSize: 18 }} />} iconPosition="start" value="record" label="Record" />
+                                        <Tab icon={<EditNote sx={{ fontSize: 18 }} />} iconPosition="start" value="type" label="Type" />
+                                    </Tabs>
+                                </Stack>
+
+                                {inputMode === 'record' ? (
+                                    <Stack spacing={1.2}>
+                                        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ sm: 'center' }}>
+                                            <Button
+                                                variant={isMicRecording ? 'contained' : 'outlined'}
+                                                color={isMicRecording ? 'error' : 'primary'}
+                                                startIcon={isMicRecording ? <MicOff /> : <Mic />}
+                                                onClick={isMicRecording ? () => stopRecording(true) : startRecording}
+                                                disabled={isMicStarting}
+                                            >
+                                                {isMicStarting
+                                                    ? 'Starting...'
+                                                    : isMicRecording
+                                                        ? 'Stop Recording'
+                                                        : 'Start Recording'}
+                                            </Button>
+                                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                {isMicRecording ? 'Listening' : isMicStarting ? 'Starting mic' : 'Recorder idle'} • Auto-stop after {silenceAutoStopSeconds.toFixed(1)}s of silence
+                                            </Typography>
+                                        </Stack>
+
+                                        {micError && (
+                                            <Typography variant="body2" color="error">
+                                                {micError}
+                                            </Typography>
+                                        )}
+
+                                        <Paper
+                                            elevation={0}
+                                            sx={{
+                                                p: 1.2,
+                                                minHeight: 140,
+                                                maxHeight: 220,
+                                                overflowY: 'auto',
+                                                bgcolor: 'rgba(249, 115, 22, 0.06)',
+                                                border: '1px solid rgba(249, 115, 22, 0.2)',
+                                                position: 'relative',
+                                            }}
+                                        >
+                                            {!transcriptText && !micError && (
+                                                <Stack
+                                                    spacing={0.8}
+                                                    alignItems="center"
+                                                    justifyContent="center"
+                                                    sx={{
+                                                        position: 'absolute',
+                                                        inset: 0,
+                                                        pointerEvents: 'none',
+                                                        color: 'rgba(107, 114, 128, 0.35)',
+                                                    }}
+                                                >
+                                                    <Mic sx={{ fontSize: 34 }} />
+                                                    <Typography variant="caption" sx={{ letterSpacing: '0.05em' }}>
+                                                        Live transcript waits for your voice
+                                                    </Typography>
+                                                </Stack>
+                                            )}
+                                            <Typography
+                                                variant="body2"
+                                                sx={{
+                                                    color: transcriptText ? 'text.primary' : 'text.secondary',
+                                                    whiteSpace: 'pre-wrap',
+                                                    overflowWrap: 'anywhere',
+                                                    position: 'relative',
+                                                    zIndex: 1,
+                                                }}
+                                            >
+                                                {transcriptText}
+                                            </Typography>
+                                        </Paper>
+                                    </Stack>
+                                ) : (
+                                    <TextField
+                                        fullWidth
+                                        multiline
+                                        minRows={8}
+                                        value={draft}
+                                        onChange={(e) => setDraft(e.target.value)}
+                                        placeholder="Type your answer..."
+                                    />
+                                )}
+
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} justifyContent="space-between" sx={{ mt: 1.4 }}>
+                                    <Button
+                                        variant="outlined"
+                                        startIcon={<SkipNext />}
+                                        onClick={handleSkip}
+                                        disabled={answerSubmitPending}
+                                    >
+                                        Skip Question
+                                    </Button>
+                                    <Button
+                                        variant="contained"
+                                        startIcon={answerSubmitPending ? <CircularProgress size={14} color="inherit" /> : <Send />}
+                                        onClick={handleSubmit}
+                                        disabled={submitDisabled}
+                                    >
+                                        {answerSubmitPending
+                                            ? 'Submitting...'
+                                            : inputMode === 'record'
+                                                ? 'Submit Transcript'
+                                                : 'Submit Answer'}
+                                    </Button>
+                                </Stack>
+                            </Paper></>)}
                     </Stack>
                 </Container>
             </Box>

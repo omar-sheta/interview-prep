@@ -13,6 +13,7 @@ from typing import Any, Optional
 from pypdf import PdfReader
 
 from server.services.llm_factory import get_chat_model
+from server.config import settings
 from langchain_core.messages import HumanMessage, SystemMessage
 
 
@@ -26,10 +27,12 @@ def clean_json_output(text: str) -> str:
     """
     # Strip <think>...</think> blocks (qwen3 reasoning traces)
     text = re.sub(r'<think>[\s\S]*?</think>', '', text)
+    
+    # Strip DeepSeek/LM Studio style "Thinking Process:" blocks
+    text = re.sub(r'(?i)(?:Thinking|Reasoning)\s+Process:.*?(\n\s*\{|\n\s*\[)', r'\1', text, flags=re.DOTALL)
 
     # Remove markdown code blocks
-    text = re.sub(r'```json\s*', '', text)
-    text = re.sub(r'```\s*', '', text)
+    text = re.sub(r'```(?:json)?\s*([\s\S]*?)```', r'\1', text)
     text = text.strip()
     
     # Remove single-line comments (// ...)
@@ -41,10 +44,10 @@ def clean_json_output(text: str) -> str:
     # Fix common LLM mistakes
     text = re.sub(r'"null"', 'null', text)
     
-    # Try to extract JSON object
-    json_match = re.search(r'\{[\s\S]*\}', text)
+    # Try to extract the first JSON object or array
+    json_match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', text)
     if json_match:
-        return json_match.group()
+        return json_match.group(1)
     
     return text
 
@@ -197,8 +200,13 @@ async def parse_resume_node(
     
     # Generate response (proper async call)
     try:
-        result = await chat_model.ainvoke(messages)
+        result = await chat_model.ainvoke(
+            messages,
+            json_mode=True,
+            max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
+        )
         response_text = result.content
+        print(f"RAW RESUME PARSE RESPONSE:\n{response_text[:800]}...\n")
         
         # Parse JSON
         parsed = parse_json_safely(response_text)
@@ -250,6 +258,261 @@ def extract_capitalized_phrases(text: str) -> list[str]:
 def parse_resume_sync(resume_bytes: bytes, mime_type: str = "application/pdf") -> dict:
     """Synchronous wrapper."""
     return asyncio.run(parse_resume_node(resume_bytes, mime_type))
+
+
+# ============== Mega-Prompt: Combined Resume + Job Analysis ==============
+
+MEGA_ANALYSIS_SYSTEM_PROMPT = """You are a Senior Career Analyst and Technical Recruiter.
+You will receive a candidate's resume text, a target job title, company, and optionally a job description.
+
+Perform ALL of the following in a SINGLE response:
+1. Parse the resume into structured data
+2. Identify required skills for the target role
+3. Match candidate skills against requirements
+4. Score readiness
+
+You MUST respond with ONLY valid JSON. Use this EXACT structure:
+
+{
+  "personal_info": {
+    "name": "string or null",
+    "email": "string or null",
+    "phone": "string or null",
+    "location": "string or null"
+  },
+  "summary": "1-2 sentence professional summary",
+  "skills": {
+    "hard_skills": ["core professional skills"],
+    "tools_and_tech": ["software, tools, frameworks"],
+    "soft_skills": ["interpersonal skills"],
+    "certifications": ["certifications or licenses"]
+  },
+  "experience": [
+    {
+      "company": "string",
+      "title": "string",
+      "duration": "string",
+      "responsibilities": ["key achievements"],
+      "skills_used": ["skills applied"]
+    }
+  ],
+  "education": [
+    {
+      "institution": "string",
+      "degree": "string",
+      "field": "string",
+      "year": "string or null"
+    }
+  ],
+  "years_of_experience": 0,
+  "job_requirements": {
+    "must_have_skills": ["10 essential skills for the target role"],
+    "nice_to_have_skills": ["5 beneficial but not required skills"],
+    "core_responsibilities": ["5 main job responsibilities"],
+    "career_level": "entry/mid/senior/staff/principal",
+    "interview_focus_areas": ["3-5 areas covered in interviews"]
+  },
+  "skill_analysis": [
+    {
+      "skill": "skill name",
+      "priority": "must_have or nice_to_have",
+      "status": "strong_match or partial_match or missing",
+      "candidate_level": "none/basic/intermediate/advanced/expert",
+      "required_level": "basic/intermediate/advanced/expert",
+      "evidence": "specific evidence from resume, or empty string",
+      "confidence": 0.8
+    }
+  ],
+  "readiness_score": 0.65,
+  "top_gaps": ["skill1", "skill2", "skill3"]
+}
+
+RULES:
+1. RAW JSON only. No markdown, no explanations.
+2. skill_analysis MUST cover ALL must_have_skills and nice_to_have_skills.
+3. readiness_score is 0.0-1.0 based on skill coverage.
+4. top_gaps lists the 3-6 most critical missing or weak skills.
+5. Be specific with evidence — cite actual resume content.
+6. status meanings: strong_match = clearly demonstrated, partial_match = some evidence but weak, missing = no evidence found."""
+
+
+async def analyze_resume_and_job(
+    resume_text: str,
+    job_title: str,
+    company: str = "a top tech company",
+    job_description: str = "",
+) -> dict:
+    """
+    Single mega-prompt that combines resume parsing + job analysis + skill matching.
+    Uses LM Studio's constrained decoding (json_schema) to guarantee valid JSON.
+    Replaces 5 separate LLM calls with 1.
+    """
+    chat_model = get_chat_model()
+
+    user_content = f"Target Role: {job_title}\nCompany: {company}\n"
+    if job_description and job_description.strip():
+        user_content += f"\nJOB DESCRIPTION:\n{job_description[:2000]}\n"
+    user_content += f"\nRESUME:\n{resume_text[:4000]}"
+
+    messages = [
+        SystemMessage(content=MEGA_ANALYSIS_SYSTEM_PROMPT),
+        HumanMessage(content=user_content),
+    ]
+
+    # Hand-crafted JSON schema for LM Studio constrained decoding.
+    # Kept intentionally flat to avoid schema-complexity issues.
+    mega_schema = {
+        "name": "career_analysis",
+        "type": "object",
+        "properties": {
+            "personal_info": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "email": {"type": "string"},
+                    "phone": {"type": "string"},
+                    "location": {"type": "string"},
+                },
+                "required": ["name", "email", "phone", "location"],
+                "additionalProperties": False,
+            },
+            "summary": {"type": "string"},
+            "skills": {
+                "type": "object",
+                "properties": {
+                    "hard_skills": {"type": "array", "items": {"type": "string"}},
+                    "tools_and_tech": {"type": "array", "items": {"type": "string"}},
+                    "soft_skills": {"type": "array", "items": {"type": "string"}},
+                    "certifications": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["hard_skills", "tools_and_tech", "soft_skills", "certifications"],
+                "additionalProperties": False,
+            },
+            "experience": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "company": {"type": "string"},
+                        "title": {"type": "string"},
+                        "duration": {"type": "string"},
+                        "responsibilities": {"type": "array", "items": {"type": "string"}},
+                        "skills_used": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["company", "title", "duration", "responsibilities", "skills_used"],
+                    "additionalProperties": False,
+                },
+            },
+            "education": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "institution": {"type": "string"},
+                        "degree": {"type": "string"},
+                        "field": {"type": "string"},
+                        "year": {"type": "string"},
+                    },
+                    "required": ["institution", "degree", "field", "year"],
+                    "additionalProperties": False,
+                },
+            },
+            "years_of_experience": {"type": "number"},
+            "job_requirements": {
+                "type": "object",
+                "properties": {
+                    "must_have_skills": {"type": "array", "items": {"type": "string"}},
+                    "nice_to_have_skills": {"type": "array", "items": {"type": "string"}},
+                    "core_responsibilities": {"type": "array", "items": {"type": "string"}},
+                    "career_level": {"type": "string"},
+                    "interview_focus_areas": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["must_have_skills", "nice_to_have_skills", "core_responsibilities", "career_level", "interview_focus_areas"],
+                "additionalProperties": False,
+            },
+            "skill_analysis": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "skill": {"type": "string"},
+                        "priority": {"type": "string"},
+                        "status": {"type": "string"},
+                        "candidate_level": {"type": "string"},
+                        "required_level": {"type": "string"},
+                        "evidence": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["skill", "priority", "status", "candidate_level", "required_level", "evidence", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+            "readiness_score": {"type": "number"},
+            "top_gaps": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "personal_info", "summary", "skills", "experience", "education",
+            "years_of_experience", "job_requirements", "skill_analysis",
+            "readiness_score", "top_gaps",
+        ],
+        "additionalProperties": False,
+    }
+
+    try:
+        result = await chat_model.ainvoke(
+            messages,
+            json_schema=mega_schema,
+            max_tokens=int(getattr(settings, "LLM_JSON_MAX_TOKENS", 6000)),
+        )
+        response_text = result.content
+        print(f"📊 MEGA ANALYSIS RESPONSE ({len(response_text)} chars):\n{response_text[:500]}...\n")
+
+        parsed = parse_json_safely(response_text)
+        if parsed and isinstance(parsed, dict):
+            # Ensure all top-level keys exist with defaults
+            parsed.setdefault("personal_info", {})
+            parsed.setdefault("summary", "")
+            parsed.setdefault("skills", {"hard_skills": [], "tools_and_tech": [], "soft_skills": []})
+            parsed.setdefault("experience", [])
+            parsed.setdefault("education", [])
+            parsed.setdefault("years_of_experience", 0)
+            parsed.setdefault("job_requirements", {
+                "must_have_skills": [],
+                "nice_to_have_skills": [],
+                "core_responsibilities": [],
+            })
+            parsed.setdefault("skill_analysis", [])
+            parsed.setdefault("readiness_score", 0.5)
+            parsed.setdefault("top_gaps", [])
+            return parsed
+
+    except Exception as e:
+        print(f"❌ Mega analysis LLM error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Fallback: return minimal structure
+    print("⚠️ Mega analysis failed, using empty fallback")
+    return {
+        "personal_info": {},
+        "summary": "Could not fully parse resume via AI",
+        "skills": {"hard_skills": extract_capitalized_phrases(resume_text), "tools_and_tech": [], "soft_skills": []},
+        "experience": [],
+        "education": [],
+        "years_of_experience": 0,
+        "job_requirements": {
+            "job_title": job_title,
+            "company": company,
+            "must_have_skills": [],
+            "nice_to_have_skills": [],
+            "core_responsibilities": [],
+        },
+        "skill_analysis": [],
+        "readiness_score": 0.5,
+        "top_gaps": [],
+    }
+
+
 # ============== Skill Extraction Utilities ==============
 
 def get_all_skills(resume_data: dict) -> set[str]:
