@@ -32,6 +32,7 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
+import { getQuestionAudioContext } from '@/lib/questionAudio';
 
 const DEFAULT_SILENCE_AUTO_STOP_SECONDS = 5.0;
 const DEFAULT_SILENCE_RMS_THRESHOLD = 0.008;
@@ -61,6 +62,25 @@ function bytesToBase64(bytes) {
     return window.btoa(binary);
 }
 
+function base64ToBytes(base64) {
+    const binary = window.atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
+function pcm16Base64ToFloat32(base64) {
+    const bytes = base64ToBytes(base64);
+    const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+    const floats = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i += 1) {
+        floats[i] = int16[i] / 32768;
+    }
+    return floats;
+}
+
 function normalizeHintList(value, limit = 3) {
     if (!Array.isArray(value)) return [];
     return value
@@ -87,7 +107,9 @@ export default function InterviewView() {
         forceTranscribe,
         setRecording,
         ttsAudioQueue,
+        ttsStreamQueue,
         popAudio,
+        popTtsStreamChunk,
         darkMode,
         recordingThresholds,
         interviewMode,
@@ -109,6 +131,7 @@ export default function InterviewView() {
     const [questionAudioBlocked, setQuestionAudioBlocked] = useState(false);
     const [questionAudioPlaying, setQuestionAudioPlaying] = useState(false);
     const [pendingQuestionAudio, setPendingQuestionAudio] = useState(null);
+    const [pendingQuestionStreamChunk, setPendingQuestionStreamChunk] = useState(null);
 
     const isRecordingRef = useRef(false);
     const streamRef = useRef(null);
@@ -119,6 +142,11 @@ export default function InterviewView() {
     const recordingEpochRef = useRef(0);
     const questionAudioRef = useRef(null);
     const questionAudioPlayingRef = useRef(false);
+    const ttsPlaybackContextRef = useRef(null);
+    const ttsScheduledSourcesRef = useRef([]);
+    const ttsNextPlaybackTimeRef = useRef(0);
+    const ttsPlaybackQuestionRef = useRef(null);
+    const ttsPlaybackEndTimerRef = useRef(null);
     const autoHintQuestionRef = useRef(0);
     const silenceAutoStopSeconds = Math.max(
         1,
@@ -265,6 +293,41 @@ export default function InterviewView() {
         }
     }, [isMicStarting, sendAudioChunk, setRecording, silenceAutoStopMs, silenceRmsThreshold, stopRecording]);
 
+    const ensureQuestionPlaybackContext = useCallback(async () => {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return null;
+
+        let audioContext = ttsPlaybackContextRef.current || getQuestionAudioContext();
+        if (!audioContext || audioContext.state === 'closed') {
+            audioContext = new AudioCtx();
+            window.__beePreparedQuestionAudioContext = audioContext;
+            ttsPlaybackContextRef.current = audioContext;
+        }
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+        ttsPlaybackContextRef.current = audioContext;
+        return audioContext;
+    }, []);
+
+    const scheduleQuestionAudioFinish = useCallback(() => {
+        if (ttsPlaybackEndTimerRef.current) {
+            window.clearTimeout(ttsPlaybackEndTimerRef.current);
+            ttsPlaybackEndTimerRef.current = null;
+        }
+
+        const audioContext = ttsPlaybackContextRef.current;
+        const remainingMs = audioContext
+            ? Math.max(80, ((ttsNextPlaybackTimeRef.current - audioContext.currentTime) * 1000) + 250)
+            : 250;
+
+        ttsPlaybackEndTimerRef.current = window.setTimeout(() => {
+            setQuestionAudioPlaying(false);
+            questionAudioPlayingRef.current = false;
+            ttsPlaybackQuestionRef.current = null;
+        }, remainingMs);
+    }, []);
+
     const stopQuestionAudio = useCallback(() => {
         const audio = questionAudioRef.current;
         if (audio) {
@@ -272,6 +335,26 @@ export default function InterviewView() {
             audio.src = '';
             questionAudioRef.current = null;
         }
+        if (ttsPlaybackEndTimerRef.current) {
+            window.clearTimeout(ttsPlaybackEndTimerRef.current);
+            ttsPlaybackEndTimerRef.current = null;
+        }
+        for (const source of ttsScheduledSourcesRef.current) {
+            try {
+                source.stop(0);
+            } catch (_) {
+                // Source may already be finished; safe to ignore.
+            }
+            try {
+                source.disconnect();
+            } catch (_) {
+                // Already disconnected.
+            }
+        }
+        ttsScheduledSourcesRef.current = [];
+        ttsPlaybackContextRef.current = getQuestionAudioContext() || ttsPlaybackContextRef.current;
+        ttsNextPlaybackTimeRef.current = 0;
+        ttsPlaybackQuestionRef.current = null;
         setQuestionAudioPlaying(false);
         questionAudioPlayingRef.current = false;
     }, []);
@@ -321,6 +404,65 @@ export default function InterviewView() {
         }
     }, [stopQuestionAudio]);
 
+    const playQuestionStreamChunk = useCallback(async (chunkPayload) => {
+        if (!chunkPayload?.audio) return false;
+
+        try {
+            const questionIndex = Number.isInteger(chunkPayload.question_index)
+                ? Number(chunkPayload.question_index)
+                : null;
+            const chunkIndex = Number(chunkPayload.chunk_index || 0);
+            const audioContext = await ensureQuestionPlaybackContext();
+            if (!audioContext) return false;
+
+            if (chunkIndex === 0 || (questionIndex !== null && ttsPlaybackQuestionRef.current !== questionIndex)) {
+                stopQuestionAudio();
+                const refreshedContext = await ensureQuestionPlaybackContext();
+                if (!refreshedContext) return false;
+                ttsPlaybackQuestionRef.current = questionIndex;
+            }
+
+            const activeContext = ttsPlaybackContextRef.current;
+            if (!activeContext) return false;
+
+            const samples = pcm16Base64ToFloat32(chunkPayload.audio);
+            const sampleRate = Math.max(1, Number(chunkPayload.sample_rate || 24000));
+            const audioBuffer = activeContext.createBuffer(1, samples.length, sampleRate);
+            audioBuffer.copyToChannel(samples, 0);
+
+            const source = activeContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(activeContext.destination);
+
+            const startAt = Math.max(
+                activeContext.currentTime + 0.03,
+                ttsNextPlaybackTimeRef.current || (activeContext.currentTime + 0.03),
+            );
+            ttsNextPlaybackTimeRef.current = startAt + audioBuffer.duration;
+            source.onended = () => {
+                ttsScheduledSourcesRef.current = ttsScheduledSourcesRef.current.filter((item) => item !== source);
+                try {
+                    source.disconnect();
+                } catch (_) {
+                    // Already disconnected.
+                }
+            };
+            ttsScheduledSourcesRef.current.push(source);
+            source.start(startAt);
+
+            setQuestionAudioPlaying(true);
+            questionAudioPlayingRef.current = true;
+
+            if (chunkPayload.is_final) {
+                scheduleQuestionAudioFinish();
+            }
+            return true;
+        } catch (err) {
+            console.error('[TTS] Stream chunk playback failed:', err);
+            return false;
+        }
+    }, [ensureQuestionPlaybackContext, scheduleQuestionAudioFinish, stopQuestionAudio]);
+
     useEffect(() => {
         console.log('[TTS] Playback effect: enabled=', questionAudioEnabled, 'playing=', questionAudioPlaying, 'queueLen=', ttsAudioQueue.length, 'pending=', !!pendingQuestionAudio);
         if (!questionAudioEnabled || questionAudioPlaying) return;
@@ -347,16 +489,42 @@ export default function InterviewView() {
     }, [pendingQuestionAudio, playQuestionAudio, popAudio, questionAudioEnabled, questionAudioPlaying, ttsAudioQueue]);
 
     useEffect(() => {
-        if (!questionAudioBlocked || !questionAudioEnabled || !pendingQuestionAudio) return;
+        if (!questionAudioEnabled) return;
+
+        const nextChunk = pendingQuestionStreamChunk || popTtsStreamChunk();
+        if (!nextChunk) return;
+
+        let isMounted = true;
+        playQuestionStreamChunk(nextChunk).then((started) => {
+            if (!isMounted) return;
+            if (started) {
+                setQuestionAudioBlocked(false);
+                setPendingQuestionStreamChunk(null);
+            } else {
+                setQuestionAudioBlocked(true);
+                setPendingQuestionStreamChunk(nextChunk);
+            }
+        });
+
+        return () => {
+            isMounted = false;
+        };
+    }, [pendingQuestionStreamChunk, playQuestionStreamChunk, popTtsStreamChunk, questionAudioEnabled, ttsStreamQueue]);
+
+    useEffect(() => {
+        if (!questionAudioBlocked || !questionAudioEnabled || (!pendingQuestionAudio && !pendingQuestionStreamChunk)) return;
 
         let cancelled = false;
         const tryPlay = async () => {
             if (cancelled) return;
-            const started = await playQuestionAudio(pendingQuestionAudio);
+            const started = pendingQuestionStreamChunk
+                ? await playQuestionStreamChunk(pendingQuestionStreamChunk)
+                : await playQuestionAudio(pendingQuestionAudio);
             if (cancelled) return;
             if (started) {
                 setQuestionAudioBlocked(false);
                 setPendingQuestionAudio(null);
+                setPendingQuestionStreamChunk(null);
             }
         };
 
@@ -371,7 +539,14 @@ export default function InterviewView() {
             window.removeEventListener('pointerdown', onUserInteract);
             window.removeEventListener('keydown', onUserInteract);
         };
-    }, [pendingQuestionAudio, playQuestionAudio, questionAudioBlocked, questionAudioEnabled]);
+    }, [
+        pendingQuestionAudio,
+        pendingQuestionStreamChunk,
+        playQuestionAudio,
+        playQuestionStreamChunk,
+        questionAudioBlocked,
+        questionAudioEnabled,
+    ]);
 
     useEffect(() => {
         if (coachingEnabled) {
@@ -392,6 +567,12 @@ export default function InterviewView() {
         const timer = setTimeout(() => requestHint(), 280);
         return () => clearTimeout(timer);
     }, [coachingEnabled, questionNumber, requestHint, showTipsPanel]);
+
+    useEffect(() => {
+        setPendingQuestionAudio(null);
+        setPendingQuestionStreamChunk(null);
+        stopQuestionAudio();
+    }, [questionNumber, stopQuestionAudio]);
 
     useEffect(() => () => stopRecording(false), [stopRecording]);
     useEffect(() => () => stopQuestionAudio(), [stopQuestionAudio]);
@@ -477,15 +658,19 @@ export default function InterviewView() {
         if (!next) {
             stopQuestionAudio();
             setQuestionAudioBlocked(false);
+            setPendingQuestionAudio(null);
+            setPendingQuestionStreamChunk(null);
         }
     };
 
     const handleRetryQuestionAudio = async () => {
-        if (!pendingQuestionAudio) return;
-        const started = await playQuestionAudio(pendingQuestionAudio);
+        const started = pendingQuestionStreamChunk
+            ? await playQuestionStreamChunk(pendingQuestionStreamChunk)
+            : (pendingQuestionAudio ? await playQuestionAudio(pendingQuestionAudio) : false);
         if (started) {
             setQuestionAudioBlocked(false);
             setPendingQuestionAudio(null);
+            setPendingQuestionStreamChunk(null);
             return;
         }
         setQuestionAudioBlocked(true);

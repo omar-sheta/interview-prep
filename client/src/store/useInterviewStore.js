@@ -98,6 +98,7 @@ const useInterviewStore = create(
             lastTranscript: '', // New: For tracking latest speech chunk
             currentTokens: '',
             ttsAudioQueue: [],
+            ttsStreamQueue: [],
             isRecording: false,
             interviewPhase: 'warmup',
 
@@ -519,6 +520,7 @@ const useInterviewStore = create(
                         coachingHint: null,
                         answerSubmitPending: false,
                         ttsAudioQueue: [],
+                        ttsStreamQueue: [],
                     });
                     get().addThinking(`❓ Question ${data.question_number}: ${data.question.text}`);
 
@@ -620,6 +622,33 @@ const useInterviewStore = create(
                         }));
                         console.log('[TTS] Audio queued, queue length:', get().ttsAudioQueue.length);
                         get().addThinking('🔊 Playing interviewer audio');
+                    }
+                });
+
+                onSafe('tts_audio_chunk', (data) => {
+                    if (!data?.audio) return;
+                    const qIdx = Number.isInteger(data.question_index)
+                        ? Number(data.question_index)
+                        : null;
+                    if (qIdx !== null) {
+                        const currentQ = Number(get().questionNumber || 0);
+                        if (currentQ > 0 && qIdx !== (currentQ - 1)) {
+                            console.log('[TTS] DROPPED stale stream chunk');
+                            return;
+                        }
+                    }
+
+                    set((state) => ({
+                        ttsStreamQueue: [...state.ttsStreamQueue, {
+                            audio: data.audio,
+                            sample_rate: Number(data.sample_rate || 24000),
+                            question_index: qIdx,
+                            chunk_index: Number(data.chunk_index || 0),
+                            is_final: Boolean(data.is_final),
+                        }],
+                    }));
+                    if (Number(data.chunk_index || 0) === 0) {
+                        get().addThinking('🔊 Streaming interviewer audio');
                     }
                 });
 
@@ -951,6 +980,7 @@ const useInterviewStore = create(
                     answerSubmitPending: false,
                     currentSessionId: null,
                     ttsAudioQueue: [],
+                    ttsStreamQueue: [],
                 });
                 get().addThinking('⏳ Generating interview questions...');
                 socket.emit('start_interview', params);
@@ -1001,6 +1031,15 @@ const useInterviewStore = create(
                 return first;
             },
 
+            popTtsStreamChunk: () => {
+                const { ttsStreamQueue } = get();
+                if (ttsStreamQueue.length === 0) return null;
+
+                const [first, ...rest] = ttsStreamQueue;
+                set({ ttsStreamQueue: rest });
+                return first;
+            },
+
             // Set recording state and sync to server so backend can gate audio chunks.
             setRecording: (isRecording) => {
                 const { socket } = get();
@@ -1033,6 +1072,7 @@ const useInterviewStore = create(
                 lastTranscript: '',
                 currentTokens: '',
                 ttsAudioQueue: [],
+                ttsStreamQueue: [],
                 analysisProgress: '',
                 targetRole: '',
                 targetCompany: '',
@@ -1119,6 +1159,7 @@ const useInterviewStore = create(
                 lastTranscript: '',
                 currentTokens: '',
                 ttsAudioQueue: [],
+                ttsStreamQueue: [],
                 isRecording: false,
                 interviewActive: false,
                 interviewMode: 'practice',
@@ -1343,6 +1384,7 @@ const useInterviewStore = create(
                     lastTranscript: '',
                     currentTokens: '',
                     ttsAudioQueue: [],
+                    ttsStreamQueue: [],
                     isRecording: false,
                     interviewActive: false,
                     interviewMode: 'practice',

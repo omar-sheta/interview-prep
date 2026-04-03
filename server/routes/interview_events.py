@@ -88,6 +88,8 @@ def register_interview_events(sio, deps):
             pass
         except Exception as exc:
             print(f"⚠️ TTS pre-fetch failed (q_index={question_index}): {exc}")
+        finally:
+            session.tts_prefetch_tasks.pop(question_index, None)
 
     async def send_question_tts(session, question_text: str, question_index: Optional[int] = None):
         """Generate TTS audio for an interview question and send to client asynchronously."""
@@ -104,31 +106,63 @@ def register_interview_events(sio, deps):
                 print(f"⚡ TTS cache hit (q_index={question_index}, chars={len(question_text or '')})")
                 audio_b64 = cached
             else:
-                print(
-                    f"🔈 Generating question TTS (q_index={question_index}, chars={len(question_text or '')}, "
-                    f"provider={tts_provider}, style={tts_style})"
-                )
-                audio_b64 = await asyncio.wait_for(
-                    tts_service.speak_wav_base64_async(question_text, style=tts_style, provider=tts_provider),
-                    timeout=tts_timeout,
-                )
+                if tts_service.supports_streaming(tts_provider):
+                    print(
+                        f"🔈 Streaming question TTS (q_index={question_index}, chars={len(question_text or '')}, "
+                        f"provider={tts_provider}, style={tts_style})"
+                    )
+                    async with asyncio.timeout(tts_timeout):
+                        async for chunk in tts_service.stream_pcm_base64_chunks_async(
+                            question_text,
+                            style=tts_style,
+                            provider=tts_provider,
+                        ):
+                            if not session.interview_active:
+                                return
+                            if question_index is not None and session.current_question_index != question_index:
+                                return
+                            await sio.emit(
+                                "tts_audio_chunk",
+                                {
+                                    "audio": chunk["audio"],
+                                    "format": "pcm16",
+                                    "sample_rate": chunk["sample_rate"],
+                                    "question_index": question_index,
+                                    "chunk_index": chunk["chunk_index"],
+                                    "is_final": chunk["is_final"],
+                                    "user_id": session.user_id,
+                                },
+                                room=str(session.user_id),
+                            )
+                    print(f"🔊 Streamed TTS sent for question ({len(question_text)} chars)")
+                    audio_b64 = None
+                else:
+                    print(
+                        f"🔈 Generating question TTS (q_index={question_index}, chars={len(question_text or '')}, "
+                        f"provider={tts_provider}, style={tts_style})"
+                    )
+                    audio_b64 = await asyncio.wait_for(
+                        tts_service.speak_wav_base64_async(question_text, style=tts_style, provider=tts_provider),
+                        timeout=tts_timeout,
+                    )
 
             if not session.interview_active:
                 return
             if question_index is not None and session.current_question_index != question_index:
                 return
-            await sio.emit(
-                "tts_audio",
-                {
-                    "audio": audio_b64,
-                    "format": "wav",
-                    "sample_rate": tts_service.sample_rate_for_provider(tts_provider),
-                    "question_index": question_index,
-                    "user_id": session.user_id,
-                },
-                room=str(session.user_id),
-            )
-            print(f"🔊 TTS sent for question ({len(question_text)} chars)")
+            if audio_b64:
+                await sio.emit(
+                    "tts_audio",
+                    {
+                        "audio": audio_b64,
+                        "format": "wav",
+                        "sample_rate": tts_service.sample_rate_for_provider(tts_provider),
+                        "question_index": question_index,
+                        "user_id": session.user_id,
+                    },
+                    room=str(session.user_id),
+                )
+                print(f"🔊 TTS sent for question ({len(question_text)} chars)")
 
             # Pre-fetch next question TTS in the background
             if question_index is not None:

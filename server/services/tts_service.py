@@ -3,7 +3,7 @@ TTS Service for BeePrepared.
 
 Supported user-selectable providers:
 - Piper (CLI, ONNX voices including high-quality models)
-- Qwen3-TTS CUDA (qwen-tts package, Hugging Face model on NVIDIA GPUs)
+- Qwen3-TTS CUDA (official qwen-tts or faster-qwen3-tts acceleration on NVIDIA GPUs)
 
 Fallback backends: NeuTTS Air (Neuphonic), Kokoro-82M via PyTorch (optional)
 """
@@ -15,7 +15,7 @@ import json
 import shutil
 import subprocess
 import tempfile
-from typing import Optional
+from typing import Any, Optional
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +44,7 @@ _piper_binary = ""
 _qwen3_tts_model = None
 _qwen3_tts_sample_rate = 24000
 _qwen3_tts_disabled_reason = ""
+_qwen3_tts_backend_variant = ""
 
 TTS_BACKEND = os.getenv("TTS_BACKEND", "piper").strip().lower()
 TTS_ALLOW_FALLBACK = os.getenv("TTS_ALLOW_FALLBACK", "1").lower() in {"1", "true", "yes", "on"}
@@ -88,6 +89,11 @@ QWEN3_TTS_INSTRUCT = os.getenv(
     "QWEN3_TTS_INSTRUCT",
     "Professional and clear."
 ).strip()
+QWEN3_TTS_ENGINE = os.getenv("QWEN3_TTS_ENGINE", "auto").strip().lower()
+QWEN3_TTS_STREAMING_ENABLED = os.getenv("QWEN3_TTS_STREAMING_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+QWEN3_TTS_STREAM_CHUNK_SIZE = max(1, min(16, int(os.getenv("QWEN3_TTS_STREAM_CHUNK_SIZE", "8"))))
+QWEN3_TTS_ATTN_IMPLEMENTATION = os.getenv("QWEN3_TTS_ATTN_IMPLEMENTATION", "sdpa").strip() or "sdpa"
+QWEN3_TTS_DTYPE = os.getenv("QWEN3_TTS_DTYPE", "bfloat16").strip() or "bfloat16"
 
 SAVE_TTS_DEBUG_AUDIO = os.getenv("SAVE_TTS_DEBUG_AUDIO", "0").lower() in {"1", "true", "yes", "on"}
 _tts_infer_lock = threading.Lock()
@@ -150,8 +156,35 @@ def _disable_qwen3_tts(reason: str) -> None:
     """Disable qwen3 provider for this process after a hard initialization/generation failure."""
     global _qwen3_tts_model
     global _qwen3_tts_disabled_reason
+    global _qwen3_tts_backend_variant
     _qwen3_tts_model = None
+    _qwen3_tts_backend_variant = ""
     _qwen3_tts_disabled_reason = str(reason or "unknown_error")
+
+
+def _inject_local_sox_paths() -> None:
+    """Expose bundled SoX binaries/libs before importing qwen_tts-based packages."""
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sox_bin = os.path.join(base_dir, "sox_local/usr/bin")
+    sox_lib = os.path.join(base_dir, "sox_local/usr/lib/aarch64-linux-gnu")
+
+    if os.path.exists(sox_bin):
+        os.environ["PATH"] = f"{sox_bin}:{os.environ.get('PATH', '')}"
+    if os.path.exists(sox_lib):
+        sox_fmt_lib = os.path.join(sox_lib, "sox")
+        os.environ["LD_LIBRARY_PATH"] = f"{sox_lib}:{sox_fmt_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+
+
+def _estimate_qwen3_max_new_tokens(text: str) -> int:
+    """Bound codec-token generation to the length of the prompt instead of the package hard default."""
+    text_len = len((text or "").strip())
+    return min(2048, max(512, text_len * 5))
+
+
+def _float_audio_to_pcm16_bytes(audio_array: np.ndarray) -> bytes:
+    """Convert float audio in [-1, 1] to mono PCM16 bytes for socket streaming."""
+    audio_array = np.clip(_to_float_audio(audio_array), -1.0, 1.0)
+    return (audio_array * 32767).astype(np.int16).tobytes()
 
 
 def _piper_style_defaults(style: str) -> dict[str, float]:
@@ -518,33 +551,56 @@ def _load_qwen3_tts_cuda():
     """Load Qwen3-TTS model via qwen-tts on CUDA."""
     global _qwen3_tts_model
     global _qwen3_tts_sample_rate
+    global _qwen3_tts_backend_variant
 
+    import importlib.util
     import sys
-    import os
+    import torch
 
-    # Inject local SoX paths (extracted from deb files because we lack sudo)
-    # The server/services/ directory is 2 levels deep from the project root.
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    sox_bin = os.path.join(base_dir, "sox_local/usr/bin")
-    sox_lib = os.path.join(base_dir, "sox_local/usr/lib/aarch64-linux-gnu")
-    
-    if os.path.exists(sox_bin):
-        os.environ["PATH"] = f"{sox_bin}:{os.environ.get('PATH', '')}"
-    if os.path.exists(sox_lib):
-        # We also need to add the plugin directory if it exists
-        sox_fmt_lib = os.path.join(sox_lib, "sox")
-        os.environ["LD_LIBRARY_PATH"] = f"{sox_lib}:{sox_fmt_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    _inject_local_sox_paths()
 
     model_id = _normalize_qwen3_tts_model_id(QWEN3_TTS_MODEL_ID)
     print(f"🔄 Loading TTS backend (Qwen3-TTS CUDA): {model_id}...")
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    faster_import_error = None
+    if torch.cuda.is_available() and QWEN3_TTS_ENGINE in {"auto", "faster"}:
+        try:
+            from faster_qwen3_tts import FasterQwen3TTS
+
+            fast_dtype = QWEN3_TTS_DTYPE
+            model = FasterQwen3TTS.from_pretrained(
+                model_id,
+                device=device,
+                dtype=fast_dtype,
+                attn_implementation=QWEN3_TTS_ATTN_IMPLEMENTATION,
+            )
+            _qwen3_tts_model = model
+            _qwen3_tts_sample_rate = int(getattr(model, "sample_rate", QWEN3_TTS_SAMPLE_RATE))
+            _qwen3_tts_backend_variant = "faster"
+            print(
+                f"✅ Qwen3-TTS CUDA READY (engine=faster, device={device}, sample_rate={_qwen3_tts_sample_rate})"
+            )
+            return
+        except Exception as err:
+            faster_import_error = err
+            if QWEN3_TTS_ENGINE == "faster":
+                msg = str(err)
+                _disable_qwen3_tts(f"fast_load_failed: {msg}")
+                raise RuntimeError(
+                    f"Faster Qwen3-TTS load failed ({msg}). "
+                    "Ensure faster-qwen3-tts is installed and CUDA is available."
+                ) from err
+            print(f"⚠️ Faster Qwen3-TTS unavailable ({err}). Falling back to official qwen-tts.")
+
     try:
-        # Suppress stderr during import to hide "flash-attn" warnings
-        # since it successfully falls back to PyTorch/soundfile.
+        # Suppress stderr during import to hide non-critical flash-attn warnings.
         devnull = open(os.devnull, 'w')
         old_stderr = sys.stderr
         sys.stderr = devnull
         try:
-            import qwen_tts
+            import qwen_tts  # noqa: F401
             from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel as QwenTTS
         finally:
             sys.stderr = old_stderr
@@ -557,11 +613,6 @@ def _load_qwen3_tts_cuda():
         ) from import_err
 
     try:
-        import importlib.util
-        import torch
-
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         load_kwargs = {
             "device_map": device,
             "dtype": dtype,
@@ -577,8 +628,14 @@ def _load_qwen3_tts_cuda():
             load_kwargs.pop("attn_implementation", None)
             model = QwenTTS.from_pretrained(model_id, **load_kwargs)
         _qwen3_tts_model = model
-        _qwen3_tts_sample_rate = QWEN3_TTS_SAMPLE_RATE 
-        print(f"✅ Qwen3-TTS CUDA READY (device={device}, sample_rate={_qwen3_tts_sample_rate})")
+        _qwen3_tts_sample_rate = QWEN3_TTS_SAMPLE_RATE
+        _qwen3_tts_backend_variant = "official"
+        if faster_import_error:
+            print(
+                f"✅ Qwen3-TTS CUDA READY (engine=official fallback, device={device}, sample_rate={_qwen3_tts_sample_rate})"
+            )
+        else:
+            print(f"✅ Qwen3-TTS CUDA READY (engine=official, device={device}, sample_rate={_qwen3_tts_sample_rate})")
     except Exception as err:
         msg = str(err)
         _disable_qwen3_tts(f"load_failed: {msg}")
@@ -598,6 +655,16 @@ def _ensure_qwen3_tts_loaded():
     if _qwen3_tts_model is None:
         _load_qwen3_tts_cuda()
     return _qwen3_tts_model
+
+
+def _qwen3_tts_supports_streaming() -> bool:
+    """True when the loaded qwen backend can emit realtime audio chunks."""
+    model = _ensure_qwen3_tts_loaded()
+    return (
+        QWEN3_TTS_STREAMING_ENABLED
+        and _qwen3_tts_backend_variant == "faster"
+        and hasattr(model, "generate_custom_voice_streaming")
+    )
 
 
 def _ensure_piper_loaded():
@@ -773,8 +840,7 @@ def _generate_qwen3_tts_audio(text: str, voice: Optional[str] = None) -> np.ndar
     try:
         # Try the generate_custom_voice API (matches macOS mlx-audio interface)
         if hasattr(model, 'generate_custom_voice'):
-            # Estimate max tokens: ~12Hz codec rate, ~12 chars/sec speech ≈ 1 token/char, 2x safety margin
-            max_new_tokens = min(2048, max(512, len(text) * 5))
+            max_new_tokens = _estimate_qwen3_max_new_tokens(text)
             results = list(model.generate_custom_voice(
                 text=text,
                 speaker=speaker,
@@ -826,6 +892,65 @@ def _generate_qwen3_tts_audio(text: str, voice: Optional[str] = None) -> np.ndar
     return _to_float_audio(audio)
 
 
+def _iter_qwen3_tts_stream_chunks(text: str, voice: Optional[str] = None):
+    """Yield realtime PCM16 chunks from FasterQwen3TTS when available."""
+    import time as _time
+
+    if not _qwen3_tts_supports_streaming():
+        raise RuntimeError("Realtime chunked Qwen3-TTS is unavailable in this process.")
+
+    model = _ensure_qwen3_tts_loaded()
+    speaker = _normalize_qwen3_speaker_name(voice or QWEN3_TTS_SPEAKER)
+    instruct = QWEN3_TTS_INSTRUCT
+    max_new_tokens = _estimate_qwen3_max_new_tokens(text)
+
+    print(
+        "🎤 FasterQwen3 streaming: "
+        f"speaker={speaker}, instruct={instruct!r}, text_len={len(text)}, chunk_size={QWEN3_TTS_STREAM_CHUNK_SIZE}"
+    )
+
+    started_at = _time.monotonic()
+    first_chunk_at = None
+    total_samples = 0
+    last_chunk_index = -1
+
+    for chunk_index, (audio_chunk, sample_rate, timing) in enumerate(
+        model.generate_custom_voice_streaming(
+            text=text,
+            speaker=speaker,
+            language="English",
+            instruct=instruct,
+            max_new_tokens=max_new_tokens,
+            chunk_size=QWEN3_TTS_STREAM_CHUNK_SIZE,
+        )
+    ):
+        if first_chunk_at is None:
+            first_chunk_at = _time.monotonic()
+            print(
+                f"🎤 FasterQwen3 first chunk in {(first_chunk_at - started_at):.2f}s "
+                f"(samples={len(audio_chunk)}, timing={timing})"
+            )
+
+        pcm_b64 = base64.b64encode(_float_audio_to_pcm16_bytes(audio_chunk)).decode("utf-8")
+        total_samples += len(audio_chunk)
+        last_chunk_index = chunk_index
+        yield {
+            "audio": pcm_b64,
+            "sample_rate": int(sample_rate or _qwen3_tts_sample_rate or QWEN3_TTS_SAMPLE_RATE),
+            "chunk_index": chunk_index,
+            "is_final": bool(timing.get("is_final")),
+            "timing": timing,
+        }
+
+    if last_chunk_index >= 0:
+        total_time = _time.monotonic() - started_at
+        total_audio_seconds = total_samples / float(_qwen3_tts_sample_rate or QWEN3_TTS_SAMPLE_RATE)
+        print(
+            f"🎤 FasterQwen3 stream complete in {total_time:.2f}s "
+            f"(chunks={last_chunk_index + 1}, audio_s={total_audio_seconds:.2f})"
+        )
+
+
 def _resolve_provider_sample_rate(provider: Optional[str] = None) -> int:
     provider_key = _normalize_tts_provider(provider, fallback=DEFAULT_TTS_PROVIDER)
     if provider_key == "qwen3_tts":
@@ -838,6 +963,19 @@ def _resolve_provider_sample_rate(provider: Optional[str] = None) -> int:
             print(f"⚠️ Qwen3-TTS sample-rate fallback to Piper: {qwen_err}")
     _ensure_piper_loaded()
     return int(_tts_sample_rate or PIPER_SAMPLE_RATE)
+
+
+def _provider_supports_streaming(provider: Optional[str] = None) -> bool:
+    provider_key = _normalize_tts_provider(provider, fallback=DEFAULT_TTS_PROVIDER)
+    if provider_key != "qwen3_tts":
+        return False
+    try:
+        return _qwen3_tts_supports_streaming()
+    except Exception as qwen_err:
+        if not TTS_ALLOW_FALLBACK:
+            raise
+        print(f"⚠️ Qwen3 streaming unavailable ({qwen_err}).")
+        return False
 
 
 def _generate_audio(
@@ -886,6 +1024,10 @@ class TTSService:
         if provider is None:
             self._sample_rate = int(rate)
         return int(rate)
+
+    def supports_streaming(self, provider: Optional[str] = None) -> bool:
+        """Whether the provider can emit chunked realtime audio instead of waiting for a full WAV."""
+        return _provider_supports_streaming(provider=provider)
 
     def speak(
         self,
@@ -985,6 +1127,56 @@ class TTSService:
             return await loop.run_in_executor(
                 None, lambda: self.speak_wav_base64(text, voice=voice, style=style, provider=provider)
             )
+
+    async def stream_pcm_base64_chunks_async(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        style: Optional[str] = None,
+        provider: Optional[str] = None,
+    ):
+        """
+        Async generator that yields PCM16/base64 chunks for low-latency browser playback.
+
+        Currently used by the faster-qwen3-tts backend only.
+        """
+        loop = asyncio.get_running_loop()
+        provider_key = _normalize_tts_provider(provider, fallback=DEFAULT_TTS_PROVIDER)
+        if provider_key != "qwen3_tts":
+            raise RuntimeError(f"Streaming audio is not implemented for provider '{provider_key}'.")
+
+        sentinel = object()
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        cancel_event = threading.Event()
+
+        def worker():
+            try:
+                with _tts_infer_lock:
+                    for chunk_payload in _iter_qwen3_tts_stream_chunks(text, voice=voice):
+                        if cancel_event.is_set():
+                            break
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk_payload)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        async with self._async_lock:
+            thread = threading.Thread(target=worker, name="tts-stream-worker", daemon=True)
+            thread.start()
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is sentinel:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            except asyncio.CancelledError:
+                cancel_event.set()
+                raise
+            finally:
+                cancel_event.set()
 
 
 # ============== Factory Function ==============
