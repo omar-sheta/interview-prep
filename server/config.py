@@ -1,11 +1,16 @@
 """
-Configuration settings for the Interview Agent Server.
+Configuration settings for BeePrepared.
 Uses pydantic-settings for environment-based configuration.
 """
 
+import json
 from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
@@ -19,8 +24,9 @@ class Settings(BaseSettings):
     # Model paths
     MODEL_PATH: str = str(Path.home() / ".cache" / "huggingface")
     
-    # Qdrant configuration
-    QDRANT_PATH: str = "./qdrant_data"
+    # Optional Qdrant configuration
+    QDRANT_ENABLED: bool = False
+    QDRANT_PATH: str = str(PROJECT_ROOT / "qdrant_data")
     
     # Embedding dimensions (optimized for nomic-embed-text)
     EMBEDDING_DIM: int = 768
@@ -37,10 +43,10 @@ class Settings(BaseSettings):
 
     # Default model for agentic flows in BeePrepared.
     # For LM Studio this must match a loaded model id, but factory includes auto-fallback.
-    LLM_MODEL_ID: str = "mlx-community/qwen3.5-35b-a3b"
+    LLM_MODEL_ID: str = "qwen/qwen3.5-35b-a3b"
 
     # Fast model for short coaching calls. Set equal to main model for consistency.
-    FAST_LLM_MODEL_ID: str = "mlx-community/qwen3.5-35b-a3b"
+    FAST_LLM_MODEL_ID: str = "qwen/qwen3.5-35b-a3b"
 
     # Reuse one shared model client instance for all flows (analysis/interview/coaching)
     # to avoid loading/seating multiple model sessions on constrained memory machines.
@@ -58,34 +64,57 @@ class Settings(BaseSettings):
     LLM_JSON_MAX_TOKENS: int = 6000
 
     # Streaming STT (partial transcripts)
-    PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
     WHISPER_CPP_ENABLED: bool = True
     WHISPER_CPP_BIN: str = str(PROJECT_ROOT / "third_party" / "whisper.cpp" / "build" / "bin" / "whisper-cli")
-    WHISPER_CPP_MODEL_PATH: str = str(PROJECT_ROOT / "third_party" / "whisper.cpp" / "models" / "ggml-base.en-q8_0.bin")
+    WHISPER_CPP_MODEL_PATH: str = str(PROJECT_ROOT / "third_party" / "whisper.cpp" / "models" / "ggml-base.en.bin")
     WHISPER_CPP_LANGUAGE: str = "en"
     WHISPER_CPP_THREADS: int = 4
-    # whisper.cpp CLI currently auto-uses GPU on Apple; set <= 0 to force CPU-only fallback.
+    # whisper.cpp CLI auto-uses GPU when available; set <= 0 to force CPU-only fallback.
     WHISPER_CPP_GPU_LAYERS: int = 99
     WHISPER_CPP_TIMEOUT_SEC: float = 8.0
 
     # Audio chunk timing for low-latency partials and end-of-utterance finalization
     STT_PARTIAL_CHUNK_MS: int = 700
     STT_PARTIAL_COOLDOWN_MS: int = 450
-    # Silence duration before finalizing an utterance.  700ms is too aggressive
-    # for natural speech with pauses; 1800ms avoids mid-sentence finalizations
-    # while still feeling responsive.
+    # Silence duration before finalizing an utterance.
     STT_FINALIZE_SILENCE_MS: int = 1800
-    
+
     # CORS configuration
-    # Set CORS_ORIGINS env var to restrict in production (comma-separated)
-    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"]
+    # Override with CORS_ORIGINS as JSON array or comma-separated string.
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = [
+        "*",
+        # HTTPS origins for Caddy reverse proxy
+        "https://192.168.0.161", "https://192.168.1.48", "https://spark.hivehub.org",
+        "https://localhost", "https://127.0.0.1",
+        "https://192.168.0.161:443", "https://spark.hivehub.org:443",
+        "https://192.168.0.161:8443", "https://192.168.1.48:8443", "https://spark.hivehub.org:8443",
+    ]
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value):
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except json.JSONDecodeError:
+                    pass
+            return [origin.strip() for origin in raw.split(",") if origin.strip()]
+        if isinstance(value, list):
+            return [str(origin).strip() for origin in value if str(origin).strip()]
+        return value
     
     # Server configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     
     # User database path
-    USER_DB_PATH: str = "./user_data/interview_app.db"
+    USER_DB_PATH: str = str(PROJECT_ROOT / "user_data" / "interview_app.db")
 
     # Feedback loop rollout flag
     FEEDBACK_LOOP_V2: bool = True

@@ -44,6 +44,15 @@ logs/
 node_modules/
 .npm/
 
+# Local deploy/runtime artifacts
+certs/
+caddy
+qwen_test.wav
+server.log
+server_new.log
+*.pid
+sox_local/
+
 # Local runtime/test artifacts (do not ship)
 debug_audio/
 output/
@@ -56,6 +65,7 @@ persona_grading_results_*.json
 
 # Audio test files
 *.wav
+*.mp3
 
 # Local app data
 user_data/

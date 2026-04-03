@@ -3,10 +3,13 @@ import re
 import sys
 import types
 import unittest
+import importlib
 import importlib.util
 
 # Provide lightweight stubs so this test can run even when LLM/runtime deps are absent.
-if "langchain_core.messages" not in sys.modules:
+try:
+    importlib.import_module("langchain_core.messages")
+except Exception:
     messages_mod = types.ModuleType("langchain_core.messages")
 
     class _Message:
@@ -20,7 +23,9 @@ if "langchain_core.messages" not in sys.modules:
     sys.modules["langchain_core"] = langchain_core_mod
     sys.modules["langchain_core.messages"] = messages_mod
 
-if "server.services.llm_factory" not in sys.modules:
+try:
+    importlib.import_module("server.services.llm_factory")
+except Exception:
     llm_factory_mod = types.ModuleType("server.services.llm_factory")
 
     class _NoopModel:
@@ -31,7 +36,9 @@ if "server.services.llm_factory" not in sys.modules:
     llm_factory_mod.get_chat_model = lambda: _NoopModel()
     sys.modules["server.services.llm_factory"] = llm_factory_mod
 
-if "server.tools.resume_tool" not in sys.modules:
+try:
+    importlib.import_module("server.tools.resume_tool")
+except Exception:
     resume_tool_mod = types.ModuleType("server.tools.resume_tool")
     resume_tool_mod.parse_json_safely = lambda text: json.loads(text) if isinstance(text, str) and text.strip().startswith("{") else {"questions": []}
     resume_tool_mod.re = re

@@ -1,6 +1,6 @@
 """
-Audio Service for Speech-to-Text (STT) using MLX-Whisper.
-Optimized for Apple Silicon with the large-v3-turbo model.
+Audio Service for Speech-to-Text (STT) using faster-whisper.
+Optimized for CUDA on Spark with configurable decode settings.
 """
 
 import asyncio
@@ -14,17 +14,31 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-import mlx_whisper
+from faster_whisper import WhisperModel
 
 from server.config import settings
 
 
 # ============== Global Model Cache ==============
 
-_whisper_model: Optional[str] = None
-# large-v3-turbo is the best balance of speed + accuracy on Apple Silicon
-# It's 4x faster than large-v3 with nearly identical WER (Word Error Rate)
-WHISPER_MODEL_ID = "mlx-community/whisper-large-v3-turbo"
+_whisper_model = None
+WHISPER_MODEL_ID = os.getenv("WHISPER_MODEL_ID", "large-v3-turbo").strip() or "large-v3-turbo"
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto").strip().lower() or "auto"
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16").strip().lower() or "float16"
+WHISPER_BEAM_SIZE = max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1") or "1"))
+WHISPER_BEST_OF = max(1, int(os.getenv("WHISPER_BEST_OF", "1") or "1"))
+WHISPER_CPU_THREADS = max(0, int(os.getenv("WHISPER_CPU_THREADS", "0") or "0"))
+WHISPER_NUM_WORKERS = max(1, int(os.getenv("WHISPER_NUM_WORKERS", "1") or "1"))
+
+
+def _resolve_whisper_device() -> str:
+    if WHISPER_DEVICE != "auto":
+        return WHISPER_DEVICE
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
 
 def _pcm16_bytes_to_float32(audio_data: bytes) -> np.ndarray:
@@ -32,6 +46,14 @@ def _pcm16_bytes_to_float32(audio_data: bytes) -> np.ndarray:
     if not audio_data:
         return np.array([], dtype=np.float32)
     return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _float32_audio_to_pcm16_bytes(audio_array: np.ndarray) -> bytes:
+    """Convert float32 mono waveform in [-1, 1] into raw 16-bit PCM bytes."""
+    if audio_array is None or len(audio_array) == 0:
+        return b""
+    clipped = np.clip(np.asarray(audio_array, dtype=np.float32), -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()
 
 
 def _resample_audio(audio_array: np.ndarray, from_rate: int, to_rate: int = 16000) -> np.ndarray:
@@ -58,23 +80,37 @@ def _normalize_transcript_text(text: str) -> str:
 def _ensure_whisper_loaded():
     """
     Ensure Whisper model is loaded.
-    The mlx_whisper library handles caching internally.
     """
     global _whisper_model
     if _whisper_model is None:
-        print(f"🔄 Loading Whisper model: {WHISPER_MODEL_ID}")
-        # Trigger model download/cache by doing a dummy transcription
-        # The model will be cached for subsequent calls
-        _whisper_model = WHISPER_MODEL_ID
-        print(f"✅ Whisper model ready")
+        device = _resolve_whisper_device()
+        print(f"🔄 Loading Whisper model: {WHISPER_MODEL_ID} (device={device}, compute_type={WHISPER_COMPUTE_TYPE})")
+        model_kwargs = {
+            "device": device,
+            "compute_type": WHISPER_COMPUTE_TYPE,
+        }
+        if WHISPER_CPU_THREADS > 0:
+            model_kwargs["cpu_threads"] = WHISPER_CPU_THREADS
+        if WHISPER_NUM_WORKERS > 0:
+            model_kwargs["num_workers"] = WHISPER_NUM_WORKERS
+        try:
+            _whisper_model = WhisperModel(WHISPER_MODEL_ID, **model_kwargs)
+        except ValueError as exc:
+            if device != "cuda" or "not compiled with CUDA support" not in str(exc):
+                raise
+            cpu_kwargs = dict(model_kwargs)
+            cpu_kwargs["device"] = "cpu"
+            cpu_kwargs["compute_type"] = "int8"
+            print("⚠️ faster-whisper CUDA unavailable in this env; falling back to CPU final-pass STT.")
+            _whisper_model = WhisperModel(WHISPER_MODEL_ID, **cpu_kwargs)
+        print("✅ Whisper model ready")
 
 
 # ============== Audio Processor ==============
 
 class AudioProcessor:
     """
-    Audio processing service using MLX-Whisper for transcription.
-    Uses the large-v3-turbo model for optimal M4 performance.
+    Audio processing service using faster-whisper for transcription.
     """
     
     def __init__(self):
@@ -102,28 +138,29 @@ class AudioProcessor:
         if sample_rate != 16000:
             audio_array = _resample_audio(audio_array, from_rate=sample_rate, to_rate=16000)
         
-        # Transcribe using mlx_whisper
+        # Final-pass STT runs on the shared faster-whisper model.
         # temperature=0.0 for greedy decoding (most accurate, no randomness)
         # condition_on_previous_text=False avoids hallucination loops on short audio
         # compression_ratio_threshold=2.4 filters out repetitive/hallucinated output
         # no_speech_threshold=0.6 avoids transcribing silence as phantom words
-        # MLX Metal path is sensitive to concurrent transcribe calls.
+        # Faster-whisper model access should remain serialized here.
         # Keep final-pass calls serialized to avoid backend crashes.
         with self._mlx_lock:
-            result = mlx_whisper.transcribe(
+            segments, _ = _whisper_model.transcribe(
                 audio_array,
-                path_or_hf_repo=self.model_id,
                 language="en",
                 task="transcribe",
+                beam_size=WHISPER_BEAM_SIZE,
+                best_of=WHISPER_BEST_OF,
                 temperature=0.0,
                 condition_on_previous_text=False,
                 compression_ratio_threshold=2.4,
                 no_speech_threshold=0.6,
-                verbose=False,
             )
-        
-        return result.get("text", "").strip()
-    
+            result_text = "".join(segment.text for segment in segments)
+
+        return result_text.strip()
+
     def transcribe_file(self, file_path: str) -> str:
         """
         Transcribe an audio file to text.
@@ -137,15 +174,18 @@ class AudioProcessor:
         _ensure_whisper_loaded()
         
         with self._mlx_lock:
-            result = mlx_whisper.transcribe(
+            segments, _ = _whisper_model.transcribe(
                 file_path,
-                path_or_hf_repo=self.model_id,
                 language="en",
+                task="transcribe",
+                beam_size=WHISPER_BEAM_SIZE,
+                best_of=WHISPER_BEST_OF,
                 temperature=0.0,
                 condition_on_previous_text=False,
             )
-        
-        return result.get("text", "").strip()
+            result_text = "".join(segment.text for segment in segments)
+
+        return result_text.strip()
     
     async def transcribe_buffer_async(
         self,
@@ -253,6 +293,8 @@ class WhisperCppStreamingProcessor:
         text = (diag or "").lower()
         markers = (
             "whisper_backend_init_gpu: no gpu found",
+            "ggml_cuda_init",
+            "cuda error",
             "ggml_metal_buffer_init: error",
             "failed to allocate buffer",
         )
@@ -308,6 +350,8 @@ class WhisperCppStreamingProcessor:
                     cmd = list(base_cmd)
                     if no_gpu:
                         cmd.append("-ng")
+                    else:
+                        cmd.extend(["-dev", "0"])
                     completed = subprocess.run(
                         cmd,
                         check=False,
@@ -351,6 +395,39 @@ class WhisperCppStreamingProcessor:
             None,
             lambda: self.transcribe_buffer(audio_data, sample_rate),
         )
+
+
+class WhisperCppAudioProcessor(AudioProcessor):
+    """
+    Final-pass STT processor backed by whisper.cpp.
+    Uses the same GPU-capable backend as live partials to avoid CPU fallback latency.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._whisper_cpp = WhisperCppStreamingProcessor()
+
+    def transcribe_buffer(self, audio_data: bytes, sample_rate: int = 16000) -> str:
+        return self._whisper_cpp.transcribe_buffer(audio_data, sample_rate)
+
+    def transcribe_file(self, file_path: str) -> str:
+        """
+        Transcribe an audio file via whisper.cpp when we can decode it locally.
+        Falls back to faster-whisper for unsupported container formats such as WebM
+        when no system transcoder is available.
+        """
+        try:
+            audio_array, sample_rate = sf.read(file_path, dtype="float32", always_2d=False)
+            if isinstance(audio_array, np.ndarray) and audio_array.ndim > 1:
+                audio_array = np.mean(audio_array, axis=1)
+            audio_array = np.asarray(audio_array, dtype=np.float32)
+            if sample_rate != 16000:
+                audio_array = _resample_audio(audio_array, from_rate=sample_rate, to_rate=16000)
+            audio_bytes = _float32_audio_to_pcm16_bytes(audio_array)
+            return self._whisper_cpp.transcribe_buffer(audio_bytes, 16000)
+        except Exception:
+            # Compatibility fallback for file/container types soundfile cannot decode.
+            return super().transcribe_file(file_path)
 
 
 # ============== VAD (Voice Activity Detection) ==============
@@ -443,7 +520,16 @@ def get_audio_processor() -> AudioProcessor:
     """Get or create the audio processor singleton."""
     global _audio_processor
     if _audio_processor is None:
-        _audio_processor = AudioProcessor()
+        whisper_cpp = WhisperCppStreamingProcessor()
+        if whisper_cpp.is_available():
+            print(
+                "✅ Final-pass STT engine: whisper.cpp "
+                f"(model={os.path.basename(whisper_cpp.model_path)})"
+            )
+            _audio_processor = WhisperCppAudioProcessor()
+        else:
+            print("ℹ️ Final-pass STT engine fallback: faster-whisper")
+            _audio_processor = AudioProcessor()
     return _audio_processor
 
 
@@ -458,7 +544,7 @@ def get_vad() -> VoiceActivityDetector:
 def get_streaming_audio_processor() -> AudioProcessor | WhisperCppStreamingProcessor:
     """
     Get low-latency streaming STT processor.
-    Prefers whisper.cpp, falls back to MLX-Whisper when unavailable.
+    Prefers whisper.cpp, falls back to faster-whisper when unavailable.
     """
     global _streaming_audio_processor
     if _streaming_audio_processor is None:
@@ -470,6 +556,6 @@ def get_streaming_audio_processor() -> AudioProcessor | WhisperCppStreamingProce
             )
             _streaming_audio_processor = whisper_cpp
         else:
-            print("ℹ️ Streaming STT engine fallback: MLX-Whisper")
+            print("ℹ️ Streaming STT engine fallback: faster-whisper")
             _streaming_audio_processor = get_audio_processor()
     return _streaming_audio_processor

@@ -54,6 +54,34 @@ function scoreToneColor(score) {
     return '#DC2626';
 }
 
+const SCORE_DIMENSION_STYLES = {
+    relevance: {
+        color: '#2563EB',
+        border: 'rgba(37, 99, 235, 0.28)',
+        background: 'rgba(37, 99, 235, 0.08)',
+    },
+    depth: {
+        color: '#059669',
+        border: 'rgba(5, 150, 105, 0.28)',
+        background: 'rgba(5, 150, 105, 0.08)',
+    },
+    structure: {
+        color: '#D97706',
+        border: 'rgba(217, 119, 6, 0.28)',
+        background: 'rgba(217, 119, 6, 0.08)',
+    },
+    specificity: {
+        color: '#7C3AED',
+        border: 'rgba(124, 58, 237, 0.28)',
+        background: 'rgba(124, 58, 237, 0.08)',
+    },
+    communication: {
+        color: '#DB2777',
+        border: 'rgba(219, 39, 119, 0.28)',
+        background: 'rgba(219, 39, 119, 0.08)',
+    },
+};
+
 const SCORE_KEYS = [
     { key: 'relevance', label: 'Relevance' },
     { key: 'depth', label: 'Depth' },
@@ -604,18 +632,6 @@ export default function SessionReport() {
                                     color={hasScorableAnswers ? 'secondary' : 'default'}
                                     variant="outlined"
                                 />
-                                {reportSessionId && (
-                                    <Button
-                                        size="small"
-                                        variant="outlined"
-                                        startIcon={<PictureAsPdfOutlined />}
-                                        onClick={handleExport}
-                                        disabled={exporting}
-                                        sx={{ textTransform: 'none', borderRadius: 2 }}
-                                    >
-                                        {exporting ? 'Exporting...' : 'Export PDF'}
-                                    </Button>
-                                )}
                             </Stack>
                         </Stack>
                     </Paper>
@@ -721,6 +737,25 @@ export default function SessionReport() {
                                             <Chip size="small" variant="outlined" label={`Good ${performanceBreakdown.good}`} />
                                             <Chip size="small" variant="outlined" label={`Needs work ${performanceBreakdown.needs_work}`} />
                                         </Stack>
+                                        {reportSessionId && (
+                                            <Button
+                                                variant="contained"
+                                                size="large"
+                                                startIcon={<PictureAsPdfOutlined />}
+                                                onClick={handleExport}
+                                                disabled={exporting}
+                                                sx={{
+                                                    mt: 0.4,
+                                                    alignSelf: 'stretch',
+                                                    borderRadius: 2.4,
+                                                    textTransform: 'none',
+                                                    fontWeight: 700,
+                                                    py: 1.1,
+                                                }}
+                                            >
+                                                {exporting ? 'Exporting PDF...' : 'Download PDF Report'}
+                                            </Button>
+                                        )}
                                     </Stack>
                                 </Grid>
                                 <Grid size={{ xs: 12, md: 4 }}>
@@ -736,10 +771,11 @@ export default function SessionReport() {
                                         <Stack spacing={0.8}>
                                             {SCORE_KEYS.map(({ key, label }) => {
                                                 const value = normalizeScore(overallBreakdown[key]);
+                                                const style = SCORE_DIMENSION_STYLES[key] || SCORE_DIMENSION_STYLES.relevance;
                                                 return (
                                                     <Box key={`overall-${key}`}>
                                                         <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.3 }}>
-                                                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                            <Typography variant="caption" sx={{ color: style.color, fontWeight: 700 }}>
                                                                 {label}
                                                             </Typography>
                                                             <Typography variant="caption" sx={{ fontWeight: 700 }}>
@@ -752,9 +788,10 @@ export default function SessionReport() {
                                                             sx={{
                                                                 height: 6,
                                                                 borderRadius: 99,
+                                                                bgcolor: style.background,
                                                                 '& .MuiLinearProgress-bar': {
                                                                     borderRadius: 99,
-                                                                    backgroundColor: scoreToneColor(value),
+                                                                    backgroundColor: style.color,
                                                                 },
                                                             }}
                                                         />
@@ -867,7 +904,9 @@ export default function SessionReport() {
 
                                                     <Paper sx={{ p: 1.2, bgcolor: 'rgba(249, 115, 22, 0.07)' }}>
                                                         <Typography variant="subtitle2" sx={{ mb: 0.9 }}>
-                                                            Why this score
+                                                            <Box component="span" sx={{ fontStyle: 'italic' }}>
+                                                                Why this score
+                                                            </Box>
                                                         </Typography>
 
                                                         {q.evaluationReasoning && (
@@ -877,16 +916,28 @@ export default function SessionReport() {
                                                         )}
 
                                                         <Grid container spacing={0.8} sx={{ mb: 1 }}>
-                                                            {SCORE_KEYS.map(({ key, label }) => (
+                                                            {SCORE_KEYS.map(({ key, label }) => {
+                                                                const style = SCORE_DIMENSION_STYLES[key] || SCORE_DIMENSION_STYLES.relevance;
+                                                                return (
                                                                 <Grid key={`${q.id}-score-${key}`} size={{ xs: 6, sm: 4, md: 'auto' }}>
-                                                                    <Paper sx={{ p: 1, borderStyle: 'dashed', minWidth: 80 }}>
-                                                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>{label}</Typography>
-                                                                        <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                                                                    <Paper
+                                                                        sx={{
+                                                                            p: 1,
+                                                                            minWidth: 88,
+                                                                            borderStyle: 'solid',
+                                                                            borderWidth: 1,
+                                                                            borderColor: style.border,
+                                                                            bgcolor: style.background,
+                                                                        }}
+                                                                    >
+                                                                        <Typography variant="caption" sx={{ color: style.color, fontWeight: 700 }}>{label}</Typography>
+                                                                        <Typography variant="body2" sx={{ fontWeight: 800, color: style.color }}>
                                                                             {normalizeScore(q.breakdown[key]).toFixed(1)}/10
                                                                         </Typography>
                                                                     </Paper>
                                                                 </Grid>
-                                                            ))}
+                                                                );
+                                                            })}
                                                         </Grid>
 
                                                         {q.evidenceQuotes.length > 0 && (

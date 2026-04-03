@@ -27,6 +27,9 @@ import {
     ToggleButtonGroup,
     ToggleButton,
     IconButton,
+    Accordion,
+    AccordionSummary,
+    AccordionDetails,
 } from '@mui/material';
 import {
     PlayArrow,
@@ -47,6 +50,7 @@ import {
     AccountTree,
     AutoAwesome,
     Close,
+    ExpandMore,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
@@ -97,6 +101,17 @@ const QUICK_INTERVIEW_TYPES = [
     },
 ];
 
+const PIPER_STYLE_OPTIONS = [
+    { id: 'interviewer', label: 'Interviewer', description: 'Clear and polished for practice sessions.' },
+    { id: 'balanced', label: 'Balanced', description: 'Default cadence with moderate pacing.' },
+    { id: 'fast', label: 'Fast', description: 'Lower latency when speed matters most.' },
+];
+
+const DEFAULT_RECORDING_THRESHOLDS = {
+    silence_auto_stop_seconds: 5.0,
+    silence_rms_threshold: 0.008,
+};
+
 function getQuickSkillGaps(interviewType) {
     if (interviewType === 'behavioral') return ['communication', 'stakeholder management', 'leadership', 'conflict resolution'];
     if (interviewType === 'technical') return ['technical fundamentals', 'problem solving', 'debugging'];
@@ -116,6 +131,30 @@ function clamp01(value, fallback = 0) {
     const n = Number(value);
     if (!Number.isFinite(n)) return fallback;
     return Math.max(0, Math.min(1, n));
+}
+
+function clampNumber(value, min, max, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+}
+
+function normalizeRecordingThresholds(input) {
+    const src = (input && typeof input === 'object') ? input : {};
+    return {
+        silence_auto_stop_seconds: clampNumber(
+            src.silence_auto_stop_seconds,
+            1,
+            20,
+            DEFAULT_RECORDING_THRESHOLDS.silence_auto_stop_seconds
+        ),
+        silence_rms_threshold: clampNumber(
+            src.silence_rms_threshold,
+            0.001,
+            0.05,
+            DEFAULT_RECORDING_THRESHOLDS.silence_rms_threshold
+        ),
+    };
 }
 
 function statusMeta(statusRaw) {
@@ -229,16 +268,20 @@ export default function ConfigurationView() {
         questionCountOverride,
         interviewerPersona,
         ttsProvider,
+        piperStyle,
+        recordingThresholds,
         startCareerAnalysis,
         startInterview,
         setTargetJob,
         setTargetCompany,
         setInterviewerPersona,
+        setPiperStyle,
         setTtsProvider,
         savePreferences,
         loadPreferences,
         loadLatestAnalysis,
         clearConfiguration,
+        resetAllData,
     } = useInterviewStore();
 
     const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
@@ -253,10 +296,14 @@ export default function ConfigurationView() {
     );
     const [defaultPersona, setDefaultPersona] = useState(interviewerPersona || 'friendly');
     const [voiceEngine, setVoiceEngine] = useState('piper');
+    const [voiceStyle, setVoiceStyle] = useState('interviewer');
+    const [recordingDraft, setRecordingDraft] = useState(normalizeRecordingThresholds(recordingThresholds));
     const [resumeBase64, setResumeBase64] = useState('');
     const [resumeFilename, setResumeFilename] = useState('');
     const [status, setStatus] = useState('');
     const [error, setError] = useState('');
+    const [resumeOpen, setResumeOpen] = useState(false);
+    const [advancedOpen, setAdvancedOpen] = useState(false);
     const [skillFilter, setSkillFilter] = useState('actionable');
     const [selectedSkillId, setSelectedSkillId] = useState('');
     const [clearDialogOpen, setClearDialogOpen] = useState(false);
@@ -267,6 +314,7 @@ export default function ConfigurationView() {
     const [quickJD, setQuickJD] = useState('');
     const [quickType, setQuickType] = useState('mixed');
     const [quickStarting, setQuickStarting] = useState(false);
+    const [resetDialogOpen, setResetDialogOpen] = useState(false);
 
     useEffect(() => {
         connect();
@@ -312,9 +360,26 @@ export default function ConfigurationView() {
 
     useEffect(() => {
         const next = String(ttsProvider || 'piper').trim().toLowerCase();
-        const allowed = new Set(['piper', 'qwen3_tts_mlx']);
-        setVoiceEngine(allowed.has(next) ? next : 'piper');
+        const allowed = new Set(['piper', 'qwen3_tts', 'qwen3_tts_mlx']);
+        const normalized = next === 'qwen3_tts_mlx' ? 'qwen3_tts' : next;
+        setVoiceEngine(allowed.has(next) ? normalized : 'piper');
     }, [ttsProvider]);
+
+    useEffect(() => {
+        const next = String(piperStyle || 'interviewer').trim().toLowerCase();
+        const allowed = new Set(PIPER_STYLE_OPTIONS.map((option) => option.id));
+        setVoiceStyle(allowed.has(next) ? next : 'interviewer');
+    }, [piperStyle]);
+
+    useEffect(() => {
+        setRecordingDraft(normalizeRecordingThresholds(recordingThresholds));
+    }, [recordingThresholds]);
+
+    useEffect(() => {
+        if (resumeFilename || resumeBase64) {
+            setResumeOpen(true);
+        }
+    }, [resumeFilename, resumeBase64]);
 
     const skillBoard = useMemo(() => normalizeSkillBoard(skillMapping), [skillMapping]);
     const coverage = useMemo(
@@ -338,6 +403,7 @@ export default function ConfigurationView() {
 
     const followupTargets = Array.isArray(skillMapping?.followup_targets) ? skillMapping.followup_targets.slice(0, 3) : [];
     const followupQuestions = Array.isArray(skillMapping?.followup_questions) ? skillMapping.followup_questions.slice(0, 4) : [];
+    const activePersonaOption = PERSONA_OPTIONS.find((option) => option.id === defaultPersona) || PERSONA_OPTIONS[0];
 
     useEffect(() => {
         if (filteredBoard.length === 0) {
@@ -366,18 +432,26 @@ export default function ConfigurationView() {
         const normalizedPersona = allowedPersona.has(String(defaultPersona || '').trim().toLowerCase())
             ? String(defaultPersona).trim().toLowerCase()
             : 'friendly';
+        const normalizedVoiceStyle = new Set(PIPER_STYLE_OPTIONS.map((option) => option.id)).has(String(voiceStyle || '').trim().toLowerCase())
+            ? String(voiceStyle).trim().toLowerCase()
+            : 'interviewer';
+        const normalizedRecording = normalizeRecordingThresholds(recordingDraft);
 
         setTargetJob(normalizedRole);
         setTargetCompany(normalizedCompany);
         setInterviewerPersona(normalizedPersona);
+        setPiperStyle(normalizedVoiceStyle);
         setTtsProvider(voiceEngine);
+        setRecordingDraft(normalizedRecording);
         savePreferences({
             target_role: normalizedRole,
             target_company: normalizedCompany,
             job_description: normalizedDescription,
             question_count_override: normalizedCount || null,
             interviewer_persona: normalizedPersona,
+            piper_style: normalizedVoiceStyle,
             tts_provider: voiceEngine,
+            recording_thresholds: normalizedRecording,
             resume_filename: resumeFilename || undefined,
         });
         setStatus('Configuration saved.');
@@ -426,6 +500,15 @@ export default function ConfigurationView() {
         setResumeBase64('');
         setResumeFilename('');
         setStatus('Configuration cleared.');
+    };
+
+    const resetWorkspace = () => {
+        const started = resetAllData();
+        if (!started) {
+            setError('Not connected. Reconnect and try again.');
+            return;
+        }
+        setStatus('Reset requested. Your history and saved workspace are being cleared.');
     };
 
     const openQuickDialog = (typeId = 'mixed') => {
@@ -478,133 +561,28 @@ export default function ConfigurationView() {
         <ThemeProvider theme={theme}>
             <CssBaseline />
             <Box sx={{ minHeight: '100vh', bgcolor: 'background.default', pb: { xs: 3, md: 5 } }}>
-                <HiveTopNav active="config" />
+                <HiveTopNav
+                    active="config"
+                    quickActionLabel="Quick Interview"
+                    quickActionIcon={<BoltOutlined />}
+                    onQuickAction={() => openQuickDialog('mixed')}
+                />
                 <Container maxWidth="lg" sx={{ pt: { xs: 2.5, md: 4 } }}>
-                    <Stack spacing={2.2}>
-                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
-                            <Typography variant="h4">Configuration</Typography>
-                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                Set target role, job description, resume, and interview defaults.
-                            </Typography>
-                        </Paper>
-
-                        {/* ── Quick Interview Section ── */}
-                        <Paper
-                            sx={{
-                                p: { xs: 2, md: 2.5 },
-                                border: '1px solid',
-                                borderColor: darkMode ? 'rgba(99,102,241,0.45)' : 'rgba(99,102,241,0.3)',
-                                background: darkMode
-                                    ? 'linear-gradient(135deg, rgba(99,102,241,0.14), rgba(139,92,246,0.06))'
-                                    : 'linear-gradient(135deg, rgba(99,102,241,0.09), rgba(139,92,246,0.03))',
-                            }}
-                        >
-                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1.2} sx={{ mb: 1.8 }}>
-                                <Stack direction="row" spacing={1.2} alignItems="center">
-                                    <Box
-                                        sx={{
-                                            width: 40,
-                                            height: 40,
-                                            borderRadius: '50%',
-                                            display: 'grid',
-                                            placeItems: 'center',
-                                            background: darkMode
-                                                ? 'linear-gradient(135deg, rgba(99,102,241,0.55), rgba(139,92,246,0.4))'
-                                                : 'linear-gradient(135deg, rgba(99,102,241,0.3), rgba(139,92,246,0.18))',
-                                        }}
-                                    >
-                                        <BoltOutlined sx={{ color: darkMode ? '#c4b5fd' : '#6366f1', fontSize: 22 }} />
-                                    </Box>
-                                    <Box>
-                                        <Typography variant="h6" sx={{ lineHeight: 1.2 }}>Try a Quick Interview</Typography>
-                                        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                            Jump straight in — pick a type and go. No resume or analysis needed.
-                                        </Typography>
-                                    </Box>
-                                </Stack>
-                                <Button
-                                    variant="contained"
-                                    startIcon={<BoltOutlined />}
-                                    onClick={() => openQuickDialog('mixed')}
-                                    disabled={!isConnected}
-                                    sx={{
-                                        whiteSpace: 'nowrap',
-                                        minWidth: 160,
-                                        background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
-                                        '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
-                                    }}
-                                >
-                                    Quick Start
-                                </Button>
-                            </Stack>
-
-                            <Box
-                                sx={{
-                                    display: 'grid',
-                                    gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
-                                    gap: 1,
-                                }}
-                            >
-                                {QUICK_INTERVIEW_TYPES.map((type) => {
-                                    const Icon = type.icon;
-                                    return (
-                                        <Paper
-                                            key={type.id}
-                                            role="button"
-                                            tabIndex={0}
-                                            onClick={() => openQuickDialog(type.id)}
-                                            onKeyDown={(event) => {
-                                                if (event.key === 'Enter' || event.key === ' ') {
-                                                    event.preventDefault();
-                                                    openQuickDialog(type.id);
-                                                }
-                                            }}
-                                            sx={{
-                                                p: 1.4,
-                                                cursor: 'pointer',
-                                                transition: 'all 0.18s ease',
-                                                border: '1px solid',
-                                                borderColor: darkMode ? 'rgba(99,102,241,0.25)' : 'rgba(99,102,241,0.15)',
-                                                '&:hover': {
-                                                    borderColor: darkMode ? 'rgba(99,102,241,0.55)' : 'rgba(99,102,241,0.4)',
-                                                    boxShadow: '0 4px 16px rgba(99,102,241,0.15)',
-                                                    transform: 'translateY(-1px)',
-                                                },
-                                            }}
-                                        >
-                                            <Stack spacing={0.6}>
-                                                <Stack direction="row" spacing={0.7} alignItems="center">
-                                                    <Icon sx={{ fontSize: 20, color: darkMode ? '#a5b4fc' : '#6366f1' }} />
-                                                    <Typography variant="subtitle2" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
-                                                        {type.title}
-                                                    </Typography>
-                                                </Stack>
-                                                <Typography variant="caption" sx={{ color: 'text.secondary', lineHeight: 1.3 }}>
-                                                    {type.description}
-                                                </Typography>
-                                                <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap">
-                                                    {type.tags.map((tag) => (
-                                                        <Chip key={`${type.id}-${tag}`} size="small" label={tag} variant="outlined" sx={{ fontSize: '0.65rem', height: 20 }} />
-                                                    ))}
-                                                </Stack>
-                                            </Stack>
-                                        </Paper>
-                                    );
-                                })}
-                            </Box>
-                        </Paper>
-
+                    <Stack spacing={1.8}>
                         <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
                             <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1.2} sx={{ mb: 1.2 }}>
-                                <Typography variant="h6">Target Profile</Typography>
-                                <Stack direction="row" spacing={1}>
-                                    <Chip size="small" label={`Readiness ${readinessPercent}%`} variant="outlined" />
-                                </Stack>
+                                <Box>
+                                    <Typography variant="h5">Configuration</Typography>
+                                    <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.2 }}>
+                                        Keep the core profile tight here. Resume and audio controls stay available without taking over the page.
+                                    </Typography>
+                                </Box>
+                                <Chip size="small" label={`Readiness ${readinessPercent}%`} variant="outlined" />
                             </Stack>
                             <Divider sx={{ mb: 1.5 }} />
 
-                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '1.2fr 1fr' }, gap: 1.5 }}>
-                                <Stack spacing={1.2}>
+                            <Stack spacing={1.5}>
+                                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1.25fr 1fr 0.7fr' }, gap: 1.2 }}>
                                     <TextField
                                         label="Target Role"
                                         value={jobTitle}
@@ -628,130 +606,242 @@ export default function ConfigurationView() {
                                         size="small"
                                         InputLabelProps={{ shrink: true }}
                                     />
-                                    <TextField
-                                        label="Job Description"
-                                        multiline
-                                        rows={6}
-                                        value={jobDescription}
-                                        onChange={(e) => setJobDescription(e.target.value)}
-                                        inputProps={{ style: { overflowY: 'auto' } }}
-                                        InputLabelProps={{ shrink: true }}
-                                    />
-                                </Stack>
+                                </Box>
 
-                                <Stack spacing={1.1}>
-                                    <Box
-                                        sx={{
-                                            minHeight: 190,
-                                            border: '1px dashed rgba(249,115,22,0.35)',
-                                            borderRadius: 2,
-                                            overflow: 'hidden',
-                                        }}
-                                    >
-                                        <PDFDropzone
-                                            onUpload={(base64, filename) => {
-                                                setResumeBase64(base64 || '');
-                                                setResumeFilename(filename || '');
-                                            }}
-                                            isLoading={isAnalyzing}
-                                        />
-                                    </Box>
-                                    {resumeFilename && (
-                                        <Chip
-                                            icon={<UploadFile />}
-                                            size="small"
-                                            label={`${resumeFilename} uploaded`}
-                                            color="success"
-                                            variant="outlined"
-                                        />
-                                    )}
-                                    {!resumeBase64 && (
-                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                            If no new file is uploaded, saved profile data will still be used.
-                                        </Typography>
-                                    )}
-                                    <Stack spacing={0.8} sx={{ pt: 0.3 }}>
-                                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                                            Voice Engine
-                                        </Typography>
-                                        <FormControl fullWidth size="small">
-                                            <InputLabel id="config-tts-provider-label">Voice Engine</InputLabel>
-                                            <Select
-                                                labelId="config-tts-provider-label"
-                                                label="Voice Engine"
-                                                value={voiceEngine}
-                                                onChange={(event) => setVoiceEngine(String(event.target.value || 'piper'))}
-                                            >
-                                                <MenuItem value="piper">Piper (fast + lightweight)</MenuItem>
-                                                <MenuItem value="qwen3_tts_mlx">Qwen3-TTS MLX (higher quality)</MenuItem>
-                                            </Select>
-                                        </FormControl>
-                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                            This sets the default voice engine for interview question playback.
-                                        </Typography>
+                                <TextField
+                                    label="Job Description"
+                                    multiline
+                                    rows={4}
+                                    value={jobDescription}
+                                    onChange={(e) => setJobDescription(e.target.value)}
+                                    inputProps={{ style: { overflowY: 'auto' } }}
+                                    InputLabelProps={{ shrink: true }}
+                                    helperText="Paste the core responsibilities and expectations. Keep it concise if you want faster iteration."
+                                />
 
-                                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                                            Default Interviewer Persona
-                                        </Typography>
-                                        <Box
+                                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '0.88fr 1.12fr' }, gap: 1.3, alignItems: 'start' }}>
+                                    <Paper variant="outlined" sx={{ borderRadius: 2.4, overflow: 'hidden' }}>
+                                        <Accordion
+                                            disableGutters
+                                            elevation={0}
+                                            expanded={resumeOpen}
+                                            onChange={(_, expanded) => setResumeOpen(expanded)}
                                             sx={{
-                                                display: 'grid',
-                                                gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' },
-                                                gap: 0.75,
+                                                bgcolor: 'transparent',
+                                                '&::before': { display: 'none' },
                                             }}
                                         >
-                                            {PERSONA_OPTIONS.map((option) => {
-                                                const selected = defaultPersona === option.id;
-                                                const Icon = option.icon;
-                                                return (
-                                                    <Paper
-                                                        key={option.id}
-                                                        role="button"
-                                                        tabIndex={0}
-                                                        variant="outlined"
-                                                        onClick={() => setDefaultPersona(option.id)}
-                                                        onKeyDown={(event) => {
-                                                            if (event.key === 'Enter' || event.key === ' ') {
-                                                                event.preventDefault();
-                                                                setDefaultPersona(option.id);
-                                                            }
-                                                        }}
+                                            <AccordionSummary
+                                                expandIcon={<ExpandMore />}
+                                                sx={{
+                                                    px: 1.4,
+                                                    py: 0.4,
+                                                    '& .MuiAccordionSummary-content': { my: 0.8 },
+                                                }}
+                                            >
+                                                <Stack spacing={0.4}>
+                                                    <Stack direction="row" spacing={0.8} alignItems="center" useFlexGap flexWrap="wrap">
+                                                        <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                                                            Resume Context
+                                                        </Typography>
+                                                        <Chip size="small" label="Optional" variant="outlined" />
+                                                        {resumeFilename && (
+                                                            <Chip
+                                                                icon={<UploadFile />}
+                                                                size="small"
+                                                                label="Uploaded"
+                                                                color="success"
+                                                                variant="outlined"
+                                                            />
+                                                        )}
+                                                    </Stack>
+                                                    <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                        Add a resume when you want analysis and question generation to use your actual experience.
+                                                    </Typography>
+                                                </Stack>
+                                            </AccordionSummary>
+                                            <AccordionDetails sx={{ px: 1.4, pt: 0, pb: 1.4 }}>
+                                                <Stack spacing={1}>
+                                                    <Box
                                                         sx={{
-                                                            p: 0.9,
-                                                            cursor: 'pointer',
-                                                            borderColor: selected
-                                                                ? 'rgba(249, 115, 22, 0.62)'
-                                                                : 'rgba(249, 115, 22, 0.22)',
-                                                            boxShadow: selected ? '0 0 0 1px rgba(249,115,22,0.22)' : 'none',
+                                                            minHeight: 180,
+                                                            border: '1px dashed rgba(249,115,22,0.35)',
+                                                            borderRadius: 2,
+                                                            overflow: 'hidden',
                                                         }}
                                                     >
-                                                        <Stack direction="row" spacing={0.7} alignItems="flex-start">
-                                                            <Icon
-                                                                sx={{
-                                                                    fontSize: 17,
-                                                                    mt: '2px',
-                                                                    color: selected ? 'warning.main' : 'text.secondary',
-                                                                }}
-                                                            />
-                                                            <Box sx={{ minWidth: 0 }}>
-                                                                <Typography variant="caption" sx={{ display: 'block', fontWeight: 700 }}>
-                                                                    {option.label}
+                                                        <PDFDropzone
+                                                            onUpload={(base64, filename) => {
+                                                                setResumeBase64(base64 || '');
+                                                                setResumeFilename(filename || '');
+                                                            }}
+                                                            isLoading={isAnalyzing}
+                                                        />
+                                                    </Box>
+                                                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                        If you skip this, HiveMindPrep will keep using the last saved profile context.
+                                                    </Typography>
+                                                </Stack>
+                                            </AccordionDetails>
+                                        </Accordion>
+                                    </Paper>
+
+                                    <Paper variant="outlined" sx={{ p: 1.3, borderRadius: 2.4 }}>
+                                        <Stack spacing={1.15}>
+                                            <Box>
+                                                <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>Interview Defaults</Typography>
+                                                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                                    Keep the default interview behavior light here. Advanced audio tuning stays tucked away below.
+                                                </Typography>
+                                            </Box>
+
+                                            <FormControl fullWidth size="small">
+                                                <InputLabel id="config-tts-provider-label">Voice Engine</InputLabel>
+                                                <Select
+                                                    labelId="config-tts-provider-label"
+                                                    label="Voice Engine"
+                                                    value={voiceEngine}
+                                                    onChange={(event) => setVoiceEngine(String(event.target.value || 'piper'))}
+                                                >
+                                                    <MenuItem value="piper">Piper (fast + lightweight)</MenuItem>
+                                                    <MenuItem value="qwen3_tts">Qwen3-TTS (higher quality, CUDA)</MenuItem>
+                                                </Select>
+                                            </FormControl>
+
+                                            <Box>
+                                                <Typography variant="caption" sx={{ display: 'block', color: 'text.secondary', mb: 0.7 }}>
+                                                    Interviewer Persona
+                                                </Typography>
+                                                <ToggleButtonGroup
+                                                    exclusive
+                                                    fullWidth
+                                                    size="small"
+                                                    value={defaultPersona}
+                                                    onChange={(_, value) => value && setDefaultPersona(value)}
+                                                    sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr' }}
+                                                >
+                                                    {PERSONA_OPTIONS.map((option) => {
+                                                        const Icon = option.icon;
+                                                        return (
+                                                            <ToggleButton key={option.id} value={option.id} sx={{ textTransform: 'none', gap: 0.7 }}>
+                                                                <Icon sx={{ fontSize: 17 }} />
+                                                                {option.label}
+                                                            </ToggleButton>
+                                                        );
+                                                    })}
+                                                </ToggleButtonGroup>
+                                                <Typography variant="caption" sx={{ color: 'text.secondary', mt: 0.6, display: 'block' }}>
+                                                    {activePersonaOption.description}
+                                                </Typography>
+                                            </Box>
+
+                                            <TextField
+                                                label="Auto-stop silence duration (seconds)"
+                                                value={recordingDraft.silence_auto_stop_seconds ?? ''}
+                                                onChange={(e) => setRecordingDraft((prev) => ({ ...prev, silence_auto_stop_seconds: e.target.value }))}
+                                                type="number"
+                                                inputProps={{ min: 1, max: 20, step: 0.5 }}
+                                                size="small"
+                                                fullWidth
+                                                helperText="How long we wait before treating your answer as finished."
+                                            />
+
+                                            <Accordion
+                                                disableGutters
+                                                elevation={0}
+                                                expanded={advancedOpen}
+                                                onChange={(_, expanded) => setAdvancedOpen(expanded)}
+                                                sx={{
+                                                    bgcolor: 'transparent',
+                                                    border: '1px solid',
+                                                    borderColor: 'divider',
+                                                    borderRadius: 2,
+                                                    '&::before': { display: 'none' },
+                                                }}
+                                            >
+                                                <AccordionSummary
+                                                    expandIcon={<ExpandMore />}
+                                                    sx={{
+                                                        px: 1.2,
+                                                        minHeight: 46,
+                                                        '& .MuiAccordionSummary-content': { my: 0.8 },
+                                                    }}
+                                                >
+                                                    <Box>
+                                                        <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                                                            Advanced Audio Settings
+                                                        </Typography>
+                                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                            Fine-tune Piper style, silence sensitivity, and workspace reset only when needed.
+                                                        </Typography>
+                                                    </Box>
+                                                </AccordionSummary>
+                                                <AccordionDetails sx={{ px: 1.2, pt: 0, pb: 1.2 }}>
+                                                    <Stack spacing={1}>
+                                                        <FormControl fullWidth size="small">
+                                                            <InputLabel id="config-piper-style-label">Piper Style</InputLabel>
+                                                            <Select
+                                                                labelId="config-piper-style-label"
+                                                                label="Piper Style"
+                                                                value={voiceStyle}
+                                                                onChange={(event) => setVoiceStyle(String(event.target.value || 'interviewer'))}
+                                                                disabled={voiceEngine !== 'piper'}
+                                                            >
+                                                                {PIPER_STYLE_OPTIONS.map((option) => (
+                                                                    <MenuItem key={option.id} value={option.id}>
+                                                                        {option.label}
+                                                                    </MenuItem>
+                                                                ))}
+                                                            </Select>
+                                                        </FormControl>
+                                                        {voiceEngine !== 'piper' && (
+                                                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                                Piper style presets only apply when the voice engine is Piper.
+                                                            </Typography>
+                                                        )}
+
+                                                        <TextField
+                                                            label="Silence RMS threshold"
+                                                            value={recordingDraft.silence_rms_threshold ?? ''}
+                                                            onChange={(e) => setRecordingDraft((prev) => ({ ...prev, silence_rms_threshold: e.target.value }))}
+                                                            type="number"
+                                                            inputProps={{ min: 0.001, max: 0.05, step: 0.001 }}
+                                                            size="small"
+                                                            fullWidth
+                                                            helperText="Lower is more sensitive to quiet speech."
+                                                        />
+
+                                                        <Divider sx={{ my: 0.4 }} />
+                                                        <Stack
+                                                            direction={{ xs: 'column', sm: 'row' }}
+                                                            spacing={1}
+                                                            justifyContent="space-between"
+                                                            alignItems={{ xs: 'flex-start', sm: 'center' }}
+                                                        >
+                                                            <Box>
+                                                                <Typography variant="caption" sx={{ display: 'block', color: 'text.secondary' }}>
+                                                                    Danger Zone
                                                                 </Typography>
-                                                                <Typography variant="caption" sx={{ color: 'text.secondary', lineHeight: 1.25 }}>
-                                                                    {option.description}
+                                                                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                                    Reset history and saved workspace only if you want a clean slate.
                                                                 </Typography>
                                                             </Box>
+                                                            <Button
+                                                                variant="outlined"
+                                                                color="error"
+                                                                startIcon={<DeleteSweep />}
+                                                                onClick={() => setResetDialogOpen(true)}
+                                                            >
+                                                                Reset All Data
+                                                            </Button>
                                                         </Stack>
-                                                    </Paper>
-                                                );
-                                            })}
-                                        </Box>
-                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                            Used as default for new sessions. You can still change persona on Interviews.
-                                        </Typography>
-                                    </Stack>
-                                </Stack>
-                            </Box>
+                                                    </Stack>
+                                                </AccordionDetails>
+                                            </Accordion>
+                                        </Stack>
+                                    </Paper>
+                                </Box>
+                            </Stack>
 
                             {error && (
                                 <Typography variant="body2" color="error" sx={{ mt: 1.2 }}>
@@ -764,15 +854,14 @@ export default function ConfigurationView() {
                                 </Typography>
                             )}
 
-                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} sx={{ mt: 1.6 }}>
+                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} sx={{ mt: 1.35 }}>
                                 <Typography variant="caption" sx={{ color: 'text.secondary' }}>
                                     {analysisProgress || 'Save configuration, then analyze to refresh readiness and skill gaps.'}
                                 </Typography>
                                 <Stack direction="row" spacing={1}>
                                     <Button
-                                        variant="outlined"
+                                        variant="text"
                                         color="error"
-                                        startIcon={<DeleteSweep />}
                                         onClick={() => setClearDialogOpen(true)}
                                         disabled={isAnalyzing}
                                     >
@@ -1092,6 +1181,28 @@ export default function ConfigurationView() {
                             }}
                         >
                             Clear Configuration
+                        </Button>
+                    </DialogActions>
+                </Dialog>
+
+                <Dialog open={resetDialogOpen} onClose={() => setResetDialogOpen(false)} maxWidth="xs" fullWidth>
+                    <DialogTitle>Reset All Data?</DialogTitle>
+                    <DialogContent>
+                        <Typography variant="body2">
+                            This will permanently delete interview history and clear saved configuration and analysis workspace.
+                        </Typography>
+                    </DialogContent>
+                    <DialogActions>
+                        <Button onClick={() => setResetDialogOpen(false)}>Cancel</Button>
+                        <Button
+                            color="error"
+                            variant="contained"
+                            onClick={() => {
+                                setResetDialogOpen(false);
+                                resetWorkspace();
+                            }}
+                        >
+                            Reset All Data
                         </Button>
                     </DialogActions>
                 </Dialog>

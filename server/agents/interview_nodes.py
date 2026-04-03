@@ -1348,30 +1348,67 @@ def _normalize_evaluation_payload(
 
     quality_flags = list(dict.fromkeys([f for f in quality_flags if f]))[:6]
 
+    score_breakdown = {
+        "relevance": round(relevance, 1),
+        "depth": round(depth, 1),
+        "structure": round(structure, 1),
+        "specificity": round(specificity, 1),
+        "communication": round(communication, 1),
+        # Backward-compatible aliases for pre-v2 consumers/tests.
+        "accuracy": round(relevance, 1),
+        "completeness": round(depth, 1),
+        "clarity": round(communication, 1),
+    }
+    rubric_hits = list(
+        dict.fromkeys(
+            [str(item).strip() for item in (evaluation.get("rubric_hits") or []) if str(item).strip()]
+            + auto_hits
+        )
+    )[:6]
+    rubric_misses = list(
+        dict.fromkeys(
+            [str(item).strip() for item in (evaluation.get("rubric_misses") or []) if str(item).strip()]
+            + gaps
+        )
+    )[:6]
+    improvement_plan = {
+        "focus": derived_plan["focus"],
+        "steps": derived_plan["steps"],
+        "success_criteria": derived_plan["success_criteria"],
+    }
+    coaching_tip = str(
+        evaluation.get("coaching_tip")
+        or "Structure your answer: context, action, result. Add specific evidence."
+    )
+    model_answer = str(
+        evaluation.get("model_answer")
+        or evaluation.get("optimized_answer")
+        or "A strong answer defines the concept, explains trade-offs, and anchors with a concrete example."
+    )
+    evaluation_reasoning = str(
+        evaluation.get("evaluation_reasoning") or evaluation.get("feedback") or ""
+    )
+
     return {
+        "evaluation_version": "v2",
         "score": weighted,
-        "score_breakdown": {
-            "relevance": round(relevance, 1),
-            "depth": round(depth, 1),
-            "structure": round(structure, 1),
-            "specificity": round(specificity, 1),
-            "communication": round(communication, 1),
-        },
+        "score_breakdown": score_breakdown,
         "strengths": strengths[:6],
         "gaps": gaps[:6],
+        "missing_concepts": gaps[:6],
         "quality_flags": quality_flags,
         "confidence": round(confidence, 2),
         "coverage_ratio": coverage,
+        "rubric_hits": rubric_hits,
+        "rubric_misses": rubric_misses,
         "evidence_quotes": evidence_quotes,
-        "improvement_plan": {
-            "focus": derived_plan["focus"],
-            "steps": derived_plan["steps"],
-            "success_criteria": derived_plan["success_criteria"],
-        },
+        "improvement_plan": improvement_plan,
         "retry_drill": derived_plan["retry_drill"],
-        "coaching_tip": str(evaluation.get("coaching_tip") or "Structure your answer: context, action, result. Add specific evidence."),
-        "model_answer": str(evaluation.get("model_answer") or evaluation.get("optimized_answer") or "A strong answer defines the concept, explains trade-offs, and anchors with a concrete example."),
-        "evaluation_reasoning": str(evaluation.get("evaluation_reasoning") or evaluation.get("feedback") or ""),
+        "coaching_tip": coaching_tip,
+        "model_answer": model_answer,
+        "optimized_answer": model_answer,
+        "evaluation_reasoning": evaluation_reasoning,
+        "feedback": evaluation_reasoning,
     }
 
 

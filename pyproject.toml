@@ -1,40 +1,42 @@
 [tool.poetry]
 name = "interview-agent-server"
 version = "0.1.0"
-description = "SOTA Interview Agent - LangGraph Backend"
+description = "BeePrepared - LangGraph backend for AI interview coaching"
 authors = ["Developer"]
 readme = "README.md"
 packages = [{include = "server"}]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = ">=3.11,<3.13"
 # Core Web/API
 fastapi = "^0.115.0"
 uvicorn = {extras = ["standard"], version = "^0.32.0"}
 python-socketio = "^5.11.0"
-python-multipart = "^0.0.12"
+python-multipart = ">=0.0.12"
 # Agent Framework
-langgraph = "^0.2.0"
-langchain-core = "^0.3.0"
-langchain-ollama = "^0.2.0"
+langgraph = ">=0.2.0"
+langchain-core = ">=0.3.0"
+langchain-ollama = ">=0.2.0"
 langchain-openai = "^0.3.0"
 pydantic = "^2.9.0"
 httpx = "^0.28.0"
-# AI/ML (Apple Silicon Optimized)
-mlx-lm = "^0.20.0"
-mlx-whisper = "^0.4.0"
-neutts = "*"
-soundfile = "^0.12.1"
+# AI/ML (Linux CUDA Optimized)
+faster-whisper = "*"
+torch = "*"
+soundfile = ">=0.12.1"
 numpy = "^2.0.0"
-huggingface-hub = "^0.26.0"
+huggingface-hub = ">=0.26.0"
+# TTS
+qwen-tts = "*"
+piper-tts = "^1.4.1"
 # PDF Parsing
 pypdf = "^4.0.0"
+reportlab = "^4.4.1"
 # Audio VAD
 webrtcvad = "^2.0.10"
-# Database
-qdrant-client = "^1.12.0"
 # Utils
 pydantic-settings = "^2.6.0"
+pathvalidate = "^3.3.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

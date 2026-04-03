@@ -1150,7 +1150,7 @@ class UserDatabase:
                 - question_count_override: Optional per-session question count override
                 - interviewer_persona: Interviewer behavior style
                 - piper_style: Question/response voice style preset (interviewer|balanced|fast)
-                - tts_provider: Question voice engine (piper|qwen3_tts_mlx)
+                - tts_provider: Question voice engine (piper|qwen3_tts)
                 - focus_areas: List of focus topics
                 - onboarding_complete: bool
                 - mic_permission_granted: bool
@@ -1174,7 +1174,9 @@ class UserDatabase:
         if piper_style not in {"interviewer", "balanced", "fast"}:
             piper_style = "interviewer"
         tts_provider = str(preferences.get("tts_provider") or "piper").strip().lower()
-        if tts_provider not in {"piper", "qwen3_tts_mlx"}:
+        if tts_provider == "qwen3_tts_mlx":
+            tts_provider = "qwen3_tts"
+        if tts_provider not in ["piper", "neutts", "kokoro", "qwen3_tts"]:
             tts_provider = "piper"
         
         cursor.execute("""
@@ -1240,7 +1242,11 @@ class UserDatabase:
                 "question_count_override": int(row[5]) if row[5] is not None else None,
                 "interviewer_persona": str(row[6] or "friendly").strip().lower() or "friendly",
                 "piper_style": str(row[7] or "interviewer").strip().lower() or "interviewer",
-                "tts_provider": str(row[8] or "piper").strip().lower() or "piper",
+                "tts_provider": (
+                    "qwen3_tts"
+                    if str(row[8] or "piper").strip().lower() == "qwen3_tts_mlx"
+                    else (str(row[8] or "piper").strip().lower() or "piper")
+                ),
                 "evaluation_thresholds": thresholds if isinstance(thresholds, dict) else {},
                 "recording_thresholds": recording_thresholds if isinstance(recording_thresholds, dict) else {},
                 "focus_areas": json.loads(row[11]) if row[11] else [],
