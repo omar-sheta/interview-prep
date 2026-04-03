@@ -36,6 +36,7 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
+import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
 
 const INTERVIEW_TYPES = [
     {
@@ -211,16 +212,7 @@ export default function V0Setup() {
             return;
         }
 
-        // --- Unlock audio playback on user click ---
-        try {
-            const unlockAudio = new Audio();
-            // A silent 1-second base64 wav file
-            unlockAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-            unlockAudio.play().catch(() => { });
-        } catch (e) {
-            console.warn('Audio unlock failed:', e);
-        }
-        // -------------------------------------------
+        void primeQuestionAudioPlayback();
 
         setError('');
         setStartingType(interviewType.id);
@@ -252,15 +244,7 @@ export default function V0Setup() {
             return;
         }
 
-        // --- Unlock audio playback on user click ---
-        try {
-            const unlockAudio = new Audio();
-            unlockAudio.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-            unlockAudio.play().catch(() => { });
-        } catch (e) {
-            console.warn('Audio unlock failed:', e);
-        }
-        // -------------------------------------------
+        void primeQuestionAudioPlayback();
 
         setQuickStarting(true);
         setError('');

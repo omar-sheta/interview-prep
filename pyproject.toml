@@ -28,6 +28,7 @@ numpy = "^2.0.0"
 huggingface-hub = ">=0.26.0"
 # TTS
 qwen-tts = "*"
+faster-qwen3-tts = "^0.2.5"
 piper-tts = "^1.4.1"
 # PDF Parsing
 pypdf = "^4.0.0"
