@@ -1,5 +1,5 @@
 """
-Agent State Schema for Interview Agent.
+Agent State Schema for BeePrepared.
 Defines the state that flows through the LangGraph agent.
 """
 
@@ -12,7 +12,7 @@ InterviewStatus = Literal["warmup", "technical", "feedback"]
 
 class InterviewState(TypedDict):
     """
-    State schema for the Interview Agent LangGraph.
+    State schema for the BeePrepared LangGraph.
     
     This state is passed between nodes in the graph and maintains
     the interview context throughout the conversation.

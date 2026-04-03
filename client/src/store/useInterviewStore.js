@@ -1,5 +1,5 @@
 /**
- * Zustand Store for Interview Agent
+ * Zustand Store for BeePrepared
  * Manages global state for Socket.IO, app phases, and real-time data
  * With localStorage persistence for session data
  */
@@ -18,6 +18,18 @@ const APP_STATES = {
     COMPLETE: 'COMPLETE',
 };
 
+const formatInterviewLaunchStatus = (stage) => {
+    const normalized = String(stage || '').trim();
+    if (!normalized) return '';
+
+    const knownStages = {
+        generating_questions: 'Generating interview questions...',
+        questions_ready: 'Questions ready. Starting interview...',
+    };
+
+    return knownStages[normalized] || normalized;
+};
+
 const ALLOWED_PIPER_STYLES = new Set(['interviewer', 'balanced', 'fast']);
 const normalizePiperStyle = (style, fallback = 'interviewer') => {
     const fallbackNormalized = ALLOWED_PIPER_STYLES.has(String(fallback || '').trim().toLowerCase())
@@ -27,12 +39,16 @@ const normalizePiperStyle = (style, fallback = 'interviewer') => {
     return ALLOWED_PIPER_STYLES.has(normalized) ? normalized : fallbackNormalized;
 };
 
-const ALLOWED_TTS_PROVIDERS = new Set(['piper', 'qwen3_tts_mlx']);
+const ALLOWED_TTS_PROVIDERS = new Set(['piper', 'qwen3_tts', 'qwen3_tts_mlx']);
 const normalizeTtsProvider = (provider, fallback = 'piper') => {
+    const normalizeLegacy = (value) => {
+        const normalizedValue = String(value || '').trim().toLowerCase();
+        return normalizedValue === 'qwen3_tts_mlx' ? 'qwen3_tts' : normalizedValue;
+    };
     const fallbackNormalized = ALLOWED_TTS_PROVIDERS.has(String(fallback || '').trim().toLowerCase())
-        ? String(fallback || '').trim().toLowerCase()
+        ? normalizeLegacy(fallback)
         : 'piper';
-    const normalized = String(provider || '').trim().toLowerCase();
+    const normalized = normalizeLegacy(provider);
     return ALLOWED_TTS_PROVIDERS.has(normalized) ? normalized : fallbackNormalized;
 };
 
@@ -159,8 +175,8 @@ const useInterviewStore = create(
 
                 // Direct backend socket by default for local dev reliability.
                 // Override with VITE_SOCKET_URL when needed.
-                const socketUrl = (import.meta.env.VITE_SOCKET_URL || 'http://127.0.0.1:8000').trim();
-                const socketEndpoint = socketUrl || 'http://127.0.0.1:8000';
+                const socketUrl = (import.meta.env.VITE_SOCKET_URL || '').trim();
+                const socketEndpoint = socketUrl || '';
                 const newSocket = io(socketEndpoint, {
                     path: '/socket.io',
                     transports: ['websocket'],
@@ -184,7 +200,7 @@ const useInterviewStore = create(
                 set({ socket: newSocket });
                 newSocket.on('connect', () => {
                     set({ isConnected: true, connectionError: null });
-                    get().addThinking('🔌 Connected to Interview Agent');
+                    get().addThinking('🔌 Connected to BeePrepared');
 
                     // Restore authenticated session if we have a token
                     const { sessionToken } = get();
@@ -206,6 +222,8 @@ const useInterviewStore = create(
                         const prefs = data.preferences || {};
                         const nextState = {
                             userId: data.user.user_id,
+                            userEmail: data.user.email || get().userEmail,
+                            onboardingComplete: true,
                             targetRole: prefs.target_role || '',
                             targetCompany: prefs.target_company || '',
                             jobDescription: prefs.job_description || '',
@@ -250,6 +268,8 @@ const useInterviewStore = create(
                             nextState.sessionToken = data.session_token;
                             localStorage.setItem('session_token', data.session_token);
                         }
+                        localStorage.setItem('user_id', data.user.user_id);
+                        localStorage.setItem('onboarding_complete', 'true');
                         set(nextState);
                         get().addThinking(`✅ Authenticated as ${data.user.email}`);
                     }
@@ -259,9 +279,12 @@ const useInterviewStore = create(
                     const msg = data?.error || 'Authentication error';
                     if (msg.toLowerCase().includes('token')) {
                         localStorage.removeItem('session_token');
+                        localStorage.removeItem('user_id');
+                        localStorage.removeItem('onboarding_complete');
                         set({
                             sessionToken: null,
                             userId: null,
+                            userEmail: null,
                             onboardingComplete: false,
                             historyLoading: false,
                             deletingSessionIds: {},
@@ -279,11 +302,17 @@ const useInterviewStore = create(
                     const prefs = data.preferences || {};
                     const nextState = {
                         userId: data.user?.user_id || get().userId,
+                        userEmail: data.user?.email || get().userEmail,
+                        onboardingComplete: true,
                     };
                     if (data.session_token) {
                         nextState.sessionToken = data.session_token;
                         localStorage.setItem('session_token', data.session_token);
                     }
+                    if (data.user?.user_id) {
+                        localStorage.setItem('user_id', data.user.user_id);
+                    }
+                    localStorage.setItem('onboarding_complete', 'true');
 
                     // If an interview is active, only update user/prefs — do NOT
                     // reset interview state, which would wipe the current question.
@@ -372,6 +401,30 @@ const useInterviewStore = create(
                     get().addThinking(`📊 ${data.message}`);
                 });
 
+                onSafe('status', (data) => {
+                    const stage = String(data?.stage || '').trim();
+                    if (!stage) return;
+
+                    const isInterviewLaunchStage =
+                        stage === 'generating_questions' ||
+                        stage === 'questions_ready' ||
+                        stage.startsWith('Generating ') ||
+                        stage.startsWith('✅ Generated');
+
+                    if (!isInterviewLaunchStage) return;
+
+                    const friendlyStage = formatInterviewLaunchStatus(stage);
+                    set((state) => {
+                        if (state.interviewActive) return state;
+                        return {
+                            ...state,
+                            appState: APP_STATES.ANALYZING,
+                            analysisProgress: friendlyStage,
+                        };
+                    });
+                    get().addThinking(`⏳ ${friendlyStage}`);
+                });
+
                 // Handle career analysis (both fresh and loaded from DB)
                 onSafe('career_analysis', (data) => {
                     const analysis = data.analysis;
@@ -448,6 +501,7 @@ const useInterviewStore = create(
                         ttsProvider: normalizeTtsProvider(data.tts_provider, get().ttsProvider || 'piper'),
                         coachingEnabled: !!data.coaching_enabled,
                         appState: APP_STATES.INTERVIEWING,
+                        analysisProgress: '',
                         answerSubmitPending: false,
                         retryAttemptsByQuestion: {},
                         retrySubmitting: {},
@@ -523,7 +577,25 @@ const useInterviewStore = create(
                 });
 
                 onSafe('interview_error', (data) => {
-                    set({ answerSubmitPending: false });
+                    set((state) => {
+                        if (state.interviewActive) {
+                            return { answerSubmitPending: false };
+                        }
+
+                        const hasAnalysisData = Boolean(
+                            state.mindmap ||
+                            state.skillMapping ||
+                            state.practicePlan ||
+                            (Array.isArray(state.suggestedSessions) && state.suggestedSessions.length) ||
+                            Number(state.readinessScore) > 0
+                        );
+
+                        return {
+                            answerSubmitPending: false,
+                            analysisProgress: `Error: ${data?.error || 'Unable to start interview'}`,
+                            appState: hasAnalysisData ? APP_STATES.MAP_READY : APP_STATES.IDLE,
+                        };
+                    });
                     if (data?.error) get().addThinking(`❌ ${data.error}`);
                 });
 
@@ -867,6 +939,20 @@ const useInterviewStore = create(
             startInterview: (params) => {
                 const { socket } = get();
                 if (!socket?.connected) return;
+                set({
+                    appState: APP_STATES.ANALYZING,
+                    analysisProgress: 'Generating interview questions...',
+                    interviewActive: false,
+                    currentQuestion: null,
+                    questionNumber: 0,
+                    totalQuestions: 0,
+                    answerEvaluation: null,
+                    coachingHint: null,
+                    answerSubmitPending: false,
+                    currentSessionId: null,
+                    ttsAudioQueue: [],
+                });
+                get().addThinking('⏳ Generating interview questions...');
                 socket.emit('start_interview', params);
             },
 

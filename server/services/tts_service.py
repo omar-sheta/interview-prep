@@ -3,9 +3,9 @@ TTS Service for BeePrepared.
 
 Supported user-selectable providers:
 - Piper (CLI, ONNX voices including high-quality models)
-- Qwen3-TTS MLX (mlx-audio, Hugging Face MLX community model)
+- Qwen3-TTS CUDA (qwen-tts package, Hugging Face model on NVIDIA GPUs)
 
-Fallback backends: NeuTTS Air (Neuphonic), Kokoro-82M via mlx-audio (optional)
+Fallback backends: NeuTTS Air (Neuphonic), Kokoro-82M via PyTorch (optional)
 """
 
 import asyncio
@@ -15,7 +15,6 @@ import json
 import shutil
 import subprocess
 import tempfile
-import importlib.metadata
 from typing import Optional
 from pathlib import Path
 
@@ -76,15 +75,15 @@ NEUTTS_SAMPLE_RATE = int(os.getenv("NEUTTS_SAMPLE_RATE", "24000"))
 NEUTTS_DYNAMIC_REF_TEXT = os.getenv("NEUTTS_DYNAMIC_REF_TEXT", "1").lower() in {"1", "true", "yes", "on"}
 
 # Kokoro fallback configuration
-KOKORO_MODEL_ID = os.getenv("KOKORO_MODEL_ID", "mlx-community/Kokoro-82M-bf16")
+KOKORO_MODEL_ID = os.getenv("KOKORO_MODEL_ID", "hexgrad/Kokoro-82M")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")  # Warm, professional female voice
 KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.9"))  # Slightly slower for clearer articulation
 KOKORO_LANG = os.getenv("KOKORO_LANG", "a")  # "a" = American English
 
-# Qwen3-TTS (mlx-audio) configuration
-QWEN3_TTS_MODEL_ID = os.getenv("QWEN3_TTS_MODEL_ID", "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit").strip()
+# Qwen3-TTS CUDA configuration
+QWEN3_TTS_MODEL_ID = os.getenv("QWEN3_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").strip()
 QWEN3_TTS_SAMPLE_RATE = int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
-QWEN3_TTS_SPEAKER = os.getenv("QWEN3_TTS_SPEAKER", "aiden").strip().lower()
+QWEN3_TTS_SPEAKER = os.getenv("QWEN3_TTS_SPEAKER", "Aiden").strip()
 QWEN3_TTS_INSTRUCT = os.getenv(
     "QWEN3_TTS_INSTRUCT",
     "Professional and clear."
@@ -93,14 +92,19 @@ QWEN3_TTS_INSTRUCT = os.getenv(
 SAVE_TTS_DEBUG_AUDIO = os.getenv("SAVE_TTS_DEBUG_AUDIO", "0").lower() in {"1", "true", "yes", "on"}
 _tts_infer_lock = threading.Lock()
 ALLOWED_PIPER_STYLES = {"interviewer", "balanced", "fast"}
-ALLOWED_TTS_PROVIDERS = {"piper", "qwen3_tts_mlx"}
+ALLOWED_TTS_PROVIDERS = {"piper", "qwen3_tts"}
 
 
 def _normalize_tts_provider(provider: Optional[str], fallback: str = "piper") -> str:
     normalized_fallback = str(fallback or "piper").strip().lower()
+    # Accept legacy "qwen3_tts_mlx" as alias for "qwen3_tts"
+    if normalized_fallback == "qwen3_tts_mlx":
+        normalized_fallback = "qwen3_tts"
     if normalized_fallback not in ALLOWED_TTS_PROVIDERS:
         normalized_fallback = "piper"
     normalized = str(provider or "").strip().lower()
+    if normalized == "qwen3_tts_mlx":
+        normalized = "qwen3_tts"
     if normalized in ALLOWED_TTS_PROVIDERS:
         return normalized
     return normalized_fallback
@@ -109,19 +113,45 @@ def _normalize_tts_provider(provider: Optional[str], fallback: str = "piper") ->
 DEFAULT_TTS_PROVIDER = _normalize_tts_provider(TTS_PROVIDER, fallback="piper")
 
 
+def _normalize_qwen3_tts_model_id(model_id: Optional[str]) -> str:
+    """Map legacy shorthand ids to valid Hugging Face checkpoints."""
+    normalized = str(model_id or "").strip()
+    alias_map = {
+        "Qwen/Qwen3-TTS-1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "Qwen/Qwen3-TTS-0.6B": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "Qwen/Qwen3-TTS-CustomVoice-1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "Qwen/Qwen3-TTS-CustomVoice-0.6B": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    }
+    return alias_map.get(normalized, normalized or "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+
+
+def _normalize_qwen3_speaker_name(speaker: Optional[str]) -> str:
+    """Normalize common speaker aliases while preserving official case-sensitive names."""
+    normalized = str(speaker or "").strip()
+    if not normalized:
+        return "Aiden"
+    alias_map = {
+        "aiden": "Aiden",
+        "ryan": "Ryan",
+        "vivian": "Vivian",
+        "serena": "Serena",
+        "uncle_fu": "Uncle_Fu",
+        "uncle fu": "Uncle_Fu",
+        "dylan": "Dylan",
+        "eric": "Eric",
+        "ono_anna": "Ono_Anna",
+        "ono anna": "Ono_Anna",
+        "sohee": "Sohee",
+    }
+    return alias_map.get(normalized.lower(), normalized)
+
+
 def _disable_qwen3_tts(reason: str) -> None:
     """Disable qwen3 provider for this process after a hard initialization/generation failure."""
     global _qwen3_tts_model
     global _qwen3_tts_disabled_reason
     _qwen3_tts_model = None
     _qwen3_tts_disabled_reason = str(reason or "unknown_error")
-
-
-def _mlx_audio_version() -> str:
-    try:
-        return str(importlib.metadata.version("mlx-audio"))
-    except Exception:
-        return "unknown"
 
 
 def _piper_style_defaults(style: str) -> dict[str, float]:
@@ -227,9 +257,8 @@ def _resolve_piper_binary() -> Optional[str]:
         return resolved
 
     for candidate in (
-        "/opt/homebrew/Caskroom/miniforge/base/bin/piper",
-        "/opt/homebrew/bin/piper",
         "/usr/local/bin/piper",
+        "/usr/bin/piper",
     ):
         p = Path(candidate)
         if p.exists() and p.is_file():
@@ -266,7 +295,6 @@ def _discover_piper_model_path() -> Optional[Path]:
         project_root / "models" / "piper",
         project_root / "models",
         home / ".local" / "share" / "piper",
-        home / "Library" / "Application Support" / "piper",
         home / ".cache" / "piper",
     ]
 
@@ -400,7 +428,7 @@ def _load_neutts():
     print(f"🔄 Loading TTS backend (NeuTTS): {NEUTTS_MODEL_ID}...")
     from neutts import NeuTTS
     import torch
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"🎯 NeuTTS device: {device}")
     model = NeuTTS(backbone_repo=NEUTTS_MODEL_ID, backbone_device=device, codec_device=device)
 
@@ -437,9 +465,6 @@ def _load_neutts():
         if sidecar.exists():
             ref_text = sidecar.read_text(encoding="utf-8").strip()
     if not ref_text:
-        # Avoid hardcoded spoken phrases that can leak into generations.
-        # If no transcript is available for the reference audio, we can
-        # optionally use per-request text as guidance during inference.
         ref_text = ""
         if NEUTTS_DYNAMIC_REF_TEXT:
             print("ℹ️  No NEUTTS_REF_TEXT/pro.txt found; using dynamic ref_text from request text.")
@@ -457,7 +482,7 @@ def _load_neutts():
 
 
 def _load_kokoro():
-    """Load Kokoro as compatibility fallback."""
+    """Load Kokoro PyTorch as compatibility fallback."""
     global _tts_model
     global _tts_backend_kind
     global _tts_sample_rate
@@ -467,64 +492,100 @@ def _load_kokoro():
     old_level = lib_logger.level
     lib_logger.setLevel(logging.ERROR)
 
-    print(f"🔄 Loading TTS fallback (Kokoro): {KOKORO_MODEL_ID}...")
+    print(f"🔄 Loading TTS fallback (Kokoro PyTorch)...")
     try:
-        from mlx_audio.tts.utils import get_model_path, load_model
-        model_path = get_model_path(KOKORO_MODEL_ID)
-        model = load_model(model_path)
+        from kokoro import KPipeline
+        import torch
 
-        # Warm up the pipeline (first call initializes KokoroPipeline + spacy)
-        for _ in model.generate(
-            text="ready", voice=KOKORO_VOICE, speed=KOKORO_SPEED, lang_code=KOKORO_LANG
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model = KPipeline(lang_code=KOKORO_LANG, device=device)
+
+        # Warm up the pipeline
+        for _ in model(
+            "ready", voice=KOKORO_VOICE, speed=KOKORO_SPEED, split_pattern=r'\n+'
         ):
             break
 
         _tts_model = model
         _tts_backend_kind = "kokoro"
-        _tts_sample_rate = int(getattr(model, "sample_rate", 24000))
-        print(f"✅ Kokoro READY (sample_rate={_tts_sample_rate})")
+        _tts_sample_rate = 24000
+        print(f"✅ Kokoro READY (sample_rate={_tts_sample_rate}, device={device})")
     finally:
         lib_logger.setLevel(old_level)
 
 
-def _load_qwen3_tts_mlx():
-    """Load Qwen3-TTS model via mlx-audio."""
+def _load_qwen3_tts_cuda():
+    """Load Qwen3-TTS model via qwen-tts on CUDA."""
     global _qwen3_tts_model
     global _qwen3_tts_sample_rate
 
-    print(f"🔄 Loading TTS backend (Qwen3-TTS MLX): {QWEN3_TTS_MODEL_ID}...")
+    import sys
+    import os
+
+    # Inject local SoX paths (extracted from deb files because we lack sudo)
+    # The server/services/ directory is 2 levels deep from the project root.
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sox_bin = os.path.join(base_dir, "sox_local/usr/bin")
+    sox_lib = os.path.join(base_dir, "sox_local/usr/lib/aarch64-linux-gnu")
+    
+    if os.path.exists(sox_bin):
+        os.environ["PATH"] = f"{sox_bin}:{os.environ.get('PATH', '')}"
+    if os.path.exists(sox_lib):
+        # We also need to add the plugin directory if it exists
+        sox_fmt_lib = os.path.join(sox_lib, "sox")
+        os.environ["LD_LIBRARY_PATH"] = f"{sox_lib}:{sox_fmt_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+
+    model_id = _normalize_qwen3_tts_model_id(QWEN3_TTS_MODEL_ID)
+    print(f"🔄 Loading TTS backend (Qwen3-TTS CUDA): {model_id}...")
     try:
-        from mlx_audio.tts.utils import load_model, get_model_path
-    except Exception as import_err:
-        _disable_qwen3_tts(f"mlx_audio_import_failed: {import_err}")
+        # Suppress stderr during import to hide "flash-attn" warnings
+        # since it successfully falls back to PyTorch/soundfile.
+        devnull = open(os.devnull, 'w')
+        old_stderr = sys.stderr
+        sys.stderr = devnull
+        try:
+            import qwen_tts
+            from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel as QwenTTS
+        finally:
+            sys.stderr = old_stderr
+            devnull.close()
+    except ImportError as import_err:
+        _disable_qwen3_tts(f"qwen_tts_import_failed: {import_err}")
         raise RuntimeError(
-            f"Qwen3-TTS MLX unavailable because mlx-audio import failed ({import_err})."
+            f"Qwen3-TTS CUDA unavailable because qwen-tts import failed ({import_err}). "
+            "Install with: pip install qwen-tts"
         ) from import_err
 
-    model = None
-    primary_err: Optional[Exception] = None
     try:
-        model = load_model(QWEN3_TTS_MODEL_ID)
-    except Exception as err:
-        primary_err = err
-        try:
-            model_path = get_model_path(QWEN3_TTS_MODEL_ID)
-            model = load_model(model_path)
-        except Exception as second_err:
-            msg = str(second_err or primary_err or "unknown_error")
-            mlx_ver = _mlx_audio_version()
-            hint = (
-                "Likely MLX model/runtime mismatch. "
-                "Try: pip install -U mlx-audio (>=0.3.0 recommended for this model)."
-            )
-            _disable_qwen3_tts(f"load_failed: {msg}")
-            raise RuntimeError(
-                f"Qwen3-TTS MLX load failed ({msg}); mlx-audio={mlx_ver}. {hint}"
-            ) from second_err
+        import importlib.util
+        import torch
 
-    _qwen3_tts_model = model
-    _qwen3_tts_sample_rate = int(getattr(model, "sample_rate", QWEN3_TTS_SAMPLE_RATE))
-    print(f"✅ Qwen3-TTS MLX READY (sample_rate={_qwen3_tts_sample_rate})")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        load_kwargs = {
+            "device_map": device,
+            "dtype": dtype,
+        }
+        if torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None:
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+
+        try:
+            model = QwenTTS.from_pretrained(model_id, **load_kwargs)
+        except TypeError as err:
+            if "attn_implementation" not in str(err):
+                raise
+            load_kwargs.pop("attn_implementation", None)
+            model = QwenTTS.from_pretrained(model_id, **load_kwargs)
+        _qwen3_tts_model = model
+        _qwen3_tts_sample_rate = QWEN3_TTS_SAMPLE_RATE 
+        print(f"✅ Qwen3-TTS CUDA READY (device={device}, sample_rate={_qwen3_tts_sample_rate})")
+    except Exception as err:
+        msg = str(err)
+        _disable_qwen3_tts(f"load_failed: {msg}")
+        raise RuntimeError(
+            f"Qwen3-TTS CUDA load failed ({msg}). "
+            "Ensure qwen-tts is installed and CUDA is available."
+        ) from err
 
 
 def _ensure_qwen3_tts_loaded():
@@ -532,10 +593,10 @@ def _ensure_qwen3_tts_loaded():
     global _qwen3_tts_model
     if _qwen3_tts_disabled_reason:
         raise RuntimeError(
-            f"Qwen3-TTS MLX disabled in this process: {_qwen3_tts_disabled_reason}"
+            f"Qwen3-TTS disabled in this process: {_qwen3_tts_disabled_reason}"
         )
     if _qwen3_tts_model is None:
-        _load_qwen3_tts_mlx()
+        _load_qwen3_tts_cuda()
     return _qwen3_tts_model
 
 
@@ -684,97 +745,90 @@ def _generate_kokoro_audio(text: str, voice: Optional[str] = None) -> np.ndarray
     """Generate audio with Kokoro fallback backend."""
     model = _ensure_tts_loaded()
     audio_array = None
-    for result in model.generate(
+    for result in model(
         text=text,
         voice=voice or KOKORO_VOICE,
         speed=KOKORO_SPEED,
-        lang_code=KOKORO_LANG,
+        split_pattern=r'\n+',
     ):
-        audio_array = result.audio
+        audio_array = result.audio if hasattr(result, 'audio') else result
         break
     if audio_array is None:
         raise RuntimeError("Kokoro failed to generate audio")
     return _to_float_audio(audio_array)
 
 
-def _load_audio_from_path(path: Path) -> np.ndarray:
-    import soundfile as sf
-    audio, _sample_rate = sf.read(str(path), dtype="float32")
-    return _to_float_audio(audio)
-
-
-def _extract_qwen3_audio_result(result) -> Optional[np.ndarray]:
-    """Best-effort extraction for varying mlx-audio return shapes."""
-    if result is None:
-        return None
-    if isinstance(result, np.ndarray):
-        return _to_float_audio(result)
-    if isinstance(result, (str, Path)):
-        p = Path(result).expanduser().resolve()
-        if p.exists() and p.is_file():
-            return _load_audio_from_path(p)
-        return None
-    if isinstance(result, dict):
-        for key in ("audio", "waveform", "samples"):
-            if key in result:
-                audio = _extract_qwen3_audio_result(result.get(key))
-                if audio is not None:
-                    return audio
-        for key in ("file_path", "audio_path", "wav_path", "path"):
-            if key in result:
-                audio = _extract_qwen3_audio_result(result.get(key))
-                if audio is not None:
-                    return audio
-        return None
-    if isinstance(result, (tuple, list)):
-        for item in result:
-            audio = _extract_qwen3_audio_result(item)
-            if audio is not None:
-                return audio
-        return None
-    if hasattr(result, "audio"):
-        return _extract_qwen3_audio_result(getattr(result, "audio"))
-    if hasattr(result, "file_path"):
-        return _extract_qwen3_audio_result(getattr(result, "file_path"))
-    return None
-
-
 def _generate_qwen3_tts_audio(text: str, voice: Optional[str] = None) -> np.ndarray:
-    """Generate audio with Qwen3-TTS CustomVoice using a preset speaker."""
+    """Generate audio with Qwen3-TTS on CUDA via qwen-tts package."""
     import time as _time
     model = _ensure_qwen3_tts_loaded()
 
-    speaker = QWEN3_TTS_SPEAKER
+    speaker = _normalize_qwen3_speaker_name(voice or QWEN3_TTS_SPEAKER)
     instruct = QWEN3_TTS_INSTRUCT
     print(f"🎤 Qwen3 generating: speaker={speaker}, instruct={instruct!r}, text_len={len(text)}")
 
     t0 = _time.monotonic()
-    results = list(model.generate_custom_voice(
-        text=text,
-        speaker=speaker,
-        language="English",
-        instruct=instruct,
-    ))
-    elapsed = _time.monotonic() - t0
-    print(f"🎤 Qwen3 generate_custom_voice returned in {elapsed:.2f}s, results={len(results)}")
 
-    if not results or not hasattr(results[0], "audio"):
+    # qwen-tts API: generate audio from text
+    try:
+        # Try the generate_custom_voice API (matches macOS mlx-audio interface)
+        if hasattr(model, 'generate_custom_voice'):
+            # Estimate max tokens: ~12Hz codec rate, ~12 chars/sec speech ≈ 1 token/char, 2x safety margin
+            max_new_tokens = min(2048, max(512, len(text) * 5))
+            results = list(model.generate_custom_voice(
+                text=text,
+                speaker=speaker,
+                language="English",
+                instruct=instruct,
+                max_new_tokens=max_new_tokens,
+            ))
+        elif hasattr(model, 'generate'):
+            results = list(model.generate(
+                text=text,
+                speaker=speaker,
+            ))
+        elif hasattr(model, 'tts'):
+            # Some versions use tts() method
+            audio = model.tts(text=text, speaker=speaker)
+            elapsed = _time.monotonic() - t0
+            print(f"🎤 Qwen3 tts() returned in {elapsed:.2f}s")
+            return _to_float_audio(audio)
+        else:
+            # Fallback: try calling the model directly
+            audio = model(text, speaker=speaker)
+            elapsed = _time.monotonic() - t0
+            print(f"🎤 Qwen3 __call__ returned in {elapsed:.2f}s")
+            return _to_float_audio(audio)
+    except Exception as e:
+        elapsed = _time.monotonic() - t0
+        print(f"❌ Qwen3-TTS generation failed after {elapsed:.2f}s: {e}")
+        raise
+
+    elapsed = _time.monotonic() - t0
+    print(f"🎤 Qwen3 generation returned in {elapsed:.2f}s, results={len(results)}")
+
+    if not results:
         raise RuntimeError("Qwen3-TTS generation did not produce audio.")
 
-    audio = results[0].audio
+    # Extract audio from result
+    first_result = results[0]
+    if hasattr(first_result, "audio"):
+        audio = first_result.audio
+    elif isinstance(first_result, np.ndarray):
+        audio = first_result
+    elif hasattr(first_result, "detach"):
+        audio = first_result
+    else:
+        audio = first_result
+
     print(f"🎤 Raw audio type={type(audio).__name__}, shape={getattr(audio, 'shape', 'N/A')}")
 
-    # Convert mlx array to numpy.
-    if hasattr(audio, "tolist"):
-        audio = np.array(audio.tolist(), dtype=np.float32)
-
-    print(f"🎤 Numpy audio: shape={audio.shape}, min={audio.min():.4f}, max={audio.max():.4f}, nonzero={np.count_nonzero(audio)}/{len(audio)}")
     return _to_float_audio(audio)
 
 
 def _resolve_provider_sample_rate(provider: Optional[str] = None) -> int:
     provider_key = _normalize_tts_provider(provider, fallback=DEFAULT_TTS_PROVIDER)
-    if provider_key == "qwen3_tts_mlx":
+    if provider_key == "qwen3_tts":
         try:
             _ensure_qwen3_tts_loaded()
             return int(_qwen3_tts_sample_rate or QWEN3_TTS_SAMPLE_RATE)
@@ -794,7 +848,7 @@ def _generate_audio(
 ) -> np.ndarray:
     """Route synthesis to selected provider."""
     provider_key = _normalize_tts_provider(provider, fallback=DEFAULT_TTS_PROVIDER)
-    if provider_key == "qwen3_tts_mlx":
+    if provider_key == "qwen3_tts":
         try:
             return _generate_qwen3_tts_audio(text, voice=voice)
         except Exception as qwen_err:
@@ -847,7 +901,7 @@ class TTSService:
             text: Text to synthesize
             voice: Optional voice preset / reference audio path
             style: Piper voice style preset
-            provider: TTS provider key (piper|qwen3_tts_mlx)
+            provider: TTS provider key (piper|qwen3_tts)
 
         Returns:
             Raw PCM audio bytes (16-bit signed, mono, 24kHz)
@@ -876,7 +930,7 @@ class TTSService:
             text: Text to synthesize
             voice: Optional voice preset / reference audio path
             style: Piper voice style preset
-            provider: TTS provider key (piper|qwen3_tts_mlx)
+            provider: TTS provider key (piper|qwen3_tts)
 
         Returns:
             Base64-encoded WAV data
@@ -949,7 +1003,7 @@ def get_tts_service() -> TTSService:
 def preload_tts():
     """Preload TTS model at startup."""
     provider = _normalize_tts_provider(DEFAULT_TTS_PROVIDER, fallback="piper")
-    if provider == "qwen3_tts_mlx":
+    if provider == "qwen3_tts":
         try:
             _ensure_qwen3_tts_loaded()
         except Exception as qwen_err:

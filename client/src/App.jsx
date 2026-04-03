@@ -9,7 +9,6 @@ import useInterviewStore, { APP_STATES } from '@/store/useInterviewStore';
 import InterviewView from '@/components/InterviewView';
 import SessionReport from '@/components/SessionReport';
 import HistoryView from '@/components/HistoryView';
-import SettingsView from '@/components/SettingsView';
 import ConfigurationView from '@/components/ConfigurationView';
 // import OnboardingFlow from '@/components/OnboardingFlow'; // Deprecated
 import LoginScreen from '@/components/LoginScreen';
@@ -26,6 +25,7 @@ function AppRouter() {
     connect,
     appState,
     onboardingComplete,
+    sessionToken,
     targetRole,
     jobDescription,
     skillMapping,
@@ -70,8 +70,8 @@ function AppRouter() {
     }
   }, [appState, navigate, location.pathname]);
 
-  // Derived state to determine if we should show auth screens
-  const showAuth = !onboardingComplete;
+  // Show auth screens whenever there is no authenticated/restoreable session.
+  const showAuth = !(Boolean(onboardingComplete) || Boolean(sessionToken));
   const hasConfigSeed = Boolean(String(targetRole || '').trim() && String(jobDescription || '').trim());
   const hasAnalysisData =
     Boolean(skillMapping && typeof skillMapping === 'object') ||
@@ -98,7 +98,7 @@ function AppRouter() {
       <Route path="/session" element={showAuth ? <Navigate to="/login" replace /> : <InterviewView />} />
       <Route path="/report" element={showAuth ? <Navigate to="/login" replace /> : <SessionReport />} />
       <Route path="/history" element={showAuth ? <Navigate to="/login" replace /> : <HistoryView />} />
-      <Route path="/settings" element={showAuth ? <Navigate to="/login" replace /> : <SettingsView />} />
+      <Route path="/settings" element={showAuth ? <Navigate to="/login" replace /> : <Navigate to="/config" replace />} />
     </Routes>
   );
 }

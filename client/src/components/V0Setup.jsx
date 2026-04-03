@@ -29,8 +29,6 @@ import {
     Code,
     AccountTree,
     AutoAwesome,
-    EmojiEvents,
-    TipsAndUpdates,
     Diversity3,
     Gavel,
     BoltOutlined,
@@ -67,29 +65,6 @@ const INTERVIEW_TYPES = [
         description: 'Balanced flow across behavioral, technical, and design-style prompts.',
         icon: AutoAwesome,
         tags: ['Balanced', 'Adaptive', 'General Prep'],
-    },
-];
-
-const INTERVIEW_STYLES = [
-    {
-        id: 'mock',
-        title: 'Mock Mode',
-        subtitle: 'Premium simulation flow',
-        description: 'Questions first, full grading only at the end. Great for realistic interview pressure.',
-        mode: 'practice',
-        coachingEnabled: false,
-        icon: EmojiEvents,
-        bullets: ['No visible per-question scores', 'Focused, uninterrupted answer flow', 'Optional hints only if you enable them'],
-    },
-    {
-        id: 'coach',
-        title: 'Coach Mode',
-        subtitle: 'Guided practice flow',
-        description: 'Same final report scoring, plus contextual hints and structure prompts while you answer.',
-        mode: 'coaching',
-        coachingEnabled: true,
-        icon: TipsAndUpdates,
-        bullets: ['Live hint cards with framework and next step', 'Manual hint request anytime', 'Best for fixing patterns quickly'],
     },
 ];
 
@@ -172,7 +147,6 @@ export default function V0Setup() {
     } = useInterviewStore();
 
     const [startingType, setStartingType] = useState(null);
-    const [selectedStyle, setSelectedStyle] = useState('mock');
     const [selectedPersona, setSelectedPersona] = useState(normalizePersona(interviewerPersona));
     const [error, setError] = useState('');
 
@@ -198,12 +172,25 @@ export default function V0Setup() {
         setSelectedPersona(normalizePersona(interviewerPersona));
     }, [interviewerPersona]);
 
+    useEffect(() => {
+        if (appState === APP_STATES.INTERVIEWING) {
+            setStartingType(null);
+            setQuickStarting(false);
+            setQuickOpen(false);
+            return;
+        }
+
+        if (appState !== APP_STATES.ANALYZING) {
+            setStartingType(null);
+            setQuickStarting(false);
+        }
+    }, [appState]);
+
     const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
     const readinessPercent = Math.round(Math.max(0, Math.min(1, Number(readinessScore || 0))) * 100);
     const isAnalyzing = appState === APP_STATES.ANALYZING;
     const hasConfiguration = String(targetRole || '').trim() && String(jobDescription || '').trim();
     const questionCount = normalizeQuestionCount(questionCountOverride || 5);
-    const activeStyle = INTERVIEW_STYLES.find((style) => style.id === selectedStyle) || INTERVIEW_STYLES[0];
     const activePersona = INTERVIEW_PERSONAS.find((persona) => persona.id === selectedPersona) || INTERVIEW_PERSONAS[0];
 
     const handlePersonaSelect = (personaId) => {
@@ -246,15 +233,14 @@ export default function V0Setup() {
             readiness_score: readinessScore || 0.5,
             job_description: String(jobDescription || '').trim(),
             interview_type: interviewType.id,
-            mode: activeStyle.mode,
-            coaching_enabled: activeStyle.coachingEnabled,
+            mode: 'practice',
+            coaching_enabled: false,
             feedback_timing: 'end_only',
             live_scoring: false,
             interviewer_persona: selectedPersona,
             question_count: questionCount,
         });
 
-        setTimeout(() => setStartingType(null), 3000);
     };
 
     const handleQuickStart = () => {
@@ -287,25 +273,26 @@ export default function V0Setup() {
             readiness_score: 0.5,
             job_description: jd,
             interview_type: quickType,
-            mode: activeStyle.mode,
-            coaching_enabled: activeStyle.coachingEnabled,
+            mode: 'practice',
+            coaching_enabled: false,
             feedback_timing: 'end_only',
             live_scoring: false,
             interviewer_persona: selectedPersona,
             question_count: questionCount,
         });
 
-        setTimeout(() => {
-            setQuickStarting(false);
-            setQuickOpen(false);
-        }, 3000);
     };
 
     return (
         <ThemeProvider theme={theme}>
             <CssBaseline />
             <Box sx={{ minHeight: '100vh', bgcolor: 'background.default', pb: { xs: 3, md: 5 } }}>
-                <HiveTopNav active="interviews" />
+                <HiveTopNav
+                    active="interviews"
+                    quickActionLabel="Quick Interview"
+                    quickActionIcon={<BoltOutlined />}
+                    onQuickAction={openQuickDialog}
+                />
 
                 <Container maxWidth="lg" sx={{ pt: { xs: 2.5, md: 4 } }}>
                     <Stack spacing={2.2}>
@@ -321,7 +308,7 @@ export default function V0Setup() {
                                     <Chip size="small" label={isConnected ? 'Connected' : 'Connecting'} color={isConnected ? 'success' : 'default'} variant="outlined" />
                                     <Chip size="small" label={readinessPercent > 0 ? `Readiness ${readinessPercent}%` : 'Quick Start'} color={readinessPercent > 0 ? 'default' : 'info'} variant="outlined" />
                                     <Chip size="small" label={`${questionCount} questions`} variant="outlined" />
-                                    <Chip size="small" label={activeStyle.title} color={selectedStyle === 'coach' ? 'secondary' : 'default'} variant="outlined" />
+                                    <Chip size="small" label="Mock Mode" variant="outlined" />
                                     <Chip size="small" label={activePersona.title} variant="outlined" />
                                 </Stack>
                             </Stack>
@@ -334,79 +321,6 @@ export default function V0Setup() {
                                     {analysisProgress}
                                 </Typography>
                             )}
-                        </Paper>
-
-                        <Paper
-                            sx={{
-                                p: { xs: 2, md: 2.5 },
-                                background: darkMode
-                                    ? 'linear-gradient(135deg, rgba(245,158,11,0.12), rgba(251,191,36,0.04))'
-                                    : 'linear-gradient(135deg, rgba(251,191,36,0.2), rgba(249,115,22,0.06))',
-                            }}
-                        >
-                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1.2} sx={{ mb: 1.5 }}>
-                                <Box>
-                                    <Typography variant="h6">Session Style</Typography>
-                                    <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                        Both modes grade at the end. Coach mode adds in-session guidance.
-                                    </Typography>
-                                </Box>
-                                <Chip size="small" label="End-of-session grading" color="warning" variant="outlined" />
-                            </Stack>
-
-                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.1 }}>
-                                {INTERVIEW_STYLES.map((style) => {
-                                    const Icon = style.icon;
-                                    const selected = selectedStyle === style.id;
-                                    return (
-                                        <Paper
-                                            key={style.id}
-                                            onClick={() => setSelectedStyle(style.id)}
-                                            role="button"
-                                            tabIndex={0}
-                                            onKeyDown={(event) => {
-                                                if (event.key === 'Enter' || event.key === ' ') {
-                                                    event.preventDefault();
-                                                    setSelectedStyle(style.id);
-                                                }
-                                            }}
-                                            sx={{
-                                                p: 1.7,
-                                                cursor: 'pointer',
-                                                border: selected
-                                                    ? '1px solid rgba(245, 158, 11, 0.72)'
-                                                    : '1px solid rgba(245, 158, 11, 0.2)',
-                                                boxShadow: selected
-                                                    ? '0 0 0 1px rgba(245,158,11,0.3), 0 8px 20px rgba(245,158,11,0.16)'
-                                                    : undefined,
-                                            }}
-                                        >
-                                            <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.8 }}>
-                                                <Icon sx={{ color: selected ? 'primary.main' : 'text.secondary' }} />
-                                                <Box>
-                                                    <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.15 }}>
-                                                        {style.title}
-                                                    </Typography>
-                                                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                                        {style.subtitle}
-                                                    </Typography>
-                                                </Box>
-                                                {selected && <Chip size="small" label="Selected" color="primary" />}
-                                            </Stack>
-                                            <Typography variant="body2" sx={{ color: 'text.secondary', mb: 0.9 }}>
-                                                {style.description}
-                                            </Typography>
-                                            <Stack spacing={0.4}>
-                                                {style.bullets.map((point) => (
-                                                    <Typography key={`${style.id}-${point}`} variant="caption" sx={{ color: 'text.secondary' }}>
-                                                        • {point}
-                                                    </Typography>
-                                                ))}
-                                            </Stack>
-                                        </Paper>
-                                    );
-                                })}
-                            </Box>
                         </Paper>
 
                         <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
@@ -459,39 +373,6 @@ export default function V0Setup() {
                                     );
                                 })}
                             </Box>
-                        </Paper>
-
-                        {/* Quick Interview card — always visible */}
-                        <Paper
-                            sx={{
-                                p: { xs: 2, md: 2.5 },
-                                border: '1px solid',
-                                borderColor: 'primary.main',
-                                background: darkMode
-                                    ? 'linear-gradient(135deg, rgba(99,102,241,0.12), rgba(139,92,246,0.04))'
-                                    : 'linear-gradient(135deg, rgba(99,102,241,0.08), rgba(139,92,246,0.03))',
-                            }}
-                        >
-                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={1.2}>
-                                <Stack direction="row" spacing={1.2} alignItems="center">
-                                    <BoltOutlined sx={{ color: 'primary.main', fontSize: 28 }} />
-                                    <Box>
-                                        <Typography variant="h6" sx={{ lineHeight: 1.2 }}>Quick Interview</Typography>
-                                        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                            Jump straight in with just a role and job description. No resume or analysis needed.
-                                        </Typography>
-                                    </Box>
-                                </Stack>
-                                <Button
-                                    variant="contained"
-                                    startIcon={<BoltOutlined />}
-                                    onClick={openQuickDialog}
-                                    disabled={!isConnected}
-                                    sx={{ whiteSpace: 'nowrap', minWidth: 150 }}
-                                >
-                                    Start Quick Interview
-                                </Button>
-                            </Stack>
                         </Paper>
 
                         {!hasConfiguration && (
@@ -619,7 +500,7 @@ export default function V0Setup() {
                         </Box>
                         {quickRole.trim() && quickJD.trim() && (
                             <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                Style: {activeStyle.title} &bull; Persona: {activePersona.title} &bull; {questionCount} questions
+                                Style: Mock Mode &bull; Persona: {activePersona.title} &bull; {questionCount} questions
                             </Typography>
                         )}
                     </Stack>

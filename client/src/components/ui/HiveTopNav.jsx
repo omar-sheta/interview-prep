@@ -13,7 +13,7 @@ import {
     Paper,
     alpha,
 } from '@mui/material';
-import { Hive, History, SmartToy, Tune, Settings, DarkMode, LightMode, Logout } from '@mui/icons-material';
+import { Hive, History, SmartToy, Tune, DarkMode, LightMode, Logout } from '@mui/icons-material';
 import useInterviewStore from '@/store/useInterviewStore';
 
 export default function HiveTopNav({
@@ -21,8 +21,10 @@ export default function HiveTopNav({
     showInterviews = true,
     showConfiguration = true,
     showHistory = true,
-    showSettings = true,
     showSignOut = true,
+    quickActionLabel = '',
+    quickActionIcon = null,
+    onQuickAction = null,
 }) {
     const navigate = useNavigate();
     const location = useLocation();
@@ -86,7 +88,6 @@ export default function HiveTopNav({
         { key: 'interviews', label: 'Interviews', icon: <SmartToy />, path: '/interviews', visible: showInterviews },
         { key: 'config', label: 'Configuration', icon: <Tune />, path: '/config', visible: showConfiguration },
         { key: 'history', label: 'History', icon: <History />, path: '/history', visible: showHistory },
-        { key: 'settings', label: 'Settings', icon: <Settings />, path: '/settings', visible: showSettings },
     ].filter((item) => item.visible);
 
     return (
@@ -108,15 +109,15 @@ export default function HiveTopNav({
                     alignItems="center"
                     justifyContent="space-between"
                     sx={{
-                        minHeight: 62,
-                        py: 0.8,
+                        minHeight: 58,
+                        py: 0.55,
                     }}
                 >
-                    <Stack direction="row" spacing={1.2} alignItems="center" sx={{ minWidth: 220 }}>
+                    <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 220 }}>
                         <Box
                             sx={{
-                                width: 32,
-                                height: 32,
+                                width: 30,
+                                height: 30,
                                 borderRadius: '50%',
                                 display: 'grid',
                                 placeItems: 'center',
@@ -124,15 +125,16 @@ export default function HiveTopNav({
                                 color: '#fff',
                             }}
                         >
-                            <Hive sx={{ fontSize: 19 }} />
+                            <Hive sx={{ fontSize: 18 }} />
                         </Box>
-                        <Typography variant="h6" sx={{ lineHeight: 1, letterSpacing: '-0.01em' }}>
-                            HiveMindPrep
+                        <Typography variant="h6" sx={{ lineHeight: 1, letterSpacing: '-0.01em', fontSize: '1.08rem' }}>
+                            BeePrepared
                         </Typography>
                         <Chip
                             size="small"
                             label="v0"
                             sx={{
+                                height: 24,
                                 borderColor: alpha('#f97316', darkMode ? 0.45 : 0.25),
                                 bgcolor: alpha('#f97316', darkMode ? 0.16 : 0.08),
                             }}
@@ -141,6 +143,25 @@ export default function HiveTopNav({
                     </Stack>
 
                     <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 220, justifyContent: 'flex-end' }}>
+                        {quickActionLabel && typeof onQuickAction === 'function' && (
+                            <Button
+                                variant="outlined"
+                                size="small"
+                                startIcon={quickActionIcon}
+                                onClick={onQuickAction}
+                                sx={{
+                                    borderRadius: 999,
+                                    px: 1.2,
+                                    textTransform: 'none',
+                                    fontWeight: 700,
+                                    whiteSpace: 'nowrap',
+                                    borderColor: alpha('#f97316', darkMode ? 0.42 : 0.28),
+                                    bgcolor: alpha('#f97316', darkMode ? 0.1 : 0.05),
+                                }}
+                            >
+                                {quickActionLabel}
+                            </Button>
+                        )}
                         <Tooltip title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
                             <IconButton
                                 color="inherit"
@@ -185,10 +206,11 @@ export default function HiveTopNav({
                                 <Button
                                     key={item.key}
                                     variant={selected ? 'contained' : 'outlined'}
+                                    size="small"
                                     startIcon={item.icon}
                                     onClick={() => navigateWithGuard(item.path)}
                                     sx={{
-                                        px: 1.4,
+                                        px: 1.25,
                                         borderRadius: 999,
                                         borderColor: selected
                                             ? 'transparent'

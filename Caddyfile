@@ -1,0 +1,33 @@
+{
+	# Use self-signed certs (no ACME needed for local network)
+	auto_https off
+}
+
+:{$PUBLIC_PORT} {
+	tls {$APP_DIR}/certs/cert.pem {$APP_DIR}/certs/key.pem
+
+	# Proxy Socket.IO, REST API, and docs to backend.
+	@backend_paths {
+		path /socket.io* /api/* /health /docs /docs/* /openapi.json /redoc /redoc/*
+	}
+	handle @backend_paths {
+		reverse_proxy 127.0.0.1:{$UVICORN_PORT} {
+			# WebSocket support
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+
+			# Increase timeouts for long LLM calls
+			transport http {
+				read_timeout 300s
+				write_timeout 300s
+			}
+		}
+	}
+
+	# Serve static frontend files
+	handle {
+		root * {$APP_DIR}/client/dist
+		try_files {path} /index.html
+		file_server
+	}
+}
