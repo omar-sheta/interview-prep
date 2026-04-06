@@ -293,10 +293,16 @@ class WhisperCppStreamingProcessor:
         text = (diag or "").lower()
         markers = (
             "whisper_backend_init_gpu: no gpu found",
-            "ggml_cuda_init",
             "cuda error",
+            "cuda driver version is insufficient",
+            "cuda-capable device(s) is/are busy or unavailable",
+            "no cuda-capable device is detected",
+            "failed to load cuda backend",
+            "whisper_backend_init_gpu: failed",
             "ggml_metal_buffer_init: error",
             "failed to allocate buffer",
+            "cublas error",
+            "operation not supported",
         )
         return any(marker in text for marker in markers)
 

@@ -77,6 +77,7 @@ const useInterviewStore = create(
             jobRequirements: null,
             resumeData: null,
             analysisProgress: '',
+            analysisStageHistory: [],
 
             // Last analysis metadata (PERSISTED)
             targetRole: '',
@@ -112,6 +113,7 @@ const useInterviewStore = create(
             answerEvaluation: null,
             coachingEnabled: false,
             coachingHint: null,
+            interviewError: '',
             allEvaluations: [],
             interviewSummary: null,
             answerSubmitPending: false,
@@ -134,6 +136,7 @@ const useInterviewStore = create(
             // ============== Actions ==============
             toggleDarkMode: () => set((state) => ({ darkMode: !state.darkMode })),
             setDarkMode: (enabled) => set({ darkMode: Boolean(enabled) }),
+            clearInterviewError: () => set({ interviewError: '' }),
 
             // Connect to Socket.IO Server
             connect: () => {
@@ -398,8 +401,18 @@ const useInterviewStore = create(
 
                 // Career Analysis events
                 onSafe('analysis_progress', (data) => {
-                    set({ analysisProgress: data.message });
-                    get().addThinking(`📊 ${data.message}`);
+                    const message = String(data?.message || '').trim();
+                    if (!message) return;
+                    set((state) => {
+                        const history = Array.isArray(state.analysisStageHistory) ? state.analysisStageHistory : [];
+                        const deduped = history.filter((item) => item !== message);
+                        return {
+                            analysisProgress: message,
+                            analysisStageHistory: [...deduped, message].slice(-6),
+                            appState: state.interviewActive ? state.appState : APP_STATES.ANALYZING,
+                        };
+                    });
+                    get().addThinking(`📊 ${message}`);
                 });
 
                 onSafe('status', (data) => {
@@ -459,6 +472,10 @@ const useInterviewStore = create(
                             jobDescription: analysis.job_description || analysis.analysis_data?.job_description || get().jobDescription || '',
                             lastAnalysisTime: analysis.created_at || Date.now(),
                             analysisProgress: 'Analysis Complete!',
+                            analysisStageHistory: [
+                                ...(Array.isArray(get().analysisStageHistory) ? get().analysisStageHistory : []),
+                                'Analysis complete',
+                            ].slice(-6),
                         };
                         if (!isInInterview) {
                             nextState.appState = APP_STATES.MAP_READY;
@@ -476,6 +493,7 @@ const useInterviewStore = create(
                             practicePlan: null,
                             lastAnalysisTime: null,
                             analysisProgress: '',
+                            analysisStageHistory: [],
                             appState: state.interviewActive ? state.appState : APP_STATES.IDLE,
                         }));
                     }
@@ -484,7 +502,14 @@ const useInterviewStore = create(
                 // Note: analysis_complete was removed - career_analysis handler above handles all cases
 
                 onSafe('analysis_error', (data) => {
-                    set({ analysisProgress: `Error: ${data.error}`, appState: APP_STATES.IDLE });
+                    set((state) => ({
+                        analysisProgress: `Error: ${data.error}`,
+                        analysisStageHistory: [
+                            ...(Array.isArray(state.analysisStageHistory) ? state.analysisStageHistory : []),
+                            `Error: ${data.error}`,
+                        ].slice(-6),
+                        appState: APP_STATES.IDLE,
+                    }));
                     get().addThinking(`❌ Analysis failed: ${data.error}`);
                 });
 
@@ -504,6 +529,7 @@ const useInterviewStore = create(
                         appState: APP_STATES.INTERVIEWING,
                         analysisProgress: '',
                         answerSubmitPending: false,
+                        interviewError: '',
                         retryAttemptsByQuestion: {},
                         retrySubmitting: {},
                         retryErrors: {},
@@ -516,8 +542,10 @@ const useInterviewStore = create(
                         questionNumber: data.question_number,
                         totalQuestions: data.total_questions || get().totalQuestions,
                         transcript: '',
+                        lastTranscript: '',
                         answerEvaluation: null,
                         coachingHint: null,
+                        interviewError: '',
                         answerSubmitPending: false,
                         ttsAudioQueue: [],
                         ttsStreamQueue: [],
@@ -531,7 +559,8 @@ const useInterviewStore = create(
                 onSafe('transcript', (data) => {
                     set({
                         transcript: data.full || (get().transcript + ' ' + data.text),
-                        lastTranscript: data.text
+                        lastTranscript: data.text,
+                        interviewError: '',
                     });
                 });
 
@@ -561,6 +590,7 @@ const useInterviewStore = create(
                     set({
                         generatingReport: true,
                         answerSubmitPending: false,
+                        interviewError: '',
                     });
                     get().addThinking('📊 Generating your interview report…');
                 });
@@ -574,6 +604,7 @@ const useInterviewStore = create(
                         allEvaluations: data.evaluations,
                         appState: APP_STATES.COMPLETE,
                         answerSubmitPending: false,
+                        interviewError: '',
                     });
                     get().addThinking('🏁 Interview session complete');
                 });
@@ -581,7 +612,10 @@ const useInterviewStore = create(
                 onSafe('interview_error', (data) => {
                     set((state) => {
                         if (state.interviewActive) {
-                            return { answerSubmitPending: false };
+                            return {
+                                answerSubmitPending: false,
+                                interviewError: data?.error || 'Speech recognition had trouble with that answer.',
+                            };
                         }
 
                         const hasAnalysisData = Boolean(
@@ -596,6 +630,7 @@ const useInterviewStore = create(
                             answerSubmitPending: false,
                             analysisProgress: `Error: ${data?.error || 'Unable to start interview'}`,
                             appState: hasAnalysisData ? APP_STATES.MAP_READY : APP_STATES.IDLE,
+                            interviewError: '',
                         };
                     });
                     if (data?.error) get().addThinking(`❌ ${data.error}`);
@@ -918,7 +953,12 @@ const useInterviewStore = create(
                 get().resetForNewAnalysis();
 
                 // Store job description in state for interview use
-                set({ jobDescription: jobDescription || '' });
+                set({
+                    appState: APP_STATES.ANALYZING,
+                    jobDescription: jobDescription || '',
+                    analysisProgress: 'Uploading resume and preparing analysis...',
+                    analysisStageHistory: ['Uploading resume and preparing analysis...'],
+                });
 
                 const payload = {
                     resume: resumeBase64,
@@ -953,6 +993,7 @@ const useInterviewStore = create(
                         console.error('❌ Failed to start analysis: socket connection timeout');
                         set({
                             analysisProgress: 'Error: Unable to connect to server. Please try again.',
+                            analysisStageHistory: ['Error: Unable to connect to server. Please try again.'],
                             appState: APP_STATES.IDLE
                         });
                         get().addThinking('❌ Failed to start analysis: connection timeout');
@@ -1120,6 +1161,7 @@ const useInterviewStore = create(
                     jobRequirements: null,
                     resumeData: null,
                     analysisProgress: 'Starting new analysis...',
+                    analysisStageHistory: ['Starting new analysis...'],
                     // Keep configuration fields stable while regenerating analysis.
                     targetRole: targetRole || '',
                     targetCompany: targetCompany || '',
@@ -1367,6 +1409,7 @@ const useInterviewStore = create(
                     jobRequirements: null,
                     resumeData: null,
                     analysisProgress: '',
+                    analysisStageHistory: [],
                     targetRole: '',
                     targetCompany: '',
                     jobDescription: '',
@@ -1449,6 +1492,7 @@ const useInterviewStore = create(
                     interviewMode: mode,
                     interviewFeedbackTiming: 'end_only',
                     coachingEnabled: mode === 'coaching',
+                    interviewError: '',
                 });
                 get().addThinking(`🎙️ Starting ${mode} mode...`);
             },
@@ -1458,7 +1502,7 @@ const useInterviewStore = create(
                 const { socket, answerSubmitPending } = get();
                 if (!socket?.connected || answerSubmitPending) return false;
 
-                set({ answerSubmitPending: true });
+                set({ answerSubmitPending: true, interviewError: '' });
                 socket.emit('submit_interview_answer', {
                     answer: answerText,
                     duration_seconds: durationSeconds

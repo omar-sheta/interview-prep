@@ -234,6 +234,16 @@ SKILL_ALIAS_MAP = {
     "restful": "rest api design",
     "restful api": "rest api design",
     "systemdesign": "system design",
+    "ci cd pipeline": "ci/cd",
+    "cicd": "ci/cd",
+    "kubernetes orchestration": "kubernetes",
+    "container orchestration": "kubernetes",
+    "devops practices": "devops",
+    "rest api": "rest api design",
+    "rest endpoint": "rest api design",
+    "rest endpoints": "rest api design",
+    "restful endpoints": "rest api design",
+    "system architecture": "system design",
 }
 
 SKILL_DISPLAY_MAP = {
@@ -313,6 +323,26 @@ def _canonical_skill_name(value: Any) -> str:
         return SKILL_ALIAS_MAP[compact]
     if key in SKILL_ALIAS_MAP:
         return SKILL_ALIAS_MAP[key]
+    # Handle common suffix variants such as "kubernetes orchestration" -> "kubernetes".
+    suffix_terms = {
+        "proficiency", "experience", "knowledge", "familiarity", "expertise",
+        "implementation", "implementations", "design", "development", "engineering",
+        "platform", "platforms", "systems", "system", "architecture", "architectures",
+        "service", "services", "tool", "tools", "pipeline", "pipelines",
+        "language", "languages", "framework", "frameworks",
+    }
+    tokens = key.split()
+    for cut in range(len(tokens) - 1, 0, -1):
+        if tokens[cut] not in suffix_terms:
+            continue
+        base = " ".join(tokens[:cut]).strip()
+        if not base:
+            continue
+        base_compact = base.replace(" ", "")
+        if base_compact in SKILL_ALIAS_MAP:
+            return SKILL_ALIAS_MAP[base_compact]
+        if base in SKILL_ALIAS_MAP:
+            return SKILL_ALIAS_MAP[base]
     return key
 
 
@@ -603,7 +633,7 @@ def _build_skill_coverage_board(required_skills: list[dict], candidate_skills: l
         importance = _clamp(_safe_float(req.get("importance"), 0.7), 0.2, 1.0)
         candidate = candidate_index.get(skill)
         candidate_level = _normalize_skill_level(candidate.get("candidate_level"), default="none") if candidate else "none"
-        confidence = _clamp(_safe_float(candidate.get("confidence"), 0.2) if candidate else 0.05, 0.05, 0.99)
+        confidence = _clamp(_safe_float(candidate.get("confidence"), 0.2) if candidate else 0.2, 0.05, 0.99)
         req_idx = SKILL_LEVEL_ORDER.get(required_level, 2)
         cand_idx = SKILL_LEVEL_ORDER.get(candidate_level, 0)
 
@@ -1584,20 +1614,20 @@ async def analyze_career_path(
     emit_progress: Optional[Callable[[str, str], Any]] = None
 ) -> CareerAnalysisState:
     """
-    FAST Career Analysis Pipeline — Single LLM Call.
+    Career analysis pipeline with decoupled resume parsing, JD analysis,
+    semantic skill matching, and deterministic scoring.
 
     Pipeline:
     1. Extract PDF text (if needed)
-    2. SINGLE LLM CALL: Mega-prompt (resume + job + skill analysis)
-    3. Deterministic: Build skill mapping from LLM analysis
+    2. Parse resume and JD into structured JSON
+    3. Semantic skill matching + deterministic coverage scoring
     4. Deterministic: Generate mindmap
     5. Deterministic: Build interview loop (template-based)
     6. Deterministic: Suggest bridge roles
     """
     from server.tools.resume_tool import (
-        analyze_resume_and_job,
+        _run_resume_analysis_pipeline,
         extract_text_from_pdf_bytes,
-        get_all_skills,
     )
 
     async def _emit(stage: str, message: str):
@@ -1637,10 +1667,15 @@ async def analyze_career_path(
 
         await _emit("step_1_done", f"✅ Processed {len(final_resume_text)} characters")
 
-        # ========== Step 2: SINGLE LLM CALL — Mega Analysis ==========
-        await _emit("step_2", f"🧠 Analyzing resume against {target_role} requirements (single-pass)...")
+        # ========== Step 2: Resume analysis pipeline ==========
+        if bool(getattr(settings, "RESUME_ANALYSIS_SINGLE_LLM_TRIAL", False)):
+            await _emit("step_2", "🧠 Running experimental holistic resume + job analysis...")
+        else:
+            await _emit("step_2", "🧠 Parsing resume into a candidate profile...")
+            await _emit("step_2b", f"📌 Extracting {target_role} requirements from the job description...")
+            await _emit("step_2c", "🧩 Matching skills semantically and scoring fit...")
 
-        mega_result = await analyze_resume_and_job(
+        mega_result, pipeline_details = await _run_resume_analysis_pipeline(
             resume_text=final_resume_text,
             job_title=target_role,
             company=target_company,
@@ -1652,87 +1687,44 @@ async def analyze_career_path(
         # ========== Step 3: Convert mega_result into CareerAnalysisState ==========
         await _emit("step_3", "🎯 Building skill coverage board...")
 
-        # Extract resume_data (standard shape the rest of the app expects)
-        resume_data = {
-            "personal_info": mega_result.get("personal_info", {}),
-            "summary": mega_result.get("summary", ""),
-            "skills": mega_result.get("skills", {}),
-            "experience": mega_result.get("experience", []),
-            "education": mega_result.get("education", []),
-            "years_of_experience": mega_result.get("years_of_experience", 0),
-        }
-        state["resume_data"] = resume_data
+        state["resume_data"] = pipeline_details.get("resume_data", {})
+        state["job_requirements"] = pipeline_details.get("job_requirements", {})
 
-        # Extract job_requirements (standard shape)
-        job_reqs_raw = mega_result.get("job_requirements", {})
-        job_requirements = {
-            "job_title": target_role,
-            "company": target_company,
-            "must_have_skills": job_reqs_raw.get("must_have_skills", []),
-            "nice_to_have_skills": job_reqs_raw.get("nice_to_have_skills", []),
-            "core_responsibilities": job_reqs_raw.get("core_responsibilities", []),
-            "career_level": job_reqs_raw.get("career_level", "mid"),
-            "interview_focus_areas": job_reqs_raw.get("interview_focus_areas", []),
-        }
-        state["job_requirements"] = job_requirements
-
-        # Build skill_mapping from the LLM's skill_analysis array
-        skill_analysis = mega_result.get("skill_analysis", [])
-        matched = []
-        partial = []
-        missing = []
-
-        for item in skill_analysis:
-            skill_name = str(item.get("skill", "")).strip()
-            if not skill_name:
-                continue
-
-            status = str(item.get("status", "missing")).lower().replace(" ", "_")
-            priority = str(item.get("priority", "must_have")).lower().replace(" ", "_")
-            evidence = str(item.get("evidence", ""))
-            confidence = float(item.get("confidence", 0.5))
-            candidate_level = str(item.get("candidate_level", "none"))
-            required_level = str(item.get("required_level", "intermediate"))
-
-            entry = {
-                "name": skill_name,
-                "skill": skill_name,
-                "status": status,
-                "priority": priority,
-                "evidence": evidence,
-                "confidence": confidence,
-                "candidate_level": candidate_level,
-                "required_level": required_level,
-            }
-
-            if status == "strong_match":
-                matched.append(entry)
-            elif status == "partial_match":
-                partial.append(entry)
-            else:
-                missing.append(entry)
-
-        readiness_score = float(mega_result.get("readiness_score", 0.5))
-        readiness_score = max(0.0, min(1.0, readiness_score))
-
-        skill_mapping = {
-            "matched": matched,
-            "partial": partial,
-            "missing": missing,
-        }
+        skill_mapping = pipeline_details.get("skill_mapping", {})
         state["skill_mapping"] = skill_mapping
+        matched = skill_mapping.get("matched", [])
+        partial = skill_mapping.get("partial", [])
+        missing = skill_mapping.get("missing", [])
+        readiness_score = max(0.0, min(1.0, _safe_float(pipeline_details.get("readiness_score"), mega_result.get("readiness_score", 0.5))))
         state["readiness_score"] = round(readiness_score, 2)
 
-        # Skill gaps = missing + uncertain partial
-        top_gaps = mega_result.get("top_gaps", [])
+        gap_sources = []
+        gap_sources.extend(skill_mapping.get("followup_targets", []))
+        gap_sources.extend(missing)
+        gap_sources.extend(partial)
+
         skill_gaps = []
-        for gap_name in top_gaps:
-            skill_gaps.append({"name": str(gap_name), "status": "missing"})
-        # Also add any missing skills not already in top_gaps
-        gap_names_lower = {str(g).lower() for g in top_gaps}
-        for m in missing:
-            if m["name"].lower() not in gap_names_lower:
-                skill_gaps.append(m)
+        seen_gap_keys: set[str] = set()
+        for item in gap_sources:
+            if not isinstance(item, dict):
+                continue
+            gap_name = str(item.get("name") or item.get("skill") or "").strip()
+            if not gap_name:
+                continue
+            canonical = gap_name.lower()
+            if canonical in seen_gap_keys:
+                continue
+            seen_gap_keys.add(canonical)
+            skill_gaps.append({
+                "name": gap_name,
+                "status": str(item.get("status") or "missing"),
+                "priority": str(item.get("priority") or "must_have"),
+                "reason": str(item.get("reason") or ""),
+                "learning_tip": str(item.get("learning_tip") or ""),
+                "candidate_level": str(item.get("candidate_level") or "none"),
+                "required_level": str(item.get("required_level") or "intermediate"),
+                "confidence": round(_safe_float(item.get("confidence"), 0.0), 2),
+            })
         state["skill_gaps"] = skill_gaps[:12]
 
         await _emit("step_3_done", f"✅ Skill board: {len(matched)} matched, {len(partial)} partial, {len(missing)} missing — Readiness: {int(readiness_score * 100)}%")
@@ -1751,7 +1743,7 @@ async def analyze_career_path(
         await _emit("step_6", "🏗️ Building your interview loop...")
 
         gap_skills = [g.get("name", g) if isinstance(g, dict) else str(g) for g in state["skill_gaps"][:4]]
-        focus_areas = job_requirements.get("interview_focus_areas", [])
+        focus_areas = state["job_requirements"].get("interview_focus_areas", [])
 
         practice_plan = _build_template_interview_loop(
             target_role=target_role,

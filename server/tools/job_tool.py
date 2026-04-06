@@ -45,7 +45,86 @@ You MUST respond with ONLY valid JSON, no other text. Use this exact structure:
 Be specific and realistic based on current industry standards."""
 
 
-# ============== JD Inference Function ==============
+JD_ANALYSIS_SYSTEM_PROMPT = """You are a job description analyst.
+Extract a clean hiring profile from the role details provided.
+Return JSON only using this exact structure:
+{
+  "job_title": "the role title",
+  "company": "the company name",
+  "must_have_skills": ["required skills"],
+  "nice_to_have_skills": ["preferred skills"],
+  "core_responsibilities": ["key responsibilities"],
+  "career_level": "entry|mid|senior|staff|principal",
+  "interview_focus_areas": ["likely interview themes"]
+}
+Rules:
+- Use the key career_level exactly.
+- Keep must_have_skills to 6-12 items.
+- Keep nice_to_have_skills to 0-8 items.
+- Prefer concrete technical or role-execution skills over vague traits.
+- If the job description is sparse, infer realistic skills from the title and company context."""
+
+
+# ============== JD Analysis Functions ==============
+
+async def analyze_job_description(
+    job_title: str,
+    company: str = "a top tech company",
+    jd_text: str = ""
+) -> dict[str, Any]:
+    """
+    Build a structured job profile from a job description or role metadata.
+    """
+    chat_model = get_chat_model()
+
+    if jd_text and jd_text.strip():
+        prompt = {
+            "job_title": job_title,
+            "company": company,
+            "job_description": jd_text[:3000],
+        }
+    else:
+        prompt = {
+            "job_title": job_title,
+            "company": company,
+            "job_description": "",
+            "instruction": "Infer a realistic hiring profile from the role title and company context.",
+        }
+
+    result = await chat_model.ainvoke(
+        [
+            SystemMessage(content=JD_ANALYSIS_SYSTEM_PROMPT),
+            HumanMessage(content=json.dumps(prompt)),
+        ],
+        json_mode=True,
+        max_tokens=min(int(getattr(settings, "LLM_JSON_MAX_TOKENS", 500)), 700),
+    )
+    response_text = result.content
+
+    from server.tools.resume_tool import parse_json_safely
+
+    parsed = parse_json_safely(response_text)
+    if not parsed or not isinstance(parsed, dict):
+        return {
+            "job_title": job_title,
+            "company": company,
+            "must_have_skills": [],
+            "nice_to_have_skills": [],
+            "core_responsibilities": [],
+            "career_level": estimate_role_level(job_title),
+            "interview_focus_areas": [],
+            "error": "Could not parse response",
+        }
+
+    parsed.setdefault("job_title", job_title)
+    parsed.setdefault("company", company)
+    parsed.setdefault("must_have_skills", [])
+    parsed.setdefault("nice_to_have_skills", [])
+    parsed.setdefault("core_responsibilities", [])
+    parsed.setdefault("career_level", estimate_role_level(job_title))
+    parsed.setdefault("interview_focus_areas", [])
+    return parsed
+
 
 async def infer_job_requirements(
     job_title: str,
@@ -57,58 +136,7 @@ async def infer_job_requirements(
     If a job description is provided, the LLM extracts requirements from it directly.
     Otherwise it infers them from the title and company.
     """
-    chat_model = get_chat_model()
-
-    if job_description and job_description.strip():
-        prompt = f"""As a Senior Recruiter, extract the requirements from this ACTUAL job description:
-
-Job Title: {job_title}
-Company: {company}
-
-JOB DESCRIPTION:
-{job_description[:2000]}
-
-Extract the must-have skills, nice-to-have skills, and core responsibilities from this real posting."""
-    else:
-        prompt = f"""As a Senior Recruiter, analyze the requirements for:
-Job Title: {job_title}
-Company: {company}
-
-List the 10 must-have technical skills and 5 core responsibilities for this role.
-Consider the company's tech stack and culture if known."""
-    
-    messages = [
-        SystemMessage(content=JD_INFERENCE_SYSTEM_PROMPT),
-        HumanMessage(content=prompt)
-    ]
-    
-    # Generate response (proper async call)
-    result = await chat_model.ainvoke(
-        messages,
-        json_mode=True,
-        max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
-    )
-    response_text = result.content
-    
-    # Extract JSON from response
-    from server.tools.resume_tool import parse_json_safely
-    
-    parsed = parse_json_safely(response_text)
-    if not parsed or not isinstance(parsed, dict):
-        return {
-            "job_title": job_title,
-            "company": company,
-            "must_have_skills": [],
-            "core_responsibilities": [],
-            "error": "Could not parse response"
-        }
-        
-    # Ensure required fields exist
-    parsed.setdefault("job_title", job_title)
-    parsed.setdefault("company", company)
-    parsed.setdefault("must_have_skills", [])
-    parsed.setdefault("core_responsibilities", [])
-    return parsed
+    return await analyze_job_description(job_title=job_title, company=company, jd_text=job_description)
 
 
 def infer_job_requirements_sync(job_title: str, company: str = "a top tech company") -> dict:

@@ -36,6 +36,7 @@ from server.session import (
     user_connection_count,
 )
 from server.transcript import (
+    assess_submitted_transcript,
     combine_final_and_partial as _combine_final_and_partial,
     merge_transcript,
     should_drop_false_start as _should_drop_false_start,
@@ -703,6 +704,7 @@ _interview_events = register_interview_events(
         finalize_current_utterance=lambda session, reason="silence": _finalize_current_utterance(session, reason=reason),
         get_user_feedback_thresholds=lambda user_id: _get_user_feedback_thresholds(user_id),
         record_evaluation_metrics=lambda evaluation: _record_evaluation_metrics(evaluation),
+        assess_submitted_transcript=lambda answer_text, question_text="": assess_submitted_transcript(answer_text, question_text=question_text),
         send_status_ready=lambda user_id: sio.emit("status", {"stage": "ready", "user_id": user_id}, room=str(user_id)),
     ),
 )

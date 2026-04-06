@@ -12,9 +12,11 @@ import hashlib
 import secrets
 import uuid
 
+from server.config import settings
+
 
 # Database path
-DB_PATH = Path("./user_data/interview_app.db")
+DB_PATH = Path(settings.USER_DB_PATH).expanduser()
 
 
 class UserDatabase:
