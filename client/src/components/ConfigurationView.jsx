@@ -42,65 +42,18 @@ import {
     TrendingUp,
     AutoGraph,
     TipsAndUpdates,
-    Diversity3,
-    Gavel,
     BoltOutlined,
-    Psychology,
-    Code,
-    AccountTree,
-    AutoAwesome,
     Close,
     ExpandMore,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
 import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
-
-const PERSONA_OPTIONS = [
-    {
-        id: 'friendly',
-        label: 'Friendly',
-        icon: Diversity3,
-        description: 'Supportive tone, clear prompts, and collaborative pacing.',
-    },
-    {
-        id: 'strict',
-        label: 'Strict',
-        icon: Gavel,
-        description: 'High bar, direct wording, and precision-focused follow-ups.',
-    },
-];
-
-const QUICK_INTERVIEW_TYPES = [
-    {
-        id: 'behavioral',
-        title: 'Behavioral',
-        description: 'STAR-style storytelling, leadership, and communication.',
-        icon: Psychology,
-        tags: ['STAR', 'Leadership'],
-    },
-    {
-        id: 'technical',
-        title: 'Technical',
-        description: 'Implementation decisions, trade-offs, and debugging.',
-        icon: Code,
-        tags: ['Problem Solving', 'Architecture'],
-    },
-    {
-        id: 'system_design',
-        title: 'System Design',
-        description: 'Scalability, reliability, and large-scale design.',
-        icon: AccountTree,
-        tags: ['Scalability', 'Trade-offs'],
-    },
-    {
-        id: 'mixed',
-        title: 'Mixed',
-        description: 'Balanced flow across behavioral, technical, and design.',
-        icon: AutoAwesome,
-        tags: ['Balanced', 'Adaptive'],
-    },
-];
+import {
+    PERSONA_OPTIONS,
+    QUICK_INTERVIEW_TYPES,
+    getQuickSkillGaps,
+} from '@/lib/quickInterviewConfig';
 
 const PIPER_STYLE_OPTIONS = [
     { id: 'interviewer', label: 'Interviewer', description: 'Clear and polished for practice sessions.' },
@@ -112,13 +65,6 @@ const DEFAULT_RECORDING_THRESHOLDS = {
     silence_auto_stop_seconds: 5.0,
     silence_rms_threshold: 0.008,
 };
-
-function getQuickSkillGaps(interviewType) {
-    if (interviewType === 'behavioral') return ['communication', 'stakeholder management', 'leadership', 'conflict resolution'];
-    if (interviewType === 'technical') return ['technical fundamentals', 'problem solving', 'debugging'];
-    if (interviewType === 'system_design') return ['system design', 'scalability', 'reliability', 'trade-offs'];
-    return [];
-}
 
 function clampQuestionCount(value) {
     const n = Number(value);
@@ -261,6 +207,7 @@ export default function ConfigurationView() {
         darkMode,
         appState,
         analysisProgress,
+        analysisStageHistory,
         readinessScore,
         skillMapping,
         targetRole,
@@ -314,6 +261,7 @@ export default function ConfigurationView() {
     const [quickRole, setQuickRole] = useState('');
     const [quickJD, setQuickJD] = useState('');
     const [quickType, setQuickType] = useState('mixed');
+    const [quickQuestionCount, setQuickQuestionCount] = useState('5');
     const [quickStarting, setQuickStarting] = useState(false);
     const [resetDialogOpen, setResetDialogOpen] = useState(false);
 
@@ -383,6 +331,10 @@ export default function ConfigurationView() {
     }, [resumeFilename, resumeBase64]);
 
     const skillBoard = useMemo(() => normalizeSkillBoard(skillMapping), [skillMapping]);
+    const analyzingSteps = useMemo(
+        () => (Array.isArray(analysisStageHistory) ? analysisStageHistory.slice(-5) : []),
+        [analysisStageHistory],
+    );
     const coverage = useMemo(
         () => summarizeCoverage(skillMapping, skillBoard),
         [skillMapping, skillBoard],
@@ -455,7 +407,7 @@ export default function ConfigurationView() {
             recording_thresholds: normalizedRecording,
             resume_filename: resumeFilename || undefined,
         });
-        setStatus('Configuration saved.');
+        setStatus('Profile saved.');
         return true;
     };
 
@@ -500,7 +452,7 @@ export default function ConfigurationView() {
         setVoiceEngine('piper');
         setResumeBase64('');
         setResumeFilename('');
-        setStatus('Configuration cleared.');
+        setStatus('Profile cleared.');
     };
 
     const resetWorkspace = () => {
@@ -516,6 +468,7 @@ export default function ConfigurationView() {
         setQuickRole(String(jobTitle || targetRole || '').trim());
         setQuickJD(String(jobDescription || storedJobDescription || '').trim());
         setQuickType(typeId);
+        setQuickQuestionCount(String(clampQuestionCount(questionCount) || clampQuestionCount(questionCountOverride) || 5));
         setQuickOpen(true);
     };
 
@@ -533,7 +486,7 @@ export default function ConfigurationView() {
         setQuickStarting(true);
         setError('');
 
-        const qCount = Math.max(1, Math.min(12, Math.trunc(Number(questionCount) || 5)));
+        const qCount = clampQuestionCount(quickQuestionCount) || clampQuestionCount(questionCount) || 5;
 
         startInterview({
             job_title: role,
@@ -566,7 +519,7 @@ export default function ConfigurationView() {
                         <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
                             <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1.2} sx={{ mb: 1.2 }}>
                                 <Box>
-                                    <Typography variant="h5">Configuration</Typography>
+                                    <Typography variant="h5">Profile</Typography>
                                     <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.2 }}>
                                         Keep the core profile tight here. Resume and audio controls stay available without taking over the page.
                                     </Typography>
@@ -850,7 +803,7 @@ export default function ConfigurationView() {
 
                             <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} sx={{ mt: 1.35 }}>
                                 <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                    {analysisProgress || 'Save configuration, then analyze to refresh readiness and skill gaps.'}
+                                    {analysisProgress || 'Save your profile, then analyze to refresh readiness and skill gaps.'}
                                 </Typography>
                                 <Stack direction="row" spacing={1}>
                                     <Button
@@ -859,7 +812,7 @@ export default function ConfigurationView() {
                                         onClick={() => setClearDialogOpen(true)}
                                         disabled={isAnalyzing}
                                     >
-                                        Clear Configuration
+                                        Clear Profile
                                     </Button>
                                     <Button variant="outlined" startIcon={<Save />} onClick={saveConfig} disabled={isAnalyzing}>
                                         Save
@@ -875,6 +828,35 @@ export default function ConfigurationView() {
                                 </Stack>
                             </Stack>
                         </Paper>
+
+                        {isAnalyzing && (
+                            <Paper sx={{ p: { xs: 1.6, md: 2 } }}>
+                                <Stack spacing={1.2}>
+                                    <Box>
+                                        <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                                            Resume Analysis In Progress
+                                        </Typography>
+                                        <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                                            We&apos;re parsing the resume, extracting job requirements, and scoring fit step by step.
+                                        </Typography>
+                                    </Box>
+                                    <LinearProgress color="warning" />
+                                    <Typography variant="body2">
+                                        {analysisProgress || 'Preparing analysis...'}
+                                    </Typography>
+                                    <Stack spacing={0.7}>
+                                        {analyzingSteps.map((step, index) => (
+                                            <Stack key={`${step}-${index}`} direction="row" spacing={0.9} alignItems="center">
+                                                <AutoGraph sx={{ fontSize: 16, color: index === (analyzingSteps.length - 1) ? 'warning.main' : 'text.secondary' }} />
+                                                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                    {step}
+                                                </Typography>
+                                            </Stack>
+                                        ))}
+                                    </Stack>
+                                </Stack>
+                            </Paper>
+                        )}
 
                         <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
                             <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1.2} sx={{ mb: 1.2 }}>
@@ -1158,7 +1140,7 @@ export default function ConfigurationView() {
                 </Container>
 
                 <Dialog open={clearDialogOpen} onClose={() => setClearDialogOpen(false)} maxWidth="xs" fullWidth>
-                    <DialogTitle>Clear Configuration?</DialogTitle>
+                    <DialogTitle>Clear Profile?</DialogTitle>
                     <DialogContent>
                         <Typography variant="body2">
                             This will remove target role, company, job description, uploaded resume context, and analysis outputs.
@@ -1174,7 +1156,7 @@ export default function ConfigurationView() {
                                 clearConfig();
                             }}
                         >
-                            Clear Configuration
+                            Clear Profile
                         </Button>
                     </DialogActions>
                 </Dialog>
@@ -1249,14 +1231,24 @@ export default function ConfigurationView() {
                             </Stack>
                         ) : (
                             <Stack spacing={2.5} sx={{ pt: 1 }}>
-                                <TextField
-                                    label="Target Role"
-                                    placeholder="e.g. Senior Backend Engineer"
-                                    value={quickRole}
-                                    onChange={(e) => setQuickRole(e.target.value)}
-                                    fullWidth
-                                    autoFocus
-                                />
+                                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1.5fr 0.7fr' }, gap: 1.2 }}>
+                                    <TextField
+                                        label="Target Role"
+                                        placeholder="e.g. Senior Backend Engineer"
+                                        value={quickRole}
+                                        onChange={(e) => setQuickRole(e.target.value)}
+                                        fullWidth
+                                        autoFocus
+                                    />
+                                    <TextField
+                                        label="Question Count"
+                                        type="number"
+                                        value={quickQuestionCount}
+                                        onChange={(e) => setQuickQuestionCount(e.target.value)}
+                                        inputProps={{ min: 1, max: 12 }}
+                                        fullWidth
+                                    />
+                                </Box>
                                 <TextField
                                     label="Job Description"
                                     placeholder="Paste the job description here..."
@@ -1287,7 +1279,7 @@ export default function ConfigurationView() {
                                 </Box>
                                 {quickRole.trim() && quickJD.trim() && (
                                     <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                        Mock mode &bull; {PERSONA_OPTIONS.find((p) => p.id === defaultPersona)?.label || 'Friendly'} persona &bull; {questionCount || 5} questions
+                                        Mock mode &bull; {PERSONA_OPTIONS.find((p) => p.id === defaultPersona)?.label || 'Friendly'} persona &bull; {clampQuestionCount(quickQuestionCount) || 5} questions
                                     </Typography>
                                 )}
                             </Stack>

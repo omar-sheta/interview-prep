@@ -1,6 +1,9 @@
-# BeePrepared - Spark HTTPS Deployment
+# BeePrepared - Spark / Cloudflare Deployment
 
-This project is configured to run behind Caddy on `https://<host>:8443` so microphone access works in browsers.
+This project can run with a plain HTTP origin behind an upstream HTTPS proxy.
+The recommended deployment for the lab is:
+- public site: `https://beeprepared.cyber-hive.org`
+- DGX origin: `http://<dgx-host>:8443`
 
 ## 1. Prerequisites on DGX
 
@@ -26,32 +29,32 @@ From repo root:
 ```bash
 cp .env.example .env
 chmod +x start.sh
-PUBLIC_HOST=spark.hivehub.org PUBLIC_PORT=8443 ./start.sh
+ORIGIN_SCHEME=http ORIGIN_PORT=8443 PUBLIC_SCHEME=https PUBLIC_HOST=beeprepared.cyber-hive.org PUBLIC_PORT=443 ./start.sh
 ```
 
 If frontend is already built and `npm` is unavailable in your runtime shell:
 
 ```bash
-BUILD_CLIENT=0 PUBLIC_HOST=spark.hivehub.org PUBLIC_PORT=8443 ./start.sh
+BUILD_CLIENT=0 ORIGIN_SCHEME=http ORIGIN_PORT=8443 PUBLIC_SCHEME=https PUBLIC_HOST=beeprepared.cyber-hive.org PUBLIC_PORT=443 ./start.sh
 ```
 
 What `start.sh` does:
 - Builds frontend (`client/dist`)
 - Loads `.env` if present
 - Checks the configured LLM endpoint
-- Starts/reloads Caddy with `Caddyfile`
+- Starts/reloads Caddy with `Caddyfile` or `Caddyfile.http` depending on `ORIGIN_SCHEME`
 - Runs backend on `${HOST:-0.0.0.0}:${PORT:-8000}`
 
 ## 3. Share with company users
 
 Share this URL:
 
-`https://spark.hivehub.org:8443`
+`https://beeprepared.cyber-hive.org`
 
 If your users access via IP instead, set `PUBLIC_HOST` accordingly and ensure origin is allowed:
 
 ```bash
-CORS_ORIGINS="https://spark.hivehub.org:8443,https://192.168.1.48:8443" ./start.sh
+CORS_ORIGINS="https://beeprepared.cyber-hive.org,https://beeprepared.cyber-hive.org:443,https://192.168.1.48:8443" ./start.sh
 ```
 
 `CORS_ORIGINS` accepts either:
@@ -69,6 +72,24 @@ Key settings:
 - `PUBLIC_HOST`
 - `PIPER_MODEL_PATH`
 - `WHISPER_MODEL_ID`
+
+## 4.1 Cloudflare Notes
+
+If `cyber-hive.org` is already serving the lab website on port `443`, the cleanest BeePrepared deployment is:
+
+- keep the main website on `https://cyber-hive.org`
+- expose BeePrepared separately on `https://beeprepared.cyber-hive.org`
+
+Recommended setup:
+
+1. Point Cloudflare DNS for `beeprepared.cyber-hive.org` to the DGX/Spark host and keep it proxied.
+2. Open inbound `8443/tcp` from the upstream proxy or gateway to the DGX host if the tunnel/gateway is not on the same machine.
+3. Either:
+   - terminate HTTPS upstream and forward to BeePrepared over HTTP on `8443`, or
+   - use a real origin certificate in `certs/cert.pem` and `certs/key.pem` for direct HTTPS at the origin instead.
+4. Start BeePrepared with `ORIGIN_SCHEME=http ORIGIN_PORT=8443 PUBLIC_SCHEME=https PUBLIC_HOST=beeprepared.cyber-hive.org PUBLIC_PORT=443`.
+
+Because this app already serves the frontend and Socket.IO from the same origin, no separate `VITE_SOCKET_URL` is required for this deployment.
 
 ## 5. Performance (DGX Spark)
 

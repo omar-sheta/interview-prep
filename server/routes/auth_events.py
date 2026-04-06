@@ -49,7 +49,7 @@ def register_auth_events(sio, deps):
         )
         is_local_dev_origin = origin.startswith(local_dev_prefixes)
 
-        if origin and origin not in trusted_origins and not is_local_dev_origin:
+        if origin and "*" not in trusted_origins and origin not in trusted_origins and not is_local_dev_origin:
             print(f"🛡️ Rejected connection from untrusted origin: {origin}")
             raise socketio.exceptions.ConnectionRefusedError("Origin not allowed")
 

@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     # Tighter cap for JSON-extraction style calls (resume/JD/skill extraction).
     # Increased to 2500 to allow room for "Thinking Process" traces from reasoning models.
     LLM_JSON_MAX_TOKENS: int = 6000
+    # Experimental: run resume + JD analysis in one holistic LLM call before
+    # falling back to the structured multi-step pipeline.
+    RESUME_ANALYSIS_SINGLE_LLM_TRIAL: bool = False
+    RESUME_ANALYSIS_TRIAL_RESUME_CHARS: int = 6500
+    RESUME_ANALYSIS_TRIAL_JD_CHARS: int = 4500
 
     # Streaming STT (partial transcripts)
     WHISPER_CPP_ENABLED: bool = True
@@ -84,10 +89,10 @@ class Settings(BaseSettings):
     CORS_ORIGINS: Annotated[list[str], NoDecode] = [
         "*",
         # HTTPS origins for Caddy reverse proxy
-        "https://192.168.0.161", "https://192.168.1.48", "https://spark.hivehub.org",
+        "https://192.168.0.161", "https://192.168.1.48", "https://spark.hivehub.org", "https://cyber-hive.org", "https://beeprepared.cyber-hive.org",
         "https://localhost", "https://127.0.0.1",
-        "https://192.168.0.161:443", "https://spark.hivehub.org:443",
-        "https://192.168.0.161:8443", "https://192.168.1.48:8443", "https://spark.hivehub.org:8443",
+        "https://192.168.0.161:443", "https://spark.hivehub.org:443", "https://cyber-hive.org:443", "https://beeprepared.cyber-hive.org:443",
+        "https://192.168.0.161:8443", "https://192.168.1.48:8443", "https://spark.hivehub.org:8443", "https://cyber-hive.org:8443", "https://beeprepared.cyber-hive.org:8443",
     ]
 
     @field_validator("CORS_ORIGINS", mode="before")

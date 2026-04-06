@@ -86,7 +86,7 @@ export default function HiveTopNav({
     const normalizedActive = (active === 'interview' || active === 'report' || active === 'dashboard') ? 'interviews' : active;
     const navItems = [
         { key: 'interviews', label: 'Interviews', icon: <SmartToy />, path: '/interviews', visible: showInterviews },
-        { key: 'config', label: 'Configuration', icon: <Tune />, path: '/config', visible: showConfiguration },
+        { key: 'config', label: 'Profile', icon: <Tune />, path: '/config', visible: showConfiguration },
         { key: 'history', label: 'History', icon: <History />, path: '/history', visible: showHistory },
     ].filter((item) => item.visible);
 
@@ -105,15 +105,24 @@ export default function HiveTopNav({
         >
             <Container maxWidth="lg">
                 <Stack
-                    direction="row"
-                    alignItems="center"
+                    direction={{ xs: 'column', sm: 'row' }}
+                    alignItems={{ xs: 'stretch', sm: 'center' }}
                     justifyContent="space-between"
                     sx={{
-                        minHeight: 58,
-                        py: 0.55,
+                        minHeight: { xs: 'auto', sm: 58 },
+                        py: { xs: 0.8, sm: 0.55 },
+                        gap: { xs: 0.9, sm: 0 },
                     }}
                 >
-                    <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 220 }}>
+                    <Stack
+                        direction="row"
+                        spacing={1}
+                        alignItems="center"
+                        sx={{
+                            minWidth: 0,
+                            width: { xs: '100%', sm: 'auto' },
+                        }}
+                    >
                         <Box
                             sx={{
                                 width: 30,
@@ -142,7 +151,16 @@ export default function HiveTopNav({
                         />
                     </Stack>
 
-                    <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 220, justifyContent: 'flex-end' }}>
+                    <Stack
+                        direction="row"
+                        spacing={0.8}
+                        alignItems="center"
+                        justifyContent="space-between"
+                        sx={{
+                            minWidth: 0,
+                            width: { xs: '100%', sm: 'auto' },
+                        }}
+                    >
                         {quickActionLabel && typeof onQuickAction === 'function' && (
                             <Button
                                 variant="outlined"
@@ -155,6 +173,8 @@ export default function HiveTopNav({
                                     textTransform: 'none',
                                     fontWeight: 700,
                                     whiteSpace: 'nowrap',
+                                    flexShrink: 1,
+                                    minWidth: 0,
                                     borderColor: alpha('#f97316', darkMode ? 0.42 : 0.28),
                                     bgcolor: alpha('#f97316', darkMode ? 0.1 : 0.05),
                                 }}
@@ -162,32 +182,36 @@ export default function HiveTopNav({
                                 {quickActionLabel}
                             </Button>
                         )}
-                        <Tooltip title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
-                            <IconButton
-                                color="inherit"
-                                onClick={toggleDarkMode}
-                                sx={{
-                                    border: `1px solid ${alpha('#f97316', darkMode ? 0.4 : 0.22)}`,
-                                    borderRadius: 1.5,
-                                }}
-                            >
-                                {darkMode ? <LightMode /> : <DarkMode />}
-                            </IconButton>
-                        </Tooltip>
-                        {showSignOut && (
-                            <Tooltip title="Sign out">
+                        <Stack direction="row" spacing={0.8} alignItems="center" sx={{ flexShrink: 0 }}>
+                            <Tooltip title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
                                 <IconButton
-                                    onClick={logoutWithGuard}
+                                    color="inherit"
+                                    onClick={toggleDarkMode}
                                     sx={{
-                                        border: `1px solid ${alpha('#ef4444', darkMode ? 0.44 : 0.22)}`,
+                                        border: `1px solid ${alpha('#f97316', darkMode ? 0.4 : 0.22)}`,
                                         borderRadius: 1.5,
-                                        color: darkMode ? '#fca5a5' : '#b91c1c',
+                                        p: { xs: 0.85, sm: 1 },
                                     }}
                                 >
-                                    <Logout />
+                                    {darkMode ? <LightMode /> : <DarkMode />}
                                 </IconButton>
                             </Tooltip>
-                        )}
+                            {showSignOut && (
+                                <Tooltip title="Sign out">
+                                    <IconButton
+                                        onClick={logoutWithGuard}
+                                        sx={{
+                                            border: `1px solid ${alpha('#ef4444', darkMode ? 0.44 : 0.22)}`,
+                                            borderRadius: 1.5,
+                                            color: darkMode ? '#fca5a5' : '#b91c1c',
+                                            p: { xs: 0.85, sm: 1 },
+                                        }}
+                                    >
+                                        <Logout />
+                                    </IconButton>
+                                </Tooltip>
+                            )}
+                        </Stack>
                     </Stack>
                 </Stack>
 

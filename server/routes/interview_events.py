@@ -522,8 +522,10 @@ def register_interview_events(sio, deps):
             q_index = session.current_question_index
             await deps.finalize_current_utterance(session, reason="force")
             user_answer = data.get("answer", "")
+            used_transcript = False
 
             if not user_answer.strip():
+                used_transcript = True
                 user_answer = session.finalized_answer_transcript.strip() or session.current_answer_transcript.strip()
                 print(f"📝 Using finalized transcript ({len(user_answer)} chars)")
 
@@ -534,6 +536,20 @@ def register_interview_events(sio, deps):
                     room=str(session.user_id),
                 )
                 return
+
+            if used_transcript:
+                is_valid_submission, rejection_reason = deps.assess_submitted_transcript(
+                    user_answer,
+                    question_text=current_q.get("text", ""),
+                )
+                if not is_valid_submission:
+                    print(f"🔇 Rejected low-confidence transcript submission: {user_answer!r}")
+                    await sio.emit(
+                        "interview_error",
+                        {"error": rejection_reason, "user_id": session.user_id},
+                        room=str(session.user_id),
+                    )
+                    return
 
             duration = data.get("duration_seconds", 0)
             eval_entry = {
@@ -607,6 +623,12 @@ def register_interview_events(sio, deps):
                     },
                     room=str(session.user_id),
                 )
+
+                # Re-check: user may have requested end while we yielded on the emit.
+                if session.end_requested:
+                    cancel_question_tts(session)
+                    await finish_interview(sid, session)
+                    return
 
                 cancel_question_tts(session)
                 session.question_tts_task = asyncio.create_task(

@@ -1,11 +1,9 @@
 {
-	# Use self-signed certs (no ACME needed for local network)
+	# Plain HTTP origin for upstream reverse proxies (for example Cloudflare or a lab gateway)
 	auto_https off
 }
 
-:{$ORIGIN_PORT} {
-	tls {$APP_DIR}/certs/cert.pem {$APP_DIR}/certs/key.pem
-
+http://:{$ORIGIN_PORT} {
 	# Proxy Socket.IO, REST API, and docs to backend.
 	@backend_paths {
 		path /socket.io* /api/* /health /docs /docs/* /openapi.json /redoc /redoc/*

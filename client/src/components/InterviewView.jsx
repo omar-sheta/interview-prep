@@ -3,6 +3,7 @@ import useInterviewStore from '@/store/useInterviewStore';
 import {
     ThemeProvider,
     CssBaseline,
+    Alert,
     Box,
     Container,
     Paper,
@@ -97,9 +98,11 @@ export default function InterviewView() {
         transcript,
         coachingHint,
         answerSubmitPending,
+        interviewError,
         requestHint,
         toggleCoaching,
         clearCoachingHint,
+        clearInterviewError,
         skipQuestion,
         endInterview,
         submitInterviewAnswer,
@@ -215,6 +218,7 @@ export default function InterviewView() {
         recordingEpochRef.current = epoch;
 
         try {
+            clearInterviewError();
             setMicError('');
             setIsMicStarting(true);
 
@@ -291,7 +295,7 @@ export default function InterviewView() {
                 stopRecording(false);
             }
         }
-    }, [isMicStarting, sendAudioChunk, setRecording, silenceAutoStopMs, silenceRmsThreshold, stopRecording]);
+    }, [clearInterviewError, isMicStarting, sendAudioChunk, setRecording, silenceAutoStopMs, silenceRmsThreshold, stopRecording]);
 
     const ensureQuestionPlaybackContext = useCallback(async () => {
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -572,7 +576,9 @@ export default function InterviewView() {
         setPendingQuestionAudio(null);
         setPendingQuestionStreamChunk(null);
         stopQuestionAudio();
-    }, [questionNumber, stopQuestionAudio]);
+        setDraft('');
+        clearInterviewError();
+    }, [clearInterviewError, questionNumber, stopQuestionAudio]);
 
     useEffect(() => () => stopRecording(false), [stopRecording]);
     useEffect(() => () => stopQuestionAudio(), [stopQuestionAudio]);
@@ -593,6 +599,7 @@ export default function InterviewView() {
 
     const handleSubmit = () => {
         if (answerSubmitPending) return;
+        clearInterviewError();
 
         if (inputMode === 'type') {
             const answer = draft.trim();
@@ -604,14 +611,18 @@ export default function InterviewView() {
 
         if (isMicRecording) {
             stopRecording(true);
+            // Allow the last in-flight audio chunks and the delayed forceTranscribe
+            // (scheduled by stopRecording) to reach the server before submitting.
+            setTimeout(() => submitInterviewAnswer('', elapsedTime), 200);
         } else {
             forceTranscribe();
+            submitInterviewAnswer('', elapsedTime);
         }
-        submitInterviewAnswer('', elapsedTime);
     };
 
     const handleSkip = () => {
         if (answerSubmitPending) return;
+        clearInterviewError();
         if (isMicRecording || isMicStarting) stopRecording(false);
         stopQuestionAudio();
         setDraft('');
@@ -620,6 +631,7 @@ export default function InterviewView() {
 
     const handleModeChange = (_, nextMode) => {
         if (!nextMode) return;
+        clearInterviewError();
         if (nextMode === 'type' && (isMicRecording || isMicStarting)) {
             stopRecording(false);
         }
@@ -645,6 +657,7 @@ export default function InterviewView() {
     const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
 
     const handleEndSession = () => {
+        clearInterviewError();
         if (isMicRecording || isMicStarting) {
             stopRecording(false);
         }
@@ -903,6 +916,12 @@ export default function InterviewView() {
                                             <Typography variant="body2" color="error">
                                                 {micError}
                                             </Typography>
+                                        )}
+
+                                        {interviewError && (
+                                            <Alert severity="warning" variant="outlined">
+                                                {interviewError}
+                                            </Alert>
                                         )}
 
                                         <Paper

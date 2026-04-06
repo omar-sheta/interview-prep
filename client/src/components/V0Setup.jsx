@@ -25,75 +25,49 @@ import {
 import {
     ArrowForward,
     PlayArrow,
-    Psychology,
-    Code,
-    AccountTree,
-    AutoAwesome,
-    Diversity3,
-    Gavel,
     BoltOutlined,
     Close,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
 import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
+import {
+    PERSONA_OPTIONS,
+    QUICK_INTERVIEW_TYPES,
+    getQuickSkillGaps,
+    normalizeQuickPersona,
+    clampQuickQuestionCount,
+} from '@/lib/quickInterviewConfig';
 
 const INTERVIEW_TYPES = [
     {
         id: 'behavioral',
         title: 'Behavioral Interview',
         description: 'Practice leadership, conflict handling, communication, and STAR-style storytelling.',
-        icon: Psychology,
         tags: ['STAR', 'Leadership', 'Communication'],
     },
     {
         id: 'technical',
         title: 'Technical Interview',
         description: 'Focus on implementation decisions, trade-offs, debugging, and applied technical reasoning.',
-        icon: Code,
         tags: ['Problem Solving', 'Architecture', 'Debugging'],
     },
     {
         id: 'system_design',
         title: 'System Design Interview',
         description: 'Practice large-scale design prompts around scalability, reliability, and performance.',
-        icon: AccountTree,
         tags: ['Scalability', 'Reliability', 'Trade-offs'],
     },
     {
         id: 'mixed',
         title: 'Mixed Interview',
         description: 'Balanced flow across behavioral, technical, and design-style prompts.',
-        icon: AutoAwesome,
         tags: ['Balanced', 'Adaptive', 'General Prep'],
     },
 ];
 
-const INTERVIEW_PERSONAS = [
-    {
-        id: 'friendly',
-        title: 'Friendly',
-        icon: Diversity3,
-        description: 'Supportive tone, clear prompts, and collaborative pacing.',
-    },
-    {
-        id: 'strict',
-        title: 'Strict',
-        icon: Gavel,
-        description: 'High bar, direct wording, and precision-focused follow-ups.',
-    },
-];
-
-function normalizePersona(value) {
-    const normalized = String(value || '').trim().toLowerCase();
-    const allowed = new Set(INTERVIEW_PERSONAS.map((p) => p.id));
-    return allowed.has(normalized) ? normalized : 'friendly';
-}
-
 function normalizeQuestionCount(value) {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return 5;
-    return Math.max(1, Math.min(12, Math.trunc(n)));
+    return clampQuickQuestionCount(value);
 }
 
 function getSkillGapsForType(interviewType, missingSkills = []) {
@@ -148,20 +122,20 @@ export default function V0Setup() {
     } = useInterviewStore();
 
     const [startingType, setStartingType] = useState(null);
-    const [selectedPersona, setSelectedPersona] = useState(normalizePersona(interviewerPersona));
+    const [selectedPersona, setSelectedPersona] = useState(normalizeQuickPersona(interviewerPersona));
     const [error, setError] = useState('');
 
-    // Quick Interview (cold start) state
     const [quickOpen, setQuickOpen] = useState(false);
     const [quickRole, setQuickRole] = useState('');
     const [quickJD, setQuickJD] = useState('');
     const [quickType, setQuickType] = useState('mixed');
+    const [quickQuestionCount, setQuickQuestionCount] = useState('5');
     const [quickStarting, setQuickStarting] = useState(false);
 
-    // Pre-fill quick interview fields from saved config when dialog opens
     const openQuickDialog = () => {
         setQuickRole(String(targetRole || '').trim());
         setQuickJD(String(jobDescription || '').trim());
+        setQuickQuestionCount(String(normalizeQuestionCount(questionCountOverride || 5)));
         setQuickOpen(true);
     };
 
@@ -170,7 +144,7 @@ export default function V0Setup() {
     }, [connect]);
 
     useEffect(() => {
-        setSelectedPersona(normalizePersona(interviewerPersona));
+        setSelectedPersona(normalizeQuickPersona(interviewerPersona));
     }, [interviewerPersona]);
 
     useEffect(() => {
@@ -192,10 +166,10 @@ export default function V0Setup() {
     const isAnalyzing = appState === APP_STATES.ANALYZING;
     const hasConfiguration = String(targetRole || '').trim() && String(jobDescription || '').trim();
     const questionCount = normalizeQuestionCount(questionCountOverride || 5);
-    const activePersona = INTERVIEW_PERSONAS.find((persona) => persona.id === selectedPersona) || INTERVIEW_PERSONAS[0];
+    const activePersona = PERSONA_OPTIONS.find((persona) => persona.id === selectedPersona) || PERSONA_OPTIONS[0];
 
     const handlePersonaSelect = (personaId) => {
-        const normalized = normalizePersona(personaId);
+        const normalized = normalizeQuickPersona(personaId);
         setSelectedPersona(normalized);
         setInterviewerPersona(normalized);
         savePreferences({ interviewer_persona: normalized });
@@ -208,7 +182,7 @@ export default function V0Setup() {
         }
 
         if (!hasConfiguration) {
-            setError('Configuration is incomplete. Set target role and job description first.');
+            setError('Profile is incomplete. Set target role and job description first.');
             return;
         }
 
@@ -232,7 +206,6 @@ export default function V0Setup() {
             interviewer_persona: selectedPersona,
             question_count: questionCount,
         });
-
     };
 
     const handleQuickStart = () => {
@@ -249,11 +222,9 @@ export default function V0Setup() {
         setQuickStarting(true);
         setError('');
 
-        const skillGaps = getSkillGapsForType(quickType, []);
-
         startInterview({
             job_title: role,
-            skill_gaps: skillGaps,
+            skill_gaps: getQuickSkillGaps(quickType),
             readiness_score: 0.5,
             job_description: jd,
             interview_type: quickType,
@@ -262,9 +233,8 @@ export default function V0Setup() {
             feedback_timing: 'end_only',
             live_scoring: false,
             interviewer_persona: selectedPersona,
-            question_count: questionCount,
+            question_count: normalizeQuestionCount(quickQuestionCount || 5),
         });
-
     };
 
     return (
@@ -293,12 +263,12 @@ export default function V0Setup() {
                                     <Chip size="small" label={readinessPercent > 0 ? `Readiness ${readinessPercent}%` : 'Quick Start'} color={readinessPercent > 0 ? 'default' : 'info'} variant="outlined" />
                                     <Chip size="small" label={`${questionCount} questions`} variant="outlined" />
                                     <Chip size="small" label="Mock Mode" variant="outlined" />
-                                    <Chip size="small" label={activePersona.title} variant="outlined" />
+                                    <Chip size="small" label={activePersona.label} variant="outlined" />
                                 </Stack>
                             </Stack>
                             <Divider sx={{ my: 1.4 }} />
                             <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                Configuration: {targetRole || 'Not set'} {targetCompany ? `• ${targetCompany}` : ''}
+                                Profile: {targetRole || 'Not set'} {targetCompany ? `• ${targetCompany}` : ''}
                             </Typography>
                             {analysisProgress && (
                                 <Typography variant="caption" sx={{ color: 'text.secondary' }}>
@@ -315,10 +285,10 @@ export default function V0Setup() {
                                         Choose how the interviewer behaves during the session.
                                     </Typography>
                                 </Box>
-                                <Chip size="small" label={`Active: ${activePersona.title}`} color="secondary" variant="outlined" />
+                                <Chip size="small" label={`Active: ${activePersona.label}`} color="secondary" variant="outlined" />
                             </Stack>
                             <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 0.9 }}>
-                                {INTERVIEW_PERSONAS.map((persona) => {
+                                {PERSONA_OPTIONS.map((persona) => {
                                     const Icon = persona.icon;
                                     const selected = selectedPersona === persona.id;
                                     return (
@@ -346,7 +316,7 @@ export default function V0Setup() {
                                                 <Icon sx={{ color: selected ? 'primary.main' : 'text.secondary' }} />
                                                 <Box sx={{ minWidth: 0 }}>
                                                     <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                                                        {persona.title}
+                                                        {persona.label}
                                                     </Typography>
                                                     <Typography variant="caption" sx={{ color: 'text.secondary' }}>
                                                         {persona.description}
@@ -368,7 +338,7 @@ export default function V0Setup() {
                                     For personalized questions based on your resume, set up your profile and run analysis first.
                                 </Typography>
                                 <Button variant="outlined" endIcon={<ArrowForward />} onClick={() => navigate('/config')}>
-                                    Open Configuration
+                                    Open Profile
                                 </Button>
                             </Paper>
                         )}
@@ -382,7 +352,8 @@ export default function V0Setup() {
                         {hasConfiguration && (
                             <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.4 }}>
                                 {INTERVIEW_TYPES.map((type) => {
-                                    const Icon = type.icon;
+                                    const quickTypeMatch = QUICK_INTERVIEW_TYPES.find((item) => item.id === type.id);
+                                    const Icon = quickTypeMatch?.icon;
                                     const isStarting = startingType === type.id;
                                     return (
                                         <Paper
@@ -394,7 +365,7 @@ export default function V0Setup() {
                                             }}
                                         >
                                             <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.8 }}>
-                                                <Icon sx={{ color: 'primary.main' }} />
+                                                {Icon ? <Icon sx={{ color: 'primary.main' }} /> : null}
                                                 <Typography variant="h6">{type.title}</Typography>
                                             </Stack>
                                             <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.2 }}>
@@ -422,7 +393,6 @@ export default function V0Setup() {
                 </Container>
             </Box>
 
-            {/* Quick Interview Dialog */}
             <Dialog
                 open={quickOpen}
                 onClose={() => !quickStarting && setQuickOpen(false)}
@@ -432,7 +402,7 @@ export default function V0Setup() {
                 <DialogTitle>
                     <Stack direction="row" justifyContent="space-between" alignItems="center">
                         <Stack direction="row" spacing={1} alignItems="center">
-                            <BoltOutlined sx={{ color: 'primary.main' }} />
+                            <BoltOutlined sx={{ color: '#6366f1' }} />
                             <span>Quick Interview</span>
                         </Stack>
                         <IconButton size="small" onClick={() => setQuickOpen(false)} disabled={quickStarting}>
@@ -442,68 +412,111 @@ export default function V0Setup() {
                 </DialogTitle>
                 <Divider />
                 <DialogContent>
-                    <Stack spacing={2.5} sx={{ pt: 1 }}>
-                        <TextField
-                            label="Target Role"
-                            placeholder="e.g. Senior Backend Engineer"
-                            value={quickRole}
-                            onChange={(e) => setQuickRole(e.target.value)}
-                            fullWidth
-                            disabled={quickStarting}
-                            autoFocus
-                        />
-                        <TextField
-                            label="Job Description"
-                            placeholder="Paste the job description here..."
-                            value={quickJD}
-                            onChange={(e) => setQuickJD(e.target.value)}
-                            fullWidth
-                            multiline
-                            minRows={5}
-                            maxRows={12}
-                            disabled={quickStarting}
-                        />
-                        <Box>
-                            <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
-                                Interview Type
-                            </Typography>
-                            <ToggleButtonGroup
-                                value={quickType}
-                                exclusive
-                                onChange={(_, val) => val && setQuickType(val)}
-                                size="small"
-                                fullWidth
-                                disabled={quickStarting}
+                    {quickStarting ? (
+                        <Stack
+                            spacing={2}
+                            alignItems="center"
+                            justifyContent="center"
+                            sx={{ py: { xs: 5, md: 7 }, minHeight: 280 }}
+                        >
+                            <Box
+                                sx={{
+                                    width: 64,
+                                    height: 64,
+                                    borderRadius: '50%',
+                                    display: 'grid',
+                                    placeItems: 'center',
+                                    background: 'linear-gradient(135deg, rgba(99,102,241,0.18), rgba(139,92,246,0.12))',
+                                }}
                             >
-                                {INTERVIEW_TYPES.map((t) => (
-                                    <ToggleButton key={t.id} value={t.id} sx={{ textTransform: 'none', py: 1 }}>
-                                        {t.title.replace(' Interview', '')}
-                                    </ToggleButton>
-                                ))}
-                            </ToggleButtonGroup>
-                        </Box>
-                        {quickRole.trim() && quickJD.trim() && (
-                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                Style: Mock Mode &bull; Persona: {activePersona.title} &bull; {questionCount} questions
+                                <CircularProgress size={32} sx={{ color: '#8b5cf6' }} />
+                            </Box>
+                            <Typography variant="h6" sx={{ fontWeight: 700 }}>
+                                Creating Interview…
                             </Typography>
-                        )}
-                    </Stack>
+                            <Typography variant="body2" sx={{ color: 'text.secondary', textAlign: 'center', maxWidth: 340 }}>
+                                Generating {QUICK_INTERVIEW_TYPES.find((t) => t.id === quickType)?.title || 'Mixed'} questions for <strong>{quickRole.trim()}</strong>. This usually takes a few seconds.
+                            </Typography>
+                        </Stack>
+                    ) : (
+                        <Stack spacing={2.5} sx={{ pt: 1 }}>
+                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1.5fr 0.7fr' }, gap: 1.2 }}>
+                                <TextField
+                                    label="Target Role"
+                                    placeholder="e.g. Senior Backend Engineer"
+                                    value={quickRole}
+                                    onChange={(e) => setQuickRole(e.target.value)}
+                                    fullWidth
+                                    autoFocus
+                                />
+                                <TextField
+                                    label="Question Count"
+                                    type="number"
+                                    value={quickQuestionCount}
+                                    onChange={(e) => setQuickQuestionCount(e.target.value)}
+                                    inputProps={{ min: 1, max: 12 }}
+                                    fullWidth
+                                />
+                            </Box>
+                            <TextField
+                                label="Job Description"
+                                placeholder="Paste the job description here..."
+                                value={quickJD}
+                                onChange={(e) => setQuickJD(e.target.value)}
+                                fullWidth
+                                multiline
+                                minRows={5}
+                                maxRows={12}
+                            />
+                            <Box>
+                                <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                                    Interview Type
+                                </Typography>
+                                <ToggleButtonGroup
+                                    value={quickType}
+                                    exclusive
+                                    onChange={(_, val) => val && setQuickType(val)}
+                                    size="small"
+                                    fullWidth
+                                >
+                                    {QUICK_INTERVIEW_TYPES.map((t) => (
+                                        <ToggleButton key={t.id} value={t.id} sx={{ textTransform: 'none', py: 1 }}>
+                                            {t.title}
+                                        </ToggleButton>
+                                    ))}
+                                </ToggleButtonGroup>
+                            </Box>
+                            {quickRole.trim() && quickJD.trim() && (
+                                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                    Mock mode &bull; {activePersona.label} persona &bull; {normalizeQuestionCount(quickQuestionCount || 5)} questions
+                                </Typography>
+                            )}
+                        </Stack>
+                    )}
                 </DialogContent>
-                <Divider />
-                <DialogActions sx={{ px: 3, py: 2 }}>
-                    <Button onClick={() => setQuickOpen(false)} disabled={quickStarting}>
-                        Cancel
-                    </Button>
-                    <Button
-                        variant="contained"
-                        size="large"
-                        startIcon={quickStarting ? <CircularProgress size={16} color="inherit" /> : <PlayArrow />}
-                        onClick={handleQuickStart}
-                        disabled={!quickRole.trim() || !quickJD.trim() || quickStarting}
-                    >
-                        {quickStarting ? 'Starting...' : 'Start Interview'}
-                    </Button>
-                </DialogActions>
+                {!quickStarting && (
+                    <>
+                        <Divider />
+                        <DialogActions sx={{ px: 3, py: 2 }}>
+                            <Button onClick={() => setQuickOpen(false)}>
+                                Cancel
+                            </Button>
+                            <Button
+                                variant="contained"
+                                size="large"
+                                startIcon={<PlayArrow />}
+                                onClick={handleQuickStart}
+                                disabled={!quickRole.trim() || !quickJD.trim()}
+                                sx={{
+                                    background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                                    '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
+                                }}
+                            >
+                                Start Interview
+                            </Button>
+                        </DialogActions>
+                    </>
+                )}
             </Dialog>
         </ThemeProvider>
     );

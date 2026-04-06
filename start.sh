@@ -11,6 +11,9 @@ PRESERVED_ENV_KEYS=(
   APP_DIR
   BACKEND_ENV
   BUILD_CLIENT
+  ORIGIN_SCHEME
+  ORIGIN_PORT
+  PUBLIC_SCHEME
   UVICORN_HOST
   UVICORN_PORT
   PUBLIC_HOST
@@ -115,12 +118,25 @@ fi
 
 UVICORN_HOST="${UVICORN_HOST:-${HOST:-0.0.0.0}}"
 UVICORN_PORT="${UVICORN_PORT:-${PORT:-8000}}"
-PUBLIC_PORT="${PUBLIC_PORT:-8443}"
-PUBLIC_HOST="${PUBLIC_HOST:-spark.hivehub.org}"
-PUBLIC_URL="${PUBLIC_URL:-https://${PUBLIC_HOST}:${PUBLIC_PORT}}"
+ORIGIN_SCHEME="${ORIGIN_SCHEME:-${PUBLIC_SCHEME:-https}}"
+ORIGIN_PORT="${ORIGIN_PORT:-${PUBLIC_PORT:-8443}}"
+PUBLIC_SCHEME="${PUBLIC_SCHEME:-${ORIGIN_SCHEME}}"
+PUBLIC_PORT="${PUBLIC_PORT:-${ORIGIN_PORT}}"
+PUBLIC_HOST="${PUBLIC_HOST:-beeprepared.cyber-hive.org}"
+if [ -z "${PUBLIC_URL:-}" ]; then
+  public_port_suffix=":${PUBLIC_PORT}"
+  if { [ "${PUBLIC_SCHEME}" = "http" ] && [ "${PUBLIC_PORT}" = "80" ]; } \
+    || { [ "${PUBLIC_SCHEME}" = "https" ] && [ "${PUBLIC_PORT}" = "443" ]; }; then
+    public_port_suffix=""
+  fi
+  PUBLIC_URL="${PUBLIC_SCHEME}://${PUBLIC_HOST}${public_port_suffix}"
+fi
 SPARK_FAST_PRESET="${SPARK_FAST_PRESET:-1}"
 
 export APP_DIR
+export ORIGIN_SCHEME
+export ORIGIN_PORT
+export PUBLIC_SCHEME
 export PUBLIC_PORT
 export UVICORN_PORT
 
@@ -254,15 +270,23 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-echo "Starting or reloading Caddy HTTPS proxy on port ${PUBLIC_PORT}..."
-./caddy validate --config Caddyfile
-if ! ./caddy start --config Caddyfile >/dev/null 2>&1; then
-  ./caddy reload --config Caddyfile
+if [ "${ORIGIN_SCHEME}" = "http" ]; then
+  CADDY_CONFIG="Caddyfile.http"
+  echo "Starting or reloading Caddy HTTP origin on port ${ORIGIN_PORT}..."
+else
+  CADDY_CONFIG="Caddyfile"
+  echo "Starting or reloading Caddy HTTPS origin on port ${ORIGIN_PORT}..."
+fi
+
+./caddy validate --config "${CADDY_CONFIG}"
+if ! ./caddy start --config "${CADDY_CONFIG}" >/dev/null 2>&1; then
+  ./caddy reload --config "${CADDY_CONFIG}"
 fi
 
 echo ""
 echo "==========================================="
 echo "App is live at: ${PUBLIC_URL}"
+echo "Origin listener: ${ORIGIN_SCHEME}://0.0.0.0:${ORIGIN_PORT}"
 echo "==========================================="
 echo "Runtime: ${llm_provider} @ ${llm_base_url}, SPARK_FAST_PRESET=${SPARK_FAST_PRESET}"
 echo ""

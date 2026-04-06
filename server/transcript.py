@@ -6,6 +6,23 @@ import re
 from difflib import SequenceMatcher
 
 
+SUBMISSION_FILLER_WORDS = {
+    "uh",
+    "um",
+    "hmm",
+    "mm",
+    "mhm",
+    "yeah",
+    "yep",
+    "ok",
+    "okay",
+    "so",
+    "well",
+    "you",
+    "know",
+}
+
+
 def transcript_similarity(a: str, b: str) -> float:
     """Return similarity ratio 0.0-1.0 between two transcripts."""
     if not a or not b:
@@ -49,6 +66,50 @@ def should_drop_false_start(existing: str, new_chunk: str) -> bool:
         return True
 
     return False
+
+
+def assess_submitted_transcript(answer_text: str, question_text: str = "") -> tuple[bool, str | None]:
+    """
+    Decide whether a transcript is substantial enough to submit as an answer.
+    This protects the interview flow from advancing on tiny fragments, filler,
+    or interviewer-audio echo captured by the mic.
+    """
+    text = (answer_text or "").strip()
+    if not text:
+        return False, "No answer detected yet. Please record your answer and try again."
+
+    words = normalized_transcript_words(text)
+    if not words:
+        return False, "I couldn't make out your answer. Please try recording again."
+
+    if should_drop_false_start("", text):
+        return False, "I only caught a false start. Please try recording your answer again."
+
+    if len(words) == 1 and (len(words[0]) <= 3 or words[0] in SUBMISSION_FILLER_WORDS):
+        return False, "I only caught a tiny fragment of your answer. Please speak a bit longer and try again."
+
+    if len(words) <= 2 and len(text) < 12:
+        return False, "I only caught a very short fragment. Please keep speaking for another second and try again."
+
+    if len(words) <= 3 and all(word in SUBMISSION_FILLER_WORDS for word in words):
+        return False, "That sounded like a partial start rather than your full answer. Please try again."
+
+    question_words = normalized_transcript_words(question_text)
+    if question_words and len(words) <= 5:
+        prefix_len = min(len(question_words), max(len(words) + 2, len(words)))
+        question_prefix = " ".join(question_words[:prefix_len])
+        answer_norm = " ".join(words)
+        if question_prefix and (
+            question_prefix.startswith(answer_norm)
+            or transcript_similarity(answer_norm, question_prefix) >= 0.86
+        ):
+            return (
+                False,
+                "It sounds like the mic may have picked up the interviewer audio instead of your answer. "
+                "Please wait for the prompt audio to finish, then try again.",
+            )
+
+    return True, None
 
 
 def merge_transcript(existing: str, new_chunk: str) -> str:
