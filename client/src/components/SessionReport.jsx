@@ -15,16 +15,12 @@ import {
     AccordionDetails,
     Divider,
     Grid,
-    TextField,
-    Alert,
     LinearProgress,
     Tooltip,
 } from '@mui/material';
 import {
     ExpandMore,
-    Replay,
     TipsAndUpdates,
-    TrendingUp,
     PictureAsPdfOutlined,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
@@ -276,13 +272,6 @@ function normalizeConfidence(value) {
     return Math.max(0, Math.min(1, n));
 }
 
-function formatDelta(value) {
-    const n = Number(value || 0);
-    if (Number.isNaN(n)) return '0.0';
-    const sign = n > 0 ? '+' : '';
-    return `${sign}${n.toFixed(1)}`;
-}
-
 function scoreBadgeColor(confidence) {
     if (confidence === null) return 'default';
     if (confidence >= 0.7) return 'success';
@@ -301,16 +290,11 @@ export default function SessionReport() {
         isConnected,
         loadSessionDetails,
         setReportFromHistorySession,
-        retryAttemptsByQuestion,
-        retrySubmitting,
-        retryErrors,
-        loadRetryAttempts,
-        submitRetryAnswer,
         sessionToken,
     } = useInterviewStore();
 
     const [expanded, setExpanded] = useState(false);
-    const [retryDrafts, setRetryDrafts] = useState({});
+    const [expandedTextBlocks, setExpandedTextBlocks] = useState({});
     const rehydrateRequestRef = useRef(null);
     const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
     const reportSessionId = String(currentSessionId || selectedSession?.session_id || '').trim() || null;
@@ -333,7 +317,6 @@ export default function SessionReport() {
                 };
 
                 const confidence = normalizeConfidence(evaluation?.confidence);
-                const evidenceQuotes = toStringArray(evaluation?.evidence_quotes, 2);
                 const evalGaps = toStringArray(evaluation?.gaps || evaluation?.rubric_misses || evaluation?.missing_concepts, 5);
                 const evalStrengths = toStringArray(evaluation?.strengths, 5);
                 const qualityFlags = toStringArray(evaluation?.quality_flags, 6);
@@ -341,10 +324,6 @@ export default function SessionReport() {
                     || qualityFlags.some((flag) => String(flag).toLowerCase() === 'skipped')
                     || String(ev?.answer || '').trim().toLowerCase() === '(skipped)';
                 const improvementPlan = deriveImprovementPlan(evaluation, ev?.question?.text || 'this question');
-                const retryDrill = (evaluation?.retry_drill && typeof evaluation.retry_drill === 'object')
-                    ? evaluation.retry_drill
-                    : {};
-
                 return {
                     id: `q-${idx + 1}`,
                     index: idx + 1,
@@ -359,12 +338,9 @@ export default function SessionReport() {
                     tip: evaluation?.coaching_tip || '',
                     evaluationReasoning: evaluation?.evaluation_reasoning || evaluation?.feedback || '',
                     confidence,
-                    evidenceQuotes,
                     qualityFlags,
                     isSkipped,
                     improvementPlan,
-                    retryPrompt: String(retryDrill?.prompt || '').trim(),
-                    retryTargetPoints: toStringArray(retryDrill?.target_points, 3),
                 };
             }),
         [allEvaluations]
@@ -496,21 +472,11 @@ export default function SessionReport() {
         setReportFromHistorySession,
     ]);
 
-    useEffect(() => {
-        if (!expanded || !reportSessionId) return;
-        const question = questions.find((item) => item.id === expanded);
-        if (!question) return;
-        const key = `${reportSessionId}:${question.index}`;
-        if (retryAttemptsByQuestion[key] === undefined) {
-            loadRetryAttempts(reportSessionId, question.index);
-        }
-    }, [expanded, reportSessionId, questions, retryAttemptsByQuestion, loadRetryAttempts]);
-
-    const handleRetryChange = (questionId, value) => {
-        setRetryDrafts((prev) => ({ ...prev, [questionId]: value }));
-    };
-
     const [exporting, setExporting] = useState(false);
+
+    const toggleTextBlock = (key) => {
+        setExpandedTextBlocks((prev) => ({ ...prev, [key]: !prev[key] }));
+    };
 
     const handleExport = async () => {
         if (!reportSessionId || exporting) return;
@@ -537,24 +503,6 @@ export default function SessionReport() {
             console.error('Export error:', err);
         } finally {
             setExporting(false);
-        }
-    };
-
-    const handleRetrySubmit = (question) => {
-        if (!reportSessionId) return;
-        const answer = String(retryDrafts[question.id] || '').trim();
-        if (!answer) return;
-
-        const accepted = submitRetryAnswer({
-            sessionId: reportSessionId,
-            questionNumber: question.index,
-            answer,
-            durationSeconds: 0,
-            inputMode: 'text',
-        });
-
-        if (accepted) {
-            setRetryDrafts((prev) => ({ ...prev, [question.id]: '' }));
         }
     };
 
@@ -839,15 +787,14 @@ export default function SessionReport() {
                         ) : (
                             <Stack spacing={1.1}>
                                 {questions.map((q) => {
-                                    const retryKey = reportSessionId ? `${reportSessionId}:${q.index}` : '';
-                                    const attempts = retryKey ? (retryAttemptsByQuestion[retryKey] || []) : [];
-                                    const latestAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : null;
-                                    const latestEval = latestAttempt?.evaluation || {};
-                                    const latestBreakdown = latestEval?.score_breakdown || {};
-                                    const baseline = normalizeScore(latestAttempt?.baseline_score ?? q.score);
-                                    const retryDelta = Number(latestAttempt?.delta_score || 0);
-                                    const busy = Boolean(retrySubmitting[retryKey]);
-                                    const retryError = retryErrors[retryKey];
+                                    const reasoningKey = `${q.id}-reasoning`;
+                                    const answerKey = `${q.id}-answer`;
+                                    const modelKey = `${q.id}-model`;
+                                    const tipKey = `${q.id}-tip`;
+                                    const showReasoningToggle = q.evaluationReasoning.length > 240;
+                                    const showAnswerToggle = q.answer.length > 320;
+                                    const showModelToggle = q.modelAnswer.length > 260;
+                                    const showTipToggle = q.tip.length > 220;
 
                                     return (
                                         <Accordion
@@ -885,269 +832,262 @@ export default function SessionReport() {
                                                 </Stack>
                                             </AccordionSummary>
 
-                                            <AccordionDetails>
-                                                <Stack spacing={1.1}>
-                                                    <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap">
-                                                        <Chip size="small" label={q.category} color="secondary" variant="outlined" />
+                                            <AccordionDetails sx={{ pt: 0, pb: 3, px: { xs: 2.5, md: 3.5 } }}>
+                                                <Stack spacing={4}>
+                                                    {/* Header Metadata */}
+                                                    <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                                                        <Chip size="small" label={q.category} color="secondary" variant="outlined" sx={{ borderRadius: 1.5 }} />
                                                         {q.confidence !== null && (
                                                             <Chip
                                                                 size="small"
-                                                                label={`Confidence ${(q.confidence * 100).toFixed(0)}%`}
+                                                                label={`Model Confidence ${(q.confidence * 100).toFixed(0)}%`}
                                                                 color={scoreBadgeColor(q.confidence)}
                                                                 variant="outlined"
+                                                                sx={{ borderRadius: 1.5 }}
                                                             />
                                                         )}
-                                                        {attempts.length > 0 && (
-                                                            <Chip size="small" label={`${attempts.length} retries`} variant="outlined" />
-                                                        )}
+                                                        {q.qualityFlags.length > 0 && q.qualityFlags.map((flag, idx) => (
+                                                            <Chip
+                                                                key={`${q.id}-flag-${idx}`}
+                                                                size="small"
+                                                                label={flag.replaceAll('_', ' ')}
+                                                                color="warning"
+                                                                variant="filled"
+                                                                sx={{ borderRadius: 1.5, fontWeight: 600 }}
+                                                            />
+                                                        ))}
                                                     </Stack>
 
-                                                    <Paper sx={{ p: 1.2, bgcolor: 'rgba(249, 115, 22, 0.07)' }}>
-                                                        <Typography variant="subtitle2" sx={{ mb: 0.9 }}>
-                                                            <Box component="span" sx={{ fontStyle: 'italic' }}>
-                                                                Why this score
-                                                            </Box>
+                                                    {/* Why this Score */}
+                                                    <Box>
+                                                        <Typography variant="overline" sx={{ color: 'text.secondary', fontWeight: 700, letterSpacing: '0.05em' }}>
+                                                            Why this score
                                                         </Typography>
-
+                                                        
                                                         {q.evaluationReasoning && (
-                                                            <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1, fontStyle: 'italic' }}>
+                                                            <Typography
+                                                                variant="body1"
+                                                                sx={{
+                                                                    color: 'text.primary',
+                                                                    mt: 1,
+                                                                    mb: 2,
+                                                                    lineHeight: 1.6,
+                                                                    ...(showReasoningToggle && !expandedTextBlocks[reasoningKey]
+                                                                        ? {
+                                                                            display: '-webkit-box',
+                                                                            WebkitLineClamp: 3,
+                                                                            WebkitBoxOrient: 'vertical',
+                                                                            overflow: 'hidden',
+                                                                        }
+                                                                        : {}),
+                                                                }}
+                                                            >
                                                                 {q.evaluationReasoning}
                                                             </Typography>
                                                         )}
+                                                        {showReasoningToggle && (
+                                                            <Button
+                                                                size="small"
+                                                                variant="text"
+                                                                color="primary"
+                                                                sx={{ alignSelf: 'flex-start', mb: 2, px: 0, minWidth: 0, textTransform: 'none', fontWeight: 600 }}
+                                                                onClick={() => toggleTextBlock(reasoningKey)}
+                                                            >
+                                                                {expandedTextBlocks[reasoningKey] ? 'Show less' : 'Show full reasoning'}
+                                                            </Button>
+                                                        )}
 
-                                                        <Grid container spacing={0.8} sx={{ mb: 1 }}>
+                                                        <Stack direction="row" spacing={4} useFlexGap flexWrap="wrap" sx={{ mb: 3.5, mt: 1 }}>
                                                             {SCORE_KEYS.map(({ key, label }) => {
                                                                 const style = SCORE_DIMENSION_STYLES[key] || SCORE_DIMENSION_STYLES.relevance;
                                                                 return (
-                                                                <Grid key={`${q.id}-score-${key}`} size={{ xs: 6, sm: 4, md: 'auto' }}>
-                                                                    <Paper
-                                                                        sx={{
-                                                                            p: 1,
-                                                                            minWidth: 88,
-                                                                            borderStyle: 'solid',
-                                                                            borderWidth: 1,
-                                                                            borderColor: style.border,
-                                                                            bgcolor: style.background,
-                                                                        }}
-                                                                    >
-                                                                        <Typography variant="caption" sx={{ color: style.color, fontWeight: 700 }}>{label}</Typography>
-                                                                        <Typography variant="body2" sx={{ fontWeight: 800, color: style.color }}>
-                                                                            {normalizeScore(q.breakdown[key]).toFixed(1)}/10
+                                                                    <Box key={`${q.id}-score-${key}`}>
+                                                                        <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: 600, display: 'block', mb: 0.2 }}>{label}</Typography>
+                                                                        <Typography variant="body1" sx={{ fontWeight: 800, color: style.color }}>
+                                                                            {normalizeScore(q.breakdown[key]).toFixed(1)} <Typography component="span" variant="caption" sx={{ color: 'text.disabled' }}>/10</Typography>
                                                                         </Typography>
-                                                                    </Paper>
-                                                                </Grid>
+                                                                    </Box>
                                                                 );
                                                             })}
-                                                        </Grid>
-
-                                                        {q.evidenceQuotes.length > 0 && (
-                                                            <Stack spacing={0.6} sx={{ mb: 0.8 }}>
-                                                                {q.evidenceQuotes.map((quote, idx) => (
-                                                                    <Typography key={`${q.id}-quote-${idx}`} variant="body2" sx={{ color: 'text.secondary' }}>
-                                                                        "{quote}"
-                                                                    </Typography>
-                                                                ))}
-                                                            </Stack>
-                                                        )}
-
-                                                        <Paper sx={{ p: 1, mb: 0.8 }}>
-                                                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                                                Your answer
+                                                        </Stack>
+                                                        
+                                                        <Box sx={{ 
+                                                            p: 2, 
+                                                            px: 2.5,
+                                                            borderLeft: '3px solid', 
+                                                            borderColor: 'divider', 
+                                                            bgcolor: (themeCtx) => themeCtx.palette.mode === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.015)',
+                                                            borderRadius: '0 8px 8px 0'
+                                                        }}>
+                                                            <Typography variant="caption" sx={{ color: 'text.secondary', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', mb: 1, display: 'block' }}>
+                                                                Your Answer
                                                             </Typography>
-                                                            <Typography variant="body2">
+                                                            <Typography
+                                                                variant="body2"
+                                                                sx={{
+                                                                    lineHeight: 1.7,
+                                                                    color: 'text.primary',
+                                                                    ...(showAnswerToggle && !expandedTextBlocks[answerKey]
+                                                                        ? {
+                                                                            display: '-webkit-box',
+                                                                            WebkitLineClamp: 3,
+                                                                            WebkitBoxOrient: 'vertical',
+                                                                            overflow: 'hidden',
+                                                                        }
+                                                                        : {}),
+                                                                }}
+                                                            >
                                                                 {q.answer || 'No answer captured.'}
                                                             </Typography>
-                                                        </Paper>
+                                                            {showAnswerToggle && (
+                                                                <Button
+                                                                    size="small"
+                                                                    variant="text"
+                                                                    color="primary"
+                                                                    sx={{ mt: 0.5, px: 0, minWidth: 0, textTransform: 'none', fontWeight: 600 }}
+                                                                    onClick={() => toggleTextBlock(answerKey)}
+                                                                >
+                                                                    {expandedTextBlocks[answerKey] ? 'Show less' : 'View full answer'}
+                                                                </Button>
+                                                            )}
+                                                        </Box>
+                                                    </Box>
 
-                                                        {q.qualityFlags.length > 0 && (
-                                                            <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap">
-                                                                {q.qualityFlags.map((flag, idx) => (
-                                                                    <Chip
-                                                                        key={`${q.id}-flag-${idx}`}
-                                                                        size="small"
-                                                                        label={flag.replaceAll('_', ' ')}
-                                                                        color="warning"
-                                                                        variant="outlined"
-                                                                    />
-                                                                ))}
-                                                            </Stack>
-                                                        )}
-                                                    </Paper>
+                                                    <Divider sx={{ opacity: 0.6 }} />
 
-                                                    <Paper sx={{ p: 1.2, bgcolor: 'rgba(34, 197, 94, 0.07)' }}>
-                                                        <Stack direction="row" spacing={0.8} alignItems="center" sx={{ mb: 0.8 }}>
-                                                            <TipsAndUpdates sx={{ fontSize: 18, color: 'success.main' }} />
-                                                            <Typography variant="subtitle2">How to improve</Typography>
+                                                    {/* How to Improve */}
+                                                    <Box>
+                                                        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2.5 }}>
+                                                            <TipsAndUpdates sx={{ fontSize: 20, color: 'success.main' }} />
+                                                            <Typography variant="h6" sx={{ fontWeight: 600 }}>Actionable Feedback</Typography>
                                                         </Stack>
 
                                                         {q.gaps.length > 0 && (
-                                                            <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mb: 0.9 }}>
+                                                            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 3.5 }}>
                                                                 {q.gaps.slice(0, 4).map((g, idx) => (
-                                                                    <Chip key={`${q.id}-gap-${idx}`} size="small" label={g} color="warning" variant="outlined" />
+                                                                    <Chip key={`${q.id}-gap-${idx}`} size="small" label={g} sx={{ color: 'warning.main', borderColor: 'warning.main', bgcolor: 'transparent' }} variant="outlined" />
                                                                 ))}
                                                             </Stack>
                                                         )}
 
-                                                        <Stack spacing={0.5} sx={{ mb: 0.9 }}>
-                                                            {q.improvementPlan.steps.map((step, idx) => (
-                                                                <Typography key={`${q.id}-step-${idx}`} variant="body2" sx={{ color: 'text.secondary' }}>
-                                                                    {idx + 1}. {step}
-                                                                </Typography>
-                                                            ))}
-                                                        </Stack>
+                                                        <Grid container spacing={4} sx={{ mb: 2 }}>
+                                                            <Grid size={{ xs: 12, md: 6 }}>
+                                                                <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: 'text.primary' }}>Suggested Improvement Steps</Typography>
+                                                                <Stack spacing={1.5}>
+                                                                    {q.improvementPlan.steps.map((step, idx) => (
+                                                                        <Stack key={`${q.id}-step-${idx}`} direction="row" spacing={1.8} alignItems="flex-start">
+                                                                            <Box sx={{ width: 24, height: 24, borderRadius: '50%', bgcolor: 'rgba(34, 197, 94, 0.1)', color: 'success.main', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontSize: '0.75rem', fontWeight: 700 }}>
+                                                                                {idx + 1}
+                                                                            </Box>
+                                                                            <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.2, lineHeight: 1.6 }}>
+                                                                                {step}
+                                                                            </Typography>
+                                                                        </Stack>
+                                                                    ))}
+                                                                </Stack>
+                                                            </Grid>
+                                                            
+                                                            <Grid size={{ xs: 12, md: 6 }}>
+                                                                <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: 'text.primary' }}>Target Success Criteria</Typography>
+                                                                <Stack spacing={1.5}>
+                                                                    {q.improvementPlan.successCriteria.map((item, idx) => (
+                                                                        <Stack key={`${q.id}-criteria-${idx}`} direction="row" spacing={1.5} alignItems="flex-start">
+                                                                            <Box sx={{ width: 6, height: 6, mt: 0.8, borderRadius: '50%', bgcolor: 'text.disabled', flexShrink: 0 }} />
+                                                                            <Typography variant="body2" sx={{ color: 'text.secondary', lineHeight: 1.6 }}>
+                                                                                {item}
+                                                                            </Typography>
+                                                                        </Stack>
+                                                                    ))}
+                                                                </Stack>
+                                                            </Grid>
+                                                        </Grid>
 
-                                                        <Paper sx={{ p: 1, mb: 0.8 }}>
-                                                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                                                Success criteria
+                                                        <Box sx={{ 
+                                                            mt: 4,
+                                                            p: 2, 
+                                                            px: 2.5,
+                                                            borderLeft: '3px solid', 
+                                                            borderColor: 'secondary.main', 
+                                                            bgcolor: (themeCtx) => themeCtx.palette.mode === 'dark' ? 'rgba(251, 191, 36, 0.04)' : 'rgba(251, 191, 36, 0.05)',
+                                                            borderRadius: '0 8px 8px 0'
+                                                        }}>
+                                                            <Typography variant="caption" sx={{ color: 'secondary.main', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', mb: 1, display: 'block' }}>
+                                                                Ideal Model Answer
                                                             </Typography>
-                                                            <Stack spacing={0.3} sx={{ mt: 0.4 }}>
-                                                                {q.improvementPlan.successCriteria.map((item, idx) => (
-                                                                    <Typography key={`${q.id}-criteria-${idx}`} variant="body2">
-                                                                        • {item}
-                                                                    </Typography>
-                                                                ))}
-                                                            </Stack>
-                                                        </Paper>
-
-                                                        <Paper sx={{ p: 1, bgcolor: 'rgba(251, 191, 36, 0.1)' }}>
-                                                            <Typography variant="caption" sx={{ color: 'secondary.main' }}>
-                                                                Model answer
-                                                            </Typography>
-                                                            <Typography variant="body2">
+                                                            <Typography
+                                                                variant="body2"
+                                                                sx={{
+                                                                    lineHeight: 1.7,
+                                                                    color: 'text.primary',
+                                                                    ...(showModelToggle && !expandedTextBlocks[modelKey]
+                                                                        ? {
+                                                                            display: '-webkit-box',
+                                                                            WebkitLineClamp: 3,
+                                                                            WebkitBoxOrient: 'vertical',
+                                                                            overflow: 'hidden',
+                                                                        }
+                                                                        : {}),
+                                                                }}
+                                                            >
                                                                 {q.modelAnswer || 'State context, describe your action, and end with measurable impact.'}
                                                             </Typography>
-                                                        </Paper>
-                                                    </Paper>
+                                                            {showModelToggle && (
+                                                                <Button
+                                                                    size="small"
+                                                                    variant="text"
+                                                                    color="secondary"
+                                                                    sx={{ mt: 0.5, px: 0, minWidth: 0, textTransform: 'none', fontWeight: 600 }}
+                                                                    onClick={() => toggleTextBlock(modelKey)}
+                                                                >
+                                                                    {expandedTextBlocks[modelKey] ? 'Show less' : 'View full example'}
+                                                                </Button>
+                                                            )}
+                                                        </Box>
+                                                    </Box>
 
-                                                    <Paper sx={{ p: 1.2 }}>
-                                                        <Stack direction="row" spacing={0.8} alignItems="center" sx={{ mb: 0.8 }}>
-                                                            <TrendingUp sx={{ fontSize: 18, color: 'secondary.main' }} />
-                                                            <Typography variant="subtitle2">Retry now</Typography>
-                                                        </Stack>
-
-                                                        {q.retryPrompt && (
-                                                            <Typography variant="body2" sx={{ color: 'text.secondary', mb: 0.8 }}>
-                                                                {q.retryPrompt}
-                                                            </Typography>
-                                                        )}
-
-                                                        {q.retryTargetPoints.length > 0 && (
-                                                            <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mb: 0.8 }}>
-                                                                {q.retryTargetPoints.map((point, idx) => (
-                                                                    <Chip key={`${q.id}-target-${idx}`} size="small" label={point} variant="outlined" />
-                                                                ))}
-                                                            </Stack>
-                                                        )}
-
-                                                        <TextField
-                                                            multiline
-                                                            minRows={3}
-                                                            value={retryDrafts[q.id] || ''}
-                                                            onChange={(event) => handleRetryChange(q.id, event.target.value)}
-                                                            placeholder="Rewrite this answer with clearer structure and evidence..."
-                                                            fullWidth
-                                                        />
-
-                                                        <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
-                                                            <Button
-                                                                variant="contained"
-                                                                startIcon={<Replay />}
-                                                                disabled={busy || !String(retryDrafts[q.id] || '').trim() || !reportSessionId}
-                                                                onClick={() => handleRetrySubmit(q)}
-                                                            >
-                                                                Submit Retry
-                                                            </Button>
-                                                        </Stack>
-
-                                                        {busy && <LinearProgress sx={{ mt: 1 }} />}
-                                                        {retryError && (
-                                                            <Alert severity="error" sx={{ mt: 1 }}>
-                                                                {retryError}
-                                                            </Alert>
-                                                        )}
-                                                        {latestAttempt && (
-                                                            <Alert
-                                                                severity={retryDelta >= 0 ? 'success' : 'warning'}
-                                                                sx={{ mt: 1 }}
-                                                            >
-                                                                Attempt {latestAttempt.attempt_number} scored{' '}
-                                                                {normalizeScore(latestEval?.score || 0).toFixed(1)}/10 ({formatDelta(retryDelta)})
-                                                            </Alert>
-                                                        )}
-
-                                                        {attempts.length > 0 && (
-                                                            <Paper sx={{ p: 1, mt: 1 }}>
-                                                                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                                                    Attempt history
-                                                                </Typography>
-                                                                <Stack spacing={0.5} sx={{ mt: 0.6 }}>
-                                                                    {attempts.map((entry) => {
-                                                                        const num = Number(entry?.attempt_number || 0);
-                                                                        const label = num === 0 ? 'Original' : `Retry ${num}`;
-                                                                        const score = normalizeScore(entry?.evaluation?.score || 0);
-                                                                        const delta = Number(entry?.delta_score || 0);
-                                                                        return (
-                                                                            <Stack
-                                                                                key={`${q.id}-attempt-${entry?.retry_id || num}`}
-                                                                                direction="row"
-                                                                                spacing={0.8}
-                                                                                alignItems="center"
-                                                                                justifyContent="space-between"
-                                                                            >
-                                                                                <Typography variant="body2">
-                                                                                    {label}
-                                                                                </Typography>
-                                                                                <Stack direction="row" spacing={0.8} alignItems="center">
-                                                                                    <Chip size="small" label={`${score.toFixed(1)}/10`} variant="outlined" />
-                                                                                    {num > 0 && (
-                                                                                        <Chip
-                                                                                            size="small"
-                                                                                            label={formatDelta(delta)}
-                                                                                            color={delta >= 0 ? 'success' : 'warning'}
-                                                                                            variant="outlined"
-                                                                                        />
-                                                                                    )}
-                                                                                </Stack>
-                                                                            </Stack>
-                                                                        );
-                                                                    })}
-                                                                </Stack>
-                                                            </Paper>
-                                                        )}
-                                                    </Paper>
-
-                                                    {latestAttempt && (
-                                                        <Paper sx={{ p: 1.2 }}>
-                                                            <Typography variant="subtitle2" sx={{ mb: 0.9 }}>
-                                                                Before vs After
-                                                            </Typography>
-                                                            <Grid container spacing={0.8}>
-                                                                <Grid size={{ xs: 12, md: 3 }}>
-                                                                    <Paper sx={{ p: 1, borderStyle: 'dashed' }}>
-                                                                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>Score</Typography>
-                                                                        <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                                                                            {baseline.toFixed(1)} -&gt; {normalizeScore(latestEval?.score || 0).toFixed(1)}
-                                                                        </Typography>
-                                                                    </Paper>
-                                                                </Grid>
-                                                                {SCORE_KEYS.map(({ key, label }) => (
-                                                                    <Grid key={`${q.id}-delta-${key}`} size={{ xs: 6, md: 3 }}>
-                                                                        <Paper sx={{ p: 1, borderStyle: 'dashed' }}>
-                                                                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>{label}</Typography>
-                                                                            <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                                                                                {normalizeScore(q.breakdown[key]).toFixed(1)} -&gt; {normalizeScore(latestBreakdown[key]).toFixed(1)}
-                                                                            </Typography>
-                                                                        </Paper>
-                                                                    </Grid>
-                                                                ))}
-                                                            </Grid>
-                                                        </Paper>
-                                                    )}
-
+                                                    {/* Coach Tip */}
                                                     {q.tip && (
-                                                        <Typography variant="body2" sx={{ color: 'warning.dark' }}>
-                                                            <strong>Coach tip:</strong> {q.tip}
-                                                        </Typography>
+                                                        <Box sx={{ 
+                                                            display: 'flex', 
+                                                            alignItems: 'flex-start', 
+                                                            gap: 1.5,
+                                                            p: 2.5, 
+                                                            borderRadius: 3,
+                                                            bgcolor: (themeCtx) => themeCtx.palette.mode === 'dark' ? 'rgba(245, 158, 11, 0.06)' : 'rgba(249, 115, 22, 0.04)',
+                                                        }}>
+                                                            <Box sx={{ color: 'warning.main', fontSize: '1.2rem', mt: 0 }}>💡</Box>
+                                                            <Box sx={{ flex: 1 }}>
+                                                                <Typography
+                                                                    variant="body2"
+                                                                    sx={{
+                                                                        color: (themeCtx) => themeCtx.palette.mode === 'dark' ? 'warning.light' : 'warning.dark',
+                                                                        lineHeight: 1.6,
+                                                                        ...(showTipToggle && !expandedTextBlocks[tipKey]
+                                                                            ? {
+                                                                                display: '-webkit-box',
+                                                                                WebkitLineClamp: 2,
+                                                                                WebkitBoxOrient: 'vertical',
+                                                                                overflow: 'hidden',
+                                                                            }
+                                                                            : {}),
+                                                                    }}
+                                                                >
+                                                                    <Typography component="span" sx={{ fontWeight: 700, mr: 1 }}>Coach Tip:</Typography>
+                                                                    {q.tip}
+                                                                </Typography>
+                                                                {showTipToggle && (
+                                                                    <Button
+                                                                        size="small"
+                                                                        variant="text"
+                                                                        color="warning"
+                                                                        sx={{ mt: 0.5, px: 0, minWidth: 0, textTransform: 'none', fontWeight: 600 }}
+                                                                        onClick={() => toggleTextBlock(tipKey)}
+                                                                    >
+                                                                        {expandedTextBlocks[tipKey] ? 'Show less' : 'Read full tip'}
+                                                                    </Button>
+                                                                )}
+                                                            </Box>
+                                                        </Box>
                                                     )}
                                                 </Stack>
                                             </AccordionDetails>

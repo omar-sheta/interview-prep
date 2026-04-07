@@ -18,7 +18,7 @@ import {
     IconButton,
     Tooltip
 } from '@mui/material';
-import { DarkMode, LightMode } from '@mui/icons-material';
+import { DarkMode, LightMode, Visibility, VisibilityOff } from '@mui/icons-material';
 import { Key, User, Mail } from 'lucide-react';
 
 function createAuthTheme(mode) {
@@ -57,8 +57,10 @@ const SignupScreen = () => {
     // Destructure logout to force clean session
     const { signup, logout, darkMode, toggleDarkMode } = useInterviewStore();
     const [isLoading, setIsLoading] = useState(false);
-    const [form, setForm] = useState({ name: '', email: '', password: '' });
+    const [form, setForm] = useState({ name: '', email: '', password: '', confirmPassword: '' });
     const [error, setError] = useState('');
+    const [showPassword, setShowPassword] = useState(false);
+    const [showConfirmPassword, setShowConfirmPassword] = useState(false);
     const theme = useMemo(() => createAuthTheme(darkMode ? 'dark' : 'light'), [darkMode]);
     const ui = darkMode
         ? {
@@ -99,8 +101,13 @@ const SignupScreen = () => {
         setError('');
 
         // Quick validation
-        if (!form.name || !form.email || !form.password) {
+        if (!form.name || !form.email || !form.password || !form.confirmPassword) {
             setError('Please fill in all fields');
+            return;
+        }
+
+        if (form.password !== form.confirmPassword) {
+            setError('Passwords do not match');
             return;
         }
 
@@ -258,7 +265,7 @@ const SignupScreen = () => {
                                         fullWidth
                                         name="password"
                                         placeholder="Password *"
-                                        type="password"
+                                        type={showPassword ? 'text' : 'password'}
                                         id="password"
                                         autoComplete="new-password"
                                         value={form.password}
@@ -276,8 +283,64 @@ const SignupScreen = () => {
                                         }}
                                         InputProps={{
                                             endAdornment: (
-                                                <InputAdornment position="end">
+                                                <InputAdornment position="end" sx={{ gap: 0.4 }}>
                                                     <Key size={18} color="#F97316" />
+                                                    <IconButton
+                                                        edge="end"
+                                                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                                                        onClick={() => setShowPassword((prev) => !prev)}
+                                                        onMouseDown={(event) => event.preventDefault()}
+                                                        size="small"
+                                                        sx={{ color: '#F97316' }}
+                                                    >
+                                                        {showPassword ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
+                                                    </IconButton>
+                                                </InputAdornment>
+                                            ),
+                                        }}
+                                    />
+
+                                    <TextField
+                                        margin="normal"
+                                        fullWidth
+                                        name="confirmPassword"
+                                        placeholder="Confirm Password *"
+                                        type={showConfirmPassword ? 'text' : 'password'}
+                                        id="confirm-password"
+                                        autoComplete="new-password"
+                                        value={form.confirmPassword}
+                                        onChange={handleChange}
+                                        disabled={isLoading}
+                                        error={Boolean(form.confirmPassword) && form.password !== form.confirmPassword}
+                                        helperText={
+                                            form.confirmPassword && form.password !== form.confirmPassword
+                                                ? 'Passwords must match'
+                                                : ' '
+                                        }
+                                        sx={{
+                                            '& .MuiOutlinedInput-root': {
+                                                backgroundColor: ui.inputBg,
+                                                borderRadius: 3,
+                                                '& fieldset': { borderColor: 'rgba(249, 115, 22, 0.2)' },
+                                                '&:hover fieldset': { borderColor: 'rgba(249, 115, 22, 0.4)' },
+                                                '&.Mui-focused fieldset': { borderColor: '#F97316' },
+                                            },
+                                            '& .MuiInputBase-input': { py: 1.5, px: 2, color: ui.inputText },
+                                        }}
+                                        InputProps={{
+                                            endAdornment: (
+                                                <InputAdornment position="end" sx={{ gap: 0.4 }}>
+                                                    <Key size={18} color="#F97316" />
+                                                    <IconButton
+                                                        edge="end"
+                                                        aria-label={showConfirmPassword ? 'Hide password confirmation' : 'Show password confirmation'}
+                                                        onClick={() => setShowConfirmPassword((prev) => !prev)}
+                                                        onMouseDown={(event) => event.preventDefault()}
+                                                        size="small"
+                                                        sx={{ color: '#F97316' }}
+                                                    >
+                                                        {showConfirmPassword ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
+                                                    </IconButton>
                                                 </InputAdornment>
                                             ),
                                         }}

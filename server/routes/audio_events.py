@@ -5,10 +5,32 @@ import base64
 import os
 import tempfile
 from types import SimpleNamespace
+from typing import Optional
 
 
 def register_audio_events(sio, deps):
     """Register audio and chat-related Socket.IO events."""
+
+    def _log_audio_event(session, event_type: str, details: Optional[dict] = None) -> None:
+        """Persist audio lifecycle events without impacting the live path."""
+        if session is None or not getattr(session, "user_id", None):
+            return
+        try:
+            user_db = deps.get_user_db()
+            user_db.log_session_event(
+                user_id=session.user_id,
+                session_id=getattr(session, "db_session_id", None),
+                auth_session_fingerprint=user_db.get_session_token_fingerprint(
+                    getattr(session, "session_token", None)
+                ),
+                sid=getattr(session, "sid", None),
+                event_type=event_type,
+                event_source="audio",
+                question_number=(session.current_question_index + 1) if getattr(session, "interview_active", False) else None,
+                details=details or {},
+            )
+        except Exception as exc:
+            print(f"⚠️ Failed logging audio event {event_type}: {exc}")
 
     async def user_audio_chunk(sid, data):
         """
@@ -190,6 +212,15 @@ def register_audio_events(sio, deps):
         data = data or {}
         recording = bool(data.get("recording", False))
         session.accept_audio_chunks = recording and session.interview_active
+        _log_audio_event(
+            session,
+            "recording_state_changed",
+            details={
+                "recording_requested": recording,
+                "accept_audio_chunks": session.accept_audio_chunks,
+                "interview_active": bool(session.interview_active),
+            },
+        )
         if not session.accept_audio_chunks:
             session.was_speaking = False
             session.silence_start_time = None
@@ -218,7 +249,7 @@ def register_audio_events(sio, deps):
             await sio.emit(
                 "phase_changed",
                 {"phase": session.status, "user_id": session.user_id},
-                room=str(session.user_id),
+                room=session.sid,
             )
 
     async def submit_audio(sid, data):
@@ -264,9 +295,9 @@ def register_audio_events(sio, deps):
                         session.current_answer_transcript = merged
                         await deps.emit_transcript_update(session, is_final=True)
                 else:
-                    await sio.emit("transcript", {"text": text, "user_id": session.user_id}, room=str(session.user_id))
+                    await sio.emit("transcript", {"text": text, "user_id": session.user_id}, room=session.sid)
                     session.is_processing = True
-                    await sio.emit("status", {"stage": "analyzing", "user_id": session.user_id}, room=str(session.user_id))
+                    await sio.emit("status", {"stage": "analyzing", "user_id": session.user_id}, room=session.sid)
                     try:
                         await process_text_and_respond(sid, session, text)
                     finally:
@@ -275,20 +306,20 @@ def register_audio_events(sio, deps):
                 print("⚠️ Transcription empty")
         except Exception as exc:
             print(f"❌ Error in submit_audio: {exc}")
-            await sio.emit("error", {"message": "Audio processing failed", "user_id": session.user_id}, room=str(session.user_id))
+            await sio.emit("error", {"message": "Audio processing failed", "user_id": session.user_id}, room=session.sid)
 
     async def process_audio_and_respond(sid: str, session):
         """Process audio buffer: STT -> LLM -> TTS -> Send response."""
-        await sio.emit("status", {"stage": "transcribing", "user_id": session.user_id}, room=str(session.user_id))
+        await sio.emit("status", {"stage": "transcribing", "user_id": session.user_id}, room=session.sid)
 
         audio_processor = deps.get_audio_processor()
         transcript = await audio_processor.transcribe_buffer_async(bytes(session.audio_buffer))
 
         if not transcript.strip():
-            await sio.emit("status", {"stage": "no_speech"}, room=str(session.user_id))
+            await sio.emit("status", {"stage": "no_speech"}, room=session.sid)
             return
 
-        await sio.emit("transcript", {"text": transcript, "user_id": session.user_id}, room=str(session.user_id))
+        await sio.emit("transcript", {"text": transcript, "user_id": session.user_id}, room=session.sid)
         session.transcript_chunks.append(transcript)
         await process_text_and_respond(sid, session, transcript)
 
@@ -297,18 +328,18 @@ def register_audio_events(sio, deps):
         from langchain_core.messages import AIMessage, HumanMessage
 
         session.messages.append(HumanMessage(content=text))
-        await sio.emit("status", {"stage": "thinking", "user_id": session.user_id}, room=str(session.user_id))
+        await sio.emit("status", {"stage": "thinking", "user_id": session.user_id}, room=session.sid)
 
         chat_model = deps.get_chat_model()
         full_response = ""
 
         async for token in chat_model.generate_response_stream(session.messages, phase=session.status):
             full_response += token
-            await sio.emit("llm_token", {"token": token, "user_id": session.user_id}, room=str(session.user_id))
+            await sio.emit("llm_token", {"token": token, "user_id": session.user_id}, room=session.sid)
 
         session.messages.append(AIMessage(content=full_response))
-        await sio.emit("llm_complete", {"text": full_response, "user_id": session.user_id}, room=str(session.user_id))
-        await sio.emit("status", {"stage": "speaking", "user_id": session.user_id}, room=str(session.user_id))
+        await sio.emit("llm_complete", {"text": full_response, "user_id": session.user_id}, room=session.sid)
+        await sio.emit("status", {"stage": "speaking", "user_id": session.user_id}, room=session.sid)
 
         try:
             await deps.await_tts_warmup_if_needed()
@@ -331,24 +362,24 @@ def register_audio_events(sio, deps):
                     "sample_rate": tts_service.sample_rate_for_provider(getattr(session, "tts_provider", "piper")),
                     "user_id": session.user_id,
                 },
-                room=str(session.user_id),
+                room=session.sid,
             )
         except asyncio.TimeoutError:
             print(f"⚠️ TTS timed out after {tts_timeout:.1f}s (continuing without audio)")
             await sio.emit(
                 "tts_error",
                 {"error": "TTS timed out; continuing without audio.", "user_id": session.user_id},
-                room=str(session.user_id),
+                room=session.sid,
             )
         except Exception as exc:
             print(f"⚠️ TTS failed in process_text_and_respond (continuing): {exc}")
             await sio.emit(
                 "tts_error",
                 {"error": "TTS unavailable; continuing without audio.", "user_id": session.user_id},
-                room=str(session.user_id),
+                room=session.sid,
             )
         finally:
-            await sio.emit("status", {"stage": "ready", "user_id": session.user_id}, room=str(session.user_id))
+            await sio.emit("status", {"stage": "ready", "user_id": session.user_id}, room=session.sid)
 
     sio.on("user_audio_chunk", handler=user_audio_chunk)
     sio.on("force_transcribe", handler=force_transcribe)

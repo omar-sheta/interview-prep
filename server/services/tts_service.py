@@ -96,7 +96,10 @@ QWEN3_TTS_ATTN_IMPLEMENTATION = os.getenv("QWEN3_TTS_ATTN_IMPLEMENTATION", "sdpa
 QWEN3_TTS_DTYPE = os.getenv("QWEN3_TTS_DTYPE", "bfloat16").strip() or "bfloat16"
 
 SAVE_TTS_DEBUG_AUDIO = os.getenv("SAVE_TTS_DEBUG_AUDIO", "0").lower() in {"1", "true", "yes", "on"}
-_tts_infer_lock = threading.Lock()
+# Qwen3 TTS model is not thread-safe (shared GPU state/KV cache).
+# Must serialize GPU inference. The asyncio.Lock was removed so callers
+# queue here in the thread pool instead of blocking the event loop.
+_tts_infer_semaphore = threading.Semaphore(1)
 ALLOWED_PIPER_STYLES = {"interviewer", "balanced", "fast"}
 ALLOWED_TTS_PROVIDERS = {"piper", "qwen3_tts"}
 
@@ -1009,7 +1012,6 @@ class TTSService:
 
     def __init__(self):
         self._sample_rate = None
-        self._async_lock = asyncio.Lock()
 
     @property
     def sample_rate(self) -> int:
@@ -1048,7 +1050,7 @@ class TTSService:
         Returns:
             Raw PCM audio bytes (16-bit signed, mono, 24kHz)
         """
-        with _tts_infer_lock:
+        with _tts_infer_semaphore:
             audio_array = _generate_audio(text, voice=voice, style=style, provider=provider)
 
         # Normalize and convert to 16-bit PCM
@@ -1078,7 +1080,7 @@ class TTSService:
             Base64-encoded WAV data
         """
         provider_key = _normalize_tts_provider(provider, fallback=DEFAULT_TTS_PROVIDER)
-        with _tts_infer_lock:
+        with _tts_infer_semaphore:
             audio_array = _generate_audio(text, voice=voice, style=style, provider=provider_key)
             sample_rate = self.sample_rate_for_provider(provider_key)
 
@@ -1123,10 +1125,9 @@ class TTSService:
         Runs TTS in thread pool to avoid blocking the event loop.
         """
         loop = asyncio.get_event_loop()
-        async with self._async_lock:
-            return await loop.run_in_executor(
-                None, lambda: self.speak_wav_base64(text, voice=voice, style=style, provider=provider)
-            )
+        return await loop.run_in_executor(
+            None, lambda: self.speak_wav_base64(text, voice=voice, style=style, provider=provider)
+        )
 
     async def stream_pcm_base64_chunks_async(
         self,
@@ -1151,7 +1152,7 @@ class TTSService:
 
         def worker():
             try:
-                with _tts_infer_lock:
+                with _tts_infer_semaphore:
                     for chunk_payload in _iter_qwen3_tts_stream_chunks(text, voice=voice):
                         if cancel_event.is_set():
                             break
@@ -1161,22 +1162,21 @@ class TTSService:
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
-        async with self._async_lock:
-            thread = threading.Thread(target=worker, name="tts-stream-worker", daemon=True)
-            thread.start()
-            try:
-                while True:
-                    item = await queue.get()
-                    if item is sentinel:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
-                    yield item
-            except asyncio.CancelledError:
-                cancel_event.set()
-                raise
-            finally:
-                cancel_event.set()
+        thread = threading.Thread(target=worker, name="tts-stream-worker", daemon=True)
+        thread.start()
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+        finally:
+            cancel_event.set()
 
 
 # ============== Factory Function ==============

@@ -18,7 +18,7 @@ import {
     IconButton,
     Tooltip,
 } from '@mui/material';
-import { DarkMode, LightMode } from '@mui/icons-material';
+import { DarkMode, LightMode, Visibility, VisibilityOff } from '@mui/icons-material';
 import { Key, User } from 'lucide-react';
 
 function createAuthTheme(mode) {
@@ -58,6 +58,7 @@ const LoginPage = () => {
     const [isLoading, setIsLoading] = useState(false);
     const [form, setForm] = useState({ username: '', password: '' });
     const [error, setError] = useState('');
+    const [showPassword, setShowPassword] = useState(false);
     const theme = useMemo(() => createAuthTheme(darkMode ? 'dark' : 'light'), [darkMode]);
     const ui = darkMode
         ? {
@@ -224,7 +225,7 @@ const LoginPage = () => {
                                         fullWidth
                                         name="password"
                                         placeholder="Password *"
-                                        type="password"
+                                        type={showPassword ? 'text' : 'password'}
                                         id="password"
                                         autoComplete="current-password"
                                         value={form.password}
@@ -242,8 +243,18 @@ const LoginPage = () => {
                                         }}
                                         InputProps={{
                                             endAdornment: (
-                                                <InputAdornment position="end">
+                                                <InputAdornment position="end" sx={{ gap: 0.4 }}>
                                                     <Key size={18} color="#F97316" />
+                                                    <IconButton
+                                                        edge="end"
+                                                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                                                        onClick={() => setShowPassword((prev) => !prev)}
+                                                        onMouseDown={(event) => event.preventDefault()}
+                                                        size="small"
+                                                        sx={{ color: '#F97316' }}
+                                                    >
+                                                        {showPassword ? <VisibilityOff fontSize="small" /> : <Visibility fontSize="small" />}
+                                                    </IconButton>
                                                 </InputAdornment>
                                             ),
                                         }}

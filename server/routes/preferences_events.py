@@ -8,6 +8,18 @@ from types import SimpleNamespace
 def register_preferences_events(sio, deps):
     """Register user preference, history, and career-analysis Socket.IO events."""
 
+    def extract_resume_text_from_payload(resume_payload):
+        """Decode a base64 PDF payload into extracted resume text."""
+        import base64
+        from server.tools.resume_tool import extract_text_from_pdf_bytes
+
+        payload = str(resume_payload or "").strip()
+        if not payload:
+            return ""
+
+        pdf_bytes = base64.b64decode(payload.split(",")[-1])
+        return extract_text_from_pdf_bytes(pdf_bytes)
+
     async def save_preferences(sid, data):
         """Save user preferences (resume, target role, focus areas)."""
         session = await deps.require_socket_auth(sid)
@@ -64,9 +76,27 @@ def register_preferences_events(sio, deps):
         if not incoming_job_description and str(existing.get("job_description") or "").strip():
             incoming_job_description = str(existing.get("job_description") or "")
 
+        incoming_resume = deps.first_present(data, ("resume", "resume_base64", "resumeBase64"), "")
+        resume_text = data.get("resume_text", existing.get("resume_text"))
+        resume_filename = data.get("resume_filename", existing.get("resume_filename"))
+        if incoming_resume:
+            try:
+                resume_text = extract_resume_text_from_payload(incoming_resume)
+                if not resume_filename:
+                    resume_filename = f"resume_{user_id}.pdf"
+            except Exception as exc:
+                error_message = f"Failed to save resume: {exc}"
+                print(f"❌ Save preferences failed for {user_id}: {error_message}")
+                await sio.emit(
+                    "preferences_saved",
+                    {"success": False, "error": error_message, "user_id": user_id},
+                    room=str(user_id),
+                )
+                return
+
         preferences = {
-            "resume_text": data.get("resume_text", existing.get("resume_text")),
-            "resume_filename": data.get("resume_filename", existing.get("resume_filename")),
+            "resume_text": resume_text,
+            "resume_filename": resume_filename,
             "target_role": incoming_target_role,
             "target_company": incoming_target_company,
             "job_description": incoming_job_description,
@@ -79,10 +109,20 @@ def register_preferences_events(sio, deps):
             "focus_areas": data.get("focus_areas", existing.get("focus_areas", [])),
             "onboarding_complete": data.get("onboarding_complete", existing.get("onboarding_complete", False)),
             "mic_permission_granted": data.get("mic_permission_granted", existing.get("mic_permission_granted", False)),
+            "has_seen_tour": data.get("has_seen_tour", existing.get("has_seen_tour", False)),
         }
 
         user_db.save_user_preferences(user_id, preferences)
-        await sio.emit("preferences_saved", {"success": True, "user_id": user_id}, room=str(user_id))
+        await sio.emit(
+            "preferences_saved",
+            {
+                "success": True,
+                "user_id": user_id,
+                "has_resume": bool(str(preferences.get("resume_text") or "").strip()),
+                "resume_filename": preferences.get("resume_filename"),
+            },
+            room=str(user_id),
+        )
         print(f"✅ Saved preferences for {user_id}")
 
     async def start_career_analysis(sid, data=None):
@@ -147,11 +187,7 @@ def register_preferences_events(sio, deps):
             print("📝 New resume provided, saving preferences first...")
             resume_text = ""
             try:
-                import base64
-                from server.tools.resume_tool import extract_text_from_pdf_bytes
-
-                pdf_bytes = base64.b64decode(str(incoming_resume).split(",")[-1])
-                resume_text = extract_text_from_pdf_bytes(pdf_bytes)
+                resume_text = extract_resume_text_from_payload(incoming_resume)
             except Exception as exc:
                 print(f"❌ Resume extraction failed: {exc}")
                 await sio.emit(
@@ -163,7 +199,7 @@ def register_preferences_events(sio, deps):
 
             preferences = {
                 "resume_text": resume_text,
-                "resume_filename": f"resume_{user_id}.pdf",
+                "resume_filename": data.get("resume_filename") or existing_prefs.get("resume_filename") or f"resume_{user_id}.pdf",
                 "target_role": incoming_job_title,
                 "target_company": incoming_company,
                 "job_description": incoming_job_description,
@@ -218,9 +254,15 @@ def register_preferences_events(sio, deps):
 
         if not prefs or not prefs.get("resume_text") or not prefs.get("target_role"):
             print(f"❌ Analysis failed: Missing prefs for {user_id}. Prefs: {prefs}")
+            missing_parts = []
+            if not prefs or not str(prefs.get("resume_text") or "").strip():
+                missing_parts.append("resume")
+            if not prefs or not str(prefs.get("target_role") or "").strip():
+                missing_parts.append("target role")
+            missing_summary = " and ".join(missing_parts) if missing_parts else "required profile data"
             await sio.emit(
                 "analysis_error",
-                {"error": "Missing resume or target role. Please complete onboarding first.", "user_id": user_id},
+                {"error": f"Missing {missing_summary}. Upload or save a resume, then try again.", "user_id": user_id},
                 room=str(user_id),
             )
             return

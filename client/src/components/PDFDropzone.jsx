@@ -1,15 +1,16 @@
-/**
- * PDF Dropzone - SOTA Command Style
- * Cinematic upload surface with security indicators
- */
-
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { motion as Motion, AnimatePresence } from 'framer-motion';
 
-export default function PDFDropzone({ onUpload, isLoading = false }) {
+export default function PDFDropzone({ onUpload, isLoading = false, hasSavedResume = false, savedLabel = '' }) {
     const [isDragging, setIsDragging] = useState(false);
     const [fileName, setFileName] = useState(null);
     const [error, setError] = useState(null);
+    const isReady = Boolean(fileName || hasSavedResume);
+    const displayLabel = useMemo(() => {
+        if (isLoading) return 'Processing...';
+        if (isDragging) return 'Drop resume here';
+        return 'Upload Resume';
+    }, [isDragging, isLoading]);
 
     const handleFile = useCallback(async (file) => {
         if (!file) return;
@@ -65,7 +66,7 @@ export default function PDFDropzone({ onUpload, isLoading = false }) {
         relative w-full h-full min-h-[120px] border-2 border-dashed rounded-xl transition-all duration-300 cursor-pointer flex flex-col items-center justify-center
         ${isDragging
                     ? 'border-[#00c2b2] bg-[#00c2b2]/5'
-                    : fileName
+                    : isReady
                         ? 'border-emerald-500/50 bg-emerald-500/5'
                         : 'border-gray-700 hover:border-[#00c2b2]/50 bg-[#0d1117]/50 hover:bg-[#0d1117]'
                 }
@@ -79,7 +80,7 @@ export default function PDFDropzone({ onUpload, isLoading = false }) {
                 <Motion.div
                     className={`w-12 h-12 rounded-full border flex items-center justify-center mb-3 transition-all ${isDragging
                         ? 'bg-[#00c2b2]/20 border-[#00c2b2]/50 scale-110'
-                        : fileName
+                        : isReady
                             ? 'bg-emerald-500/20 border-emerald-500/50'
                             : 'bg-[#161b22] border-gray-700 group-hover:border-[#00c2b2]/50'
                         }`}
@@ -87,28 +88,20 @@ export default function PDFDropzone({ onUpload, isLoading = false }) {
                 >
                     <span className={`material-symbols-outlined transition-colors ${isDragging
                         ? 'text-[#00c2b2]'
-                        : fileName
+                        : isReady
                             ? 'text-emerald-400'
                             : 'text-gray-400'
                         }`}>
-                        {fileName ? 'check_circle' : 'upload_file'}
+                        {isReady ? 'check_circle' : 'upload_file'}
                     </span>
                 </Motion.div>
 
-                {/* Text */}
-                <p className={`text-sm font-medium mb-1 ${fileName ? 'text-emerald-400' : isDragging ? 'text-[#00c2b2]' : 'text-gray-300'
+                <p className={`text-sm font-medium mb-1 ${isReady ? 'text-emerald-400' : isDragging ? 'text-[#00c2b2]' : 'text-gray-300'
                     }`}>
-                    {isLoading ? 'Processing...' : fileName || 'Upload Resume (PDF)'}
+                    {displayLabel}
                 </p>
-
-                {/* Security Badge */}
-                <div className="flex items-center gap-1.5 text-xs text-emerald-500/80 bg-emerald-950/30 px-2 py-0.5 rounded border border-emerald-900/50 mt-2">
-                    <span className="material-symbols-outlined text-[10px]">lock</span>
-                    <span>Local Processing Only</span>
-                </div>
             </div>
 
-            {/* Error */}
             <AnimatePresence>
                 {error && (
                     <Motion.p

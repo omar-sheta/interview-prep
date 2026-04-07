@@ -23,7 +23,11 @@ class SessionState:
         user_id: str = "anonymous",
         is_authenticated: bool = False,
         session_token: Optional[str] = None,
+        sid: str = "",
     ):
+        if not sid:
+            raise ValueError("SessionState requires a non-empty sid")
+        self.sid = sid
         self.user_id = user_id
         self.is_authenticated = is_authenticated
         self.session_token = session_token
@@ -129,3 +133,9 @@ active_tasks: dict[str, asyncio.Task] = {}
 
 # Maps User ID -> delayed cancellation task (disconnect grace window)
 pending_disconnect_cancels: dict[str, asyncio.Task] = {}
+
+# Maps session token -> active interview session preserved briefly across reconnects
+disconnected_interview_sessions: dict[str, SessionState] = {}
+
+# Maps session token -> delayed cleanup task for preserved interview sessions
+disconnected_interview_cleanup_tasks: dict[str, asyncio.Task] = {}

@@ -12,6 +12,44 @@ from typing import Optional
 def register_interview_events(sio, deps):
     """Register interview and coaching Socket.IO events."""
 
+    def _question_log_details(question: Optional[dict]) -> dict:
+        """Return compact question metadata for timeline events."""
+        question = question or {}
+        question_text = str(question.get("text", "") or "").strip()
+        preview = question_text[:220] + ("..." if len(question_text) > 220 else "")
+        return {
+            "question_preview": preview,
+            "category": question.get("category", "Technical"),
+            "difficulty": question.get("difficulty", "intermediate"),
+        }
+
+    def _log_session_event(
+        session,
+        event_type: str,
+        *,
+        event_source: str = "interview",
+        question_number: Optional[int] = None,
+        details: Optional[dict] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Persist interview/auth timeline data without breaking the live flow."""
+        if not session or not getattr(session, "user_id", None):
+            return
+        try:
+            user_db = deps.get_user_db()
+            user_db.log_session_event(
+                user_id=session.user_id,
+                session_id=str(session_id or getattr(session, "db_session_id", None) or "").strip() or None,
+                auth_session_fingerprint=user_db.get_session_token_fingerprint(getattr(session, "session_token", None)),
+                sid=getattr(session, "sid", None),
+                event_type=event_type,
+                event_source=event_source,
+                question_number=question_number,
+                details=details or {},
+            )
+        except Exception as exc:
+            print(f"⚠️ Failed logging session event {event_type}: {exc}")
+
     async def request_hint(sid):
         """Manually generate a hint for the current context."""
         session = deps.sessions.get(sid)
@@ -19,6 +57,13 @@ def register_interview_events(sio, deps):
             return
 
         print(f"🤔 Manual hint requested by {sid}")
+        _log_session_event(
+            session,
+            "hint_requested",
+            event_source="coaching",
+            question_number=session.current_question_index + 1,
+            details={"hint_origin": "manual"},
+        )
 
         async def send_hint():
             try:
@@ -45,19 +90,50 @@ def register_interview_events(sio, deps):
                     payload = {"message": hint_message, "level": hint_level, "user_id": session.user_id}
                     if isinstance(hint, dict):
                         payload.update({k: v for k, v in hint.items() if k != "message"})
-                    await sio.emit("coaching_hint", payload, room=str(session.user_id))
+                    await sio.emit("coaching_hint", payload, room=session.sid)
+                    _log_session_event(
+                        session,
+                        "hint_sent",
+                        event_source="coaching",
+                        question_number=session.current_question_index + 1,
+                        details={
+                            "hint_origin": "manual",
+                            "hint_level": hint_level,
+                            "message": hint_message,
+                        },
+                    )
                 else:
+                    fallback_message = "Try to break down the problem into smaller steps."
                     await sio.emit(
                         "coaching_hint",
                         {
-                            "message": "Try to break down the problem into smaller steps.",
+                            "message": fallback_message,
                             "level": 1,
                             "user_id": session.user_id,
                         },
-                        room=str(session.user_id),
+                        room=session.sid,
+                    )
+                    _log_session_event(
+                        session,
+                        "hint_sent",
+                        event_source="coaching",
+                        question_number=session.current_question_index + 1,
+                        details={
+                            "hint_origin": "manual",
+                            "hint_level": 1,
+                            "message": fallback_message,
+                            "fallback": True,
+                        },
                     )
             except Exception as exc:
                 print(f"⚠️ Manual hint generation error: {exc}")
+                _log_session_event(
+                    session,
+                    "hint_error",
+                    event_source="coaching",
+                    question_number=session.current_question_index + 1,
+                    details={"hint_origin": "manual", "error": str(exc)},
+                )
 
         asyncio.create_task(send_hint())
 
@@ -69,6 +145,10 @@ def register_interview_events(sio, deps):
             return
         question_text = session.interview_questions[question_index].get("text", "")
         if not question_text:
+            return
+        # Yield to let active question TTS from other sessions acquire the lock first.
+        await asyncio.sleep(1.0)
+        if not session.interview_active:
             return
         try:
             await deps.await_tts_warmup_if_needed()
@@ -132,7 +212,7 @@ def register_interview_events(sio, deps):
                                     "is_final": chunk["is_final"],
                                     "user_id": session.user_id,
                                 },
-                                room=str(session.user_id),
+                                room=session.sid,
                             )
                     print(f"🔊 Streamed TTS sent for question ({len(question_text)} chars)")
                     audio_b64 = None
@@ -160,9 +240,34 @@ def register_interview_events(sio, deps):
                         "question_index": question_index,
                         "user_id": session.user_id,
                     },
-                    room=str(session.user_id),
+                    room=session.sid,
                 )
                 print(f"🔊 TTS sent for question ({len(question_text)} chars)")
+                _log_session_event(
+                    session,
+                    "question_audio_ready",
+                    event_source="tts",
+                    question_number=(question_index + 1) if question_index is not None else None,
+                    details={
+                        "provider": tts_provider,
+                        "style": tts_style,
+                        "streaming": False,
+                        "cached": bool(cached),
+                    },
+                )
+            elif question_index is not None:
+                _log_session_event(
+                    session,
+                    "question_audio_ready",
+                    event_source="tts",
+                    question_number=question_index + 1,
+                    details={
+                        "provider": tts_provider,
+                        "style": tts_style,
+                        "streaming": True,
+                        "cached": False,
+                    },
+                )
 
             # Pre-fetch next question TTS in the background
             if question_index is not None:
@@ -177,20 +282,34 @@ def register_interview_events(sio, deps):
 
         except asyncio.TimeoutError:
             print(f"⚠️ Question TTS timed out after {tts_timeout:.1f}s")
+            _log_session_event(
+                session,
+                "question_audio_error",
+                event_source="tts",
+                question_number=(question_index + 1) if question_index is not None else None,
+                details={"error": "timeout", "timeout_seconds": round(tts_timeout, 2)},
+            )
             await sio.emit(
                 "tts_error",
                 {"error": "Question audio timed out; continuing without audio.", "user_id": session.user_id},
-                room=str(session.user_id),
+                room=session.sid,
             )
         except asyncio.CancelledError:
             print(f"ℹ️ Question TTS task cancelled (q_index={question_index})")
             return
         except Exception as exc:
             print(f"⚠️ TTS failed (non-blocking): {exc}")
+            _log_session_event(
+                session,
+                "question_audio_error",
+                event_source="tts",
+                question_number=(question_index + 1) if question_index is not None else None,
+                details={"error": str(exc)},
+            )
             await sio.emit(
                 "tts_error",
                 {"error": "Question audio generation failed; continuing without audio.", "user_id": session.user_id},
-                room=str(session.user_id),
+                room=session.sid,
             )
 
     def cancel_question_tts(session):
@@ -237,7 +356,7 @@ def register_interview_events(sio, deps):
             except Exception:
                 requested_question_count = None
 
-        await sio.emit("status", {"stage": "generating_questions", "user_id": session.user_id}, room=str(session.user_id))
+        await sio.emit("status", {"stage": "generating_questions", "user_id": session.user_id}, room=session.sid)
 
         try:
             from server.agents.interview_nodes import generate_interview_questions
@@ -298,7 +417,7 @@ def register_interview_events(sio, deps):
             }
 
             async def progress_cb(stage, msg):
-                await sio.emit("status", {"stage": msg, "user_id": session.user_id}, room=str(session.user_id))
+                await sio.emit("status", {"stage": msg, "user_id": session.user_id}, room=session.sid)
 
             cache = get_question_cache()
             suggestion_id = data.get("suggestion_id")
@@ -370,7 +489,7 @@ def register_interview_events(sio, deps):
             if cached_questions:
                 cache_label = suggestion_id if suggestion_id else "direct_start"
                 print(f"⚡ Using cached questions for {cache_label} (key: {cache_key})")
-                await sio.emit("status", {"stage": "questions_ready", "user_id": session.user_id}, room=str(session.user_id))
+                await sio.emit("status", {"stage": "questions_ready", "user_id": session.user_id}, room=session.sid)
                 result = {"questions": cached_questions}
             else:
                 db_questions = None
@@ -386,7 +505,7 @@ def register_interview_events(sio, deps):
 
                 if db_questions:
                     print(f"💾 Using DB persisted questions for {suggestion_id}")
-                    await sio.emit("status", {"stage": "questions_ready", "user_id": session.user_id}, room=str(session.user_id))
+                    await sio.emit("status", {"stage": "questions_ready", "user_id": session.user_id}, room=session.sid)
                     result = {"questions": db_questions}
                     if cache_key:
                         cache.set(cache_key, db_questions)
@@ -437,6 +556,23 @@ def register_interview_events(sio, deps):
                 total_questions=len(session.interview_questions),
                 plan_node_id=plan_node_id,
             )
+            _log_session_event(
+                session,
+                "interview_started",
+                details={
+                    "job_title": session.job_title,
+                    "mode": session.interview_mode,
+                    "feedback_timing": session.interview_feedback_timing,
+                    "coaching_enabled": session.coaching_enabled,
+                    "live_scoring": session.live_scoring_enabled,
+                    "interviewer_persona": session.interviewer_persona,
+                    "tts_style": session.tts_style,
+                    "tts_provider": session.tts_provider,
+                    "total_questions": len(session.interview_questions),
+                    "suggestion_id": suggestion_id,
+                    "used_cached_questions": bool(cached_questions),
+                },
+            )
 
             first_q = session.interview_questions[0]
             session.answer_start_time = time.time()
@@ -455,7 +591,7 @@ def register_interview_events(sio, deps):
                     "live_scoring": session.live_scoring_enabled,
                     "user_id": session.user_id,
                 },
-                room=str(session.user_id),
+                room=session.sid,
             )
 
             await sio.emit(
@@ -466,7 +602,13 @@ def register_interview_events(sio, deps):
                     "total_questions": len(session.interview_questions),
                     "user_id": session.user_id,
                 },
-                room=str(session.user_id),
+                room=session.sid,
+            )
+            _log_session_event(
+                session,
+                "question_presented",
+                question_number=1,
+                details={**_question_log_details(first_q), "trigger": "session_start"},
             )
 
             cancel_question_tts(session)
@@ -488,10 +630,28 @@ def register_interview_events(sio, deps):
                         payload = {"message": hint_message, "level": 0, "user_id": session.user_id}
                         if isinstance(hint, dict):
                             payload.update({k: v for k, v in hint.items() if k != "message"})
-                        await sio.emit("coaching_hint", payload, room=str(session.user_id))
+                        await sio.emit("coaching_hint", payload, room=session.sid)
                         print(f"💡 Initial tip: {hint_message}")
+                        _log_session_event(
+                            session,
+                            "hint_sent",
+                            event_source="coaching",
+                            question_number=1,
+                            details={
+                                "hint_origin": "initial_tip",
+                                "hint_level": 0,
+                                "message": hint_message,
+                            },
+                        )
                 except Exception as exc:
                     print(f"⚠️ Initial tip generation skipped: {exc}")
+                    _log_session_event(
+                        session,
+                        "hint_error",
+                        event_source="coaching",
+                        question_number=1,
+                        details={"hint_origin": "initial_tip", "error": str(exc)},
+                    )
 
             if session.coaching_enabled:
                 asyncio.create_task(send_initial_tip())
@@ -500,7 +660,12 @@ def register_interview_events(sio, deps):
             import traceback
 
             traceback.print_exc()
-            await sio.emit("interview_error", {"error": str(exc), "user_id": session.user_id}, room=str(session.user_id))
+            _log_session_event(
+                session,
+                "interview_start_error",
+                details={"error": str(exc)},
+            )
+            await sio.emit("interview_error", {"error": str(exc), "user_id": session.user_id}, room=session.sid)
 
     async def submit_interview_answer(sid, data):
         """
@@ -513,7 +678,7 @@ def register_interview_events(sio, deps):
         data = data or {}
         session.accept_audio_chunks = False
         if session.answer_submission_in_flight:
-            await sio.emit("status", {"stage": "answer_already_submitting", "user_id": session.user_id}, room=str(session.user_id))
+            await sio.emit("status", {"stage": "answer_already_submitting", "user_id": session.user_id}, room=session.sid)
             return
 
         session.answer_submission_in_flight = True
@@ -530,10 +695,16 @@ def register_interview_events(sio, deps):
                 print(f"📝 Using finalized transcript ({len(user_answer)} chars)")
 
             if not user_answer.strip():
+                _log_session_event(
+                    session,
+                    "answer_rejected",
+                    question_number=q_index + 1,
+                    details={"reason": "no_answer_detected", "used_transcript": used_transcript},
+                )
                 await sio.emit(
                     "interview_error",
                     {"error": "No answer detected. Please speak your answer.", "user_id": session.user_id},
-                    room=str(session.user_id),
+                    room=session.sid,
                 )
                 return
 
@@ -544,10 +715,20 @@ def register_interview_events(sio, deps):
                 )
                 if not is_valid_submission:
                     print(f"🔇 Rejected low-confidence transcript submission: {user_answer!r}")
+                    _log_session_event(
+                        session,
+                        "answer_rejected",
+                        question_number=q_index + 1,
+                        details={
+                            "reason": rejection_reason,
+                            "used_transcript": True,
+                            "answer_length": len(user_answer),
+                        },
+                    )
                     await sio.emit(
                         "interview_error",
                         {"error": rejection_reason, "user_id": session.user_id},
-                        room=str(session.user_id),
+                        room=session.sid,
                     )
                     return
 
@@ -559,6 +740,16 @@ def register_interview_events(sio, deps):
                 "duration": duration,
             }
             session.evaluations.append(eval_entry)
+            _log_session_event(
+                session,
+                "answer_submitted",
+                question_number=q_index + 1,
+                details={
+                    "answer_length": len(user_answer),
+                    "duration_seconds": duration,
+                    "answer_source": ("transcript" if used_transcript else "payload"),
+                },
+            )
 
             if not hasattr(session, "_pending_eval_tasks"):
                 session._pending_eval_tasks = []
@@ -595,9 +786,24 @@ def register_interview_events(sio, deps):
                             duration_seconds=entry["duration"],
                             skipped=False,
                         )
+                    _log_session_event(
+                        session,
+                        "answer_evaluated",
+                        question_number=q_idx + 1,
+                        details={
+                            "score": evaluation.get("score"),
+                            "quality_flags": evaluation.get("quality_flags", []),
+                        },
+                    )
                 except Exception as exc:
                     print(f"⚠️ Background evaluation failed (Q{q_idx + 1}): {exc}")
                     entry["evaluation"] = {"score": 0, "feedback": "Evaluation failed.", "error": True}
+                    _log_session_event(
+                        session,
+                        "answer_evaluation_failed",
+                        question_number=q_idx + 1,
+                        details={"error": str(exc)},
+                    )
 
             task = asyncio.create_task(_bg_evaluate(eval_entry, q_index))
             session._pending_eval_tasks.append(task)
@@ -621,7 +827,13 @@ def register_interview_events(sio, deps):
                         "total_questions": len(session.interview_questions),
                         "user_id": session.user_id,
                     },
-                    room=str(session.user_id),
+                    room=session.sid,
+                )
+                _log_session_event(
+                    session,
+                    "question_presented",
+                    question_number=session.current_question_index + 1,
+                    details={**_question_log_details(next_q), "trigger": "answer_advanced"},
                 )
 
                 # Re-check: user may have requested end while we yielded on the emit.
@@ -641,7 +853,13 @@ def register_interview_events(sio, deps):
             import traceback
 
             traceback.print_exc()
-            await sio.emit("interview_error", {"error": str(exc), "user_id": session.user_id}, room=str(session.user_id))
+            _log_session_event(
+                session,
+                "answer_submit_error",
+                question_number=(getattr(session, "current_question_index", 0) + 1),
+                details={"error": str(exc)},
+            )
+            await sio.emit("interview_error", {"error": str(exc), "user_id": session.user_id}, room=session.sid)
         finally:
             session.answer_submission_in_flight = False
 
@@ -653,7 +871,7 @@ def register_interview_events(sio, deps):
         session.end_requested = False
         cancel_question_tts(session)
 
-        await sio.emit("generating_report", {"user_id": session.user_id}, room=str(session.user_id))
+        await sio.emit("generating_report", {"user_id": session.user_id}, room=session.sid)
 
         pending_tasks = getattr(session, "_pending_eval_tasks", [])
         if pending_tasks:
@@ -671,6 +889,11 @@ def register_interview_events(sio, deps):
             summary = await generate_interview_summary(session.evaluations)
         except Exception as exc:
             print(f"⚠️ Summary generation failed in finish_interview: {exc}")
+            _log_session_event(
+                session,
+                "interview_summary_failed",
+                details={"error": str(exc)},
+            )
             total_questions = len(session.evaluations)
             skipped_questions = sum(1 for entry in session.evaluations if entry.get("skipped"))
             answered_questions = max(0, total_questions - skipped_questions)
@@ -717,13 +940,24 @@ def register_interview_events(sio, deps):
                 user_db = deps.get_user_db()
                 user_db.complete_session(db_sid, summary)
                 updated_queue = user_db.append_report_actions(session.user_id, summary, session_id=db_sid)
-                await sio.emit("action_queue", {"actions": updated_queue, "user_id": session.user_id}, room=str(session.user_id))
+                await sio.emit("action_queue", {"actions": updated_queue, "user_id": session.user_id}, room=session.sid)
             else:
                 print("⚠️ No db_session_id found, session summary not saved to DB")
         except Exception as exc:
             print(f"⚠️ Failed persisting completed interview {getattr(session, 'db_session_id', 'unknown')}: {exc}")
 
         session.interview_active = False
+        _log_session_event(
+            session,
+            "interview_completed",
+            details={
+                "total_questions": summary.get("total_questions"),
+                "answered_questions": summary.get("answered_questions"),
+                "skipped_questions": summary.get("skipped_questions"),
+                "average_score": summary.get("average_score"),
+                "evaluation_status": summary.get("evaluation_status"),
+            },
+        )
 
         await sio.emit(
             "interview_complete",
@@ -734,7 +968,7 @@ def register_interview_events(sio, deps):
                 "message": f"Interview complete! Average score: {summary.get('average_score', 0)}/10",
                 "user_id": session.user_id,
             },
-            room=str(session.user_id),
+            room=session.sid,
         )
 
         if deps.settings.FEEDBACK_LOOP_V2:
@@ -786,19 +1020,44 @@ def register_interview_events(sio, deps):
                 current_q,
             )
             if hint:
-                await sio.emit("coaching_hint", {**hint, "user_id": session.user_id}, room=str(session.user_id))
+                await sio.emit("coaching_hint", {**hint, "user_id": session.user_id}, room=session.sid)
+                _log_session_event(
+                    session,
+                    "hint_sent",
+                    event_source="coaching",
+                    question_number=session.current_question_index + 1,
+                    details={
+                        "hint_origin": "struggle_check",
+                        "message": hint.get("message"),
+                        "silence_duration": data.get("silence_duration", 0),
+                    },
+                )
         except Exception as exc:
             print(f"⚠️ Struggle detection error: {exc}")
+            _log_session_event(
+                session,
+                "hint_error",
+                event_source="coaching",
+                question_number=session.current_question_index + 1,
+                details={"hint_origin": "struggle_check", "error": str(exc)},
+            )
 
     async def toggle_coaching(sid, data):
         """Enable/disable real-time coaching hints."""
         session = deps.sessions.get(sid)
         if session:
             session.coaching_enabled = data.get("enabled", False)
+            _log_session_event(
+                session,
+                "coaching_toggled",
+                event_source="coaching",
+                question_number=(session.current_question_index + 1) if session.interview_active else None,
+                details={"enabled": session.coaching_enabled},
+            )
             await sio.emit(
                 "coaching_toggled",
                 {"enabled": session.coaching_enabled, "user_id": session.user_id},
-                room=str(session.user_id),
+                room=session.sid,
             )
 
     async def skip_question(sid, data):
@@ -868,6 +1127,12 @@ def register_interview_events(sio, deps):
                     duration_seconds=0,
                     skipped=True,
                 )
+            _log_session_event(
+                session,
+                "question_skipped",
+                question_number=session.current_question_index + 1,
+                details=_question_log_details(current_q),
+            )
 
             session.current_question_index += 1
 
@@ -884,7 +1149,13 @@ def register_interview_events(sio, deps):
                         "total_questions": len(session.interview_questions),
                         "user_id": session.user_id,
                     },
-                    room=str(session.user_id),
+                    room=session.sid,
+                )
+                _log_session_event(
+                    session,
+                    "question_presented",
+                    question_number=session.current_question_index + 1,
+                    details={**_question_log_details(next_q), "trigger": "question_skipped"},
                 )
 
                 cancel_question_tts(session)
@@ -904,12 +1175,20 @@ def register_interview_events(sio, deps):
         session.accept_audio_chunks = False
         session.end_requested = True
         cancel_question_tts(session)
+        _log_session_event(
+            session,
+            "interview_end_requested",
+            details={
+                "current_question_number": session.current_question_index + 1,
+                "answer_submission_in_flight": bool(session.answer_submission_in_flight),
+            },
+        )
 
         if session.answer_submission_in_flight:
             await sio.emit(
                 "status",
                 {"stage": "ending_after_current_evaluation", "user_id": session.user_id},
-                room=str(session.user_id),
+                room=session.sid,
             )
             return
 
@@ -983,11 +1262,25 @@ def register_interview_events(sio, deps):
                         )
                     except Exception as exc:
                         print(f"⚠️ Failed saving partial end-interview answer: {exc}")
+                _log_session_event(
+                    session,
+                    "partial_answer_saved",
+                    question_number=session.current_question_index + 1,
+                    details={
+                        "answer_length": len(raw_answer),
+                        "duration_seconds": duration,
+                    },
+                )
 
         try:
             await finish_interview(sid, session)
         except Exception as exc:
             print(f"❌ end_interview_early fallback path: {exc}")
+            _log_session_event(
+                session,
+                "interview_end_error",
+                details={"error": str(exc)},
+            )
             session.interview_active = False
             await sio.emit(
                 "interview_complete",
@@ -1019,7 +1312,7 @@ def register_interview_events(sio, deps):
                     "message": "Interview ended early.",
                     "user_id": session.user_id,
                 },
-                room=str(session.user_id),
+                room=session.sid,
             )
 
     sio.on("request_hint", handler=request_hint)

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useInterviewStore from '@/store/useInterviewStore';
+import InterviewReadinessDialog from '@/components/InterviewReadinessDialog';
 import {
     ThemeProvider,
     CssBaseline,
@@ -33,7 +34,12 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
-import { getQuestionAudioContext } from '@/lib/questionAudio';
+import {
+    clearSharedPlaybackAudioSource,
+    ensurePlaybackAudioSession,
+    getQuestionAudioContext,
+    primeQuestionAudioPlayback,
+} from '@/lib/questionAudio';
 
 const DEFAULT_SILENCE_AUTO_STOP_SECONDS = 5.0;
 const DEFAULT_SILENCE_RMS_THRESHOLD = 0.008;
@@ -107,19 +113,20 @@ export default function InterviewView() {
         endInterview,
         submitInterviewAnswer,
         sendAudioChunk,
-        forceTranscribe,
         setRecording,
         ttsAudioQueue,
         ttsStreamQueue,
         popAudio,
         popTtsStreamChunk,
         darkMode,
+        micPermissionGranted,
         recordingThresholds,
         interviewMode,
         interviewFeedbackTiming,
         coachingEnabled,
         interviewerPersona,
         generatingReport,
+        savePreferences,
     } = useInterviewStore();
 
     const [draft, setDraft] = useState('');
@@ -135,6 +142,7 @@ export default function InterviewView() {
     const [questionAudioPlaying, setQuestionAudioPlaying] = useState(false);
     const [pendingQuestionAudio, setPendingQuestionAudio] = useState(null);
     const [pendingQuestionStreamChunk, setPendingQuestionStreamChunk] = useState(null);
+    const [readinessOpen, setReadinessOpen] = useState(true);
 
     const isRecordingRef = useRef(false);
     const streamRef = useRef(null);
@@ -200,12 +208,7 @@ export default function InterviewView() {
         setIsMicStarting(false);
         setRecording(false);
         releaseAudioNodes();
-
-        if (flushTranscript) {
-            // Small delay helps last buffered chunk reach server before forced transcription.
-            setTimeout(() => forceTranscribe(), 140);
-        }
-    }, [forceTranscribe, releaseAudioNodes, setRecording]);
+    }, [releaseAudioNodes, setRecording]);
 
     const startRecording = useCallback(async () => {
         if (isRecordingRef.current || isMicStarting) return;
@@ -265,7 +268,7 @@ export default function InterviewView() {
                     lastVoiceDetectedAt = now;
                 } else if (!silenceTriggered && (now - lastVoiceDetectedAt) >= silenceAutoStopMs) {
                     silenceTriggered = true;
-                    stopRecording(true);
+                    stopRecording(false);
                     return;
                 }
 
@@ -300,6 +303,8 @@ export default function InterviewView() {
     const ensureQuestionPlaybackContext = useCallback(async () => {
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         if (!AudioCtx) return null;
+
+        await ensurePlaybackAudioSession('playback');
 
         let audioContext = ttsPlaybackContextRef.current || getQuestionAudioContext();
         if (!audioContext || audioContext.state === 'closed') {
@@ -336,7 +341,7 @@ export default function InterviewView() {
         const audio = questionAudioRef.current;
         if (audio) {
             audio.pause();
-            audio.src = '';
+            clearSharedPlaybackAudioSource();
             questionAudioRef.current = null;
         }
         if (ttsPlaybackEndTimerRef.current) {
@@ -368,45 +373,39 @@ export default function InterviewView() {
         console.log('[TTS] playQuestionAudio called, audioBase64 length:', audioBase64.length);
         stopQuestionAudio();
 
-        const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
-        audio.preload = 'auto';
-        questionAudioRef.current = audio;
-        setQuestionAudioPlaying(true);
-        questionAudioPlayingRef.current = true;
-
-        audio.onended = () => {
-            console.log('[TTS] Audio playback ended');
-            if (questionAudioRef.current === audio) {
-                questionAudioRef.current = null;
-            }
-            setQuestionAudioPlaying(false);
-            // Brief cooldown before un-gating mic to let trailing speaker resonance fade
-            setTimeout(() => { questionAudioPlayingRef.current = false; }, 250);
-        };
-
-        audio.onerror = (e) => {
-            console.error('[TTS] Audio playback error:', e);
-            if (questionAudioRef.current === audio) {
-                questionAudioRef.current = null;
-            }
-            setQuestionAudioPlaying(false);
-            questionAudioPlayingRef.current = false;
-        };
-
         try {
-            await audio.play();
-            console.log('[TTS] audio.play() succeeded');
+            const audioContext = await ensureQuestionPlaybackContext();
+            if (!audioContext) return false;
+
+            const bytes = base64ToBytes(audioBase64);
+            const audioBuffer = await audioContext.decodeAudioData(bytes.buffer.slice(0));
+
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+
+            source.onended = () => {
+                console.log('[TTS] Audio playback ended');
+                ttsScheduledSourcesRef.current = ttsScheduledSourcesRef.current.filter((s) => s !== source);
+                try { source.disconnect(); } catch (_) { /* already disconnected */ }
+                setQuestionAudioPlaying(false);
+                setTimeout(() => { questionAudioPlayingRef.current = false; }, 250);
+            };
+
+            ttsScheduledSourcesRef.current.push(source);
+            source.start(0);
+
+            setQuestionAudioPlaying(true);
+            questionAudioPlayingRef.current = true;
+            console.log('[TTS] Web Audio playback started');
             return true;
         } catch (err) {
-            console.error('[TTS] audio.play() failed:', err);
-            if (questionAudioRef.current === audio) {
-                questionAudioRef.current = null;
-            }
+            console.error('[TTS] Web Audio playback failed:', err);
             setQuestionAudioPlaying(false);
             questionAudioPlayingRef.current = false;
             return false;
         }
-    }, [stopQuestionAudio]);
+    }, [stopQuestionAudio, ensureQuestionPlaybackContext]);
 
     const playQuestionStreamChunk = useCallback(async (chunkPayload) => {
         if (!chunkPayload?.audio) return false;
@@ -469,7 +468,7 @@ export default function InterviewView() {
 
     useEffect(() => {
         console.log('[TTS] Playback effect: enabled=', questionAudioEnabled, 'playing=', questionAudioPlaying, 'queueLen=', ttsAudioQueue.length, 'pending=', !!pendingQuestionAudio);
-        if (!questionAudioEnabled || questionAudioPlaying) return;
+        if (readinessOpen || !questionAudioEnabled || questionAudioPlaying) return;
 
         const nextAudio = pendingQuestionAudio || popAudio();
         if (!nextAudio) return;
@@ -490,10 +489,10 @@ export default function InterviewView() {
         return () => {
             isMounted = false;
         };
-    }, [pendingQuestionAudio, playQuestionAudio, popAudio, questionAudioEnabled, questionAudioPlaying, ttsAudioQueue]);
+    }, [pendingQuestionAudio, playQuestionAudio, popAudio, questionAudioEnabled, questionAudioPlaying, readinessOpen, ttsAudioQueue]);
 
     useEffect(() => {
-        if (!questionAudioEnabled) return;
+        if (readinessOpen || !questionAudioEnabled) return;
 
         const nextChunk = pendingQuestionStreamChunk || popTtsStreamChunk();
         if (!nextChunk) return;
@@ -513,10 +512,10 @@ export default function InterviewView() {
         return () => {
             isMounted = false;
         };
-    }, [pendingQuestionStreamChunk, playQuestionStreamChunk, popTtsStreamChunk, questionAudioEnabled, ttsStreamQueue]);
+    }, [pendingQuestionStreamChunk, playQuestionStreamChunk, popTtsStreamChunk, questionAudioEnabled, readinessOpen, ttsStreamQueue]);
 
     useEffect(() => {
-        if (!questionAudioBlocked || !questionAudioEnabled || (!pendingQuestionAudio && !pendingQuestionStreamChunk)) return;
+        if (readinessOpen || !questionAudioBlocked || !questionAudioEnabled || (!pendingQuestionAudio && !pendingQuestionStreamChunk)) return;
 
         let cancelled = false;
         const tryPlay = async () => {
@@ -550,7 +549,13 @@ export default function InterviewView() {
         playQuestionStreamChunk,
         questionAudioBlocked,
         questionAudioEnabled,
+        readinessOpen,
     ]);
+
+    useEffect(() => {
+        if (!readinessOpen) return;
+        stopQuestionAudio();
+    }, [readinessOpen, stopQuestionAudio]);
 
     useEffect(() => {
         if (coachingEnabled) {
@@ -597,6 +602,11 @@ export default function InterviewView() {
         requestHint();
     };
 
+    const handleReadinessClose = useCallback(() => {
+        void primeQuestionAudioPlayback();
+        setReadinessOpen(false);
+    }, []);
+
     const handleSubmit = () => {
         if (answerSubmitPending) return;
         clearInterviewError();
@@ -610,12 +620,10 @@ export default function InterviewView() {
         }
 
         if (isMicRecording) {
-            stopRecording(true);
-            // Allow the last in-flight audio chunks and the delayed forceTranscribe
-            // (scheduled by stopRecording) to reach the server before submitting.
+            stopRecording(false);
+            // Allow the last in-flight audio chunks to reach the server before submitting.
             setTimeout(() => submitInterviewAnswer('', elapsedTime), 200);
         } else {
-            forceTranscribe();
             submitInterviewAnswer('', elapsedTime);
         }
     };
@@ -1004,6 +1012,16 @@ export default function InterviewView() {
                             </Paper></>)}
                     </Stack>
                 </Container>
+                <InterviewReadinessDialog
+                    open={readinessOpen}
+                    onClose={handleReadinessClose}
+                    onConfirm={handleReadinessClose}
+                    micPermissionGranted={micPermissionGranted}
+                    onMicPermissionChange={(granted) => savePreferences({ mic_permission_granted: granted })}
+                    title="Mic & Sound Check"
+                    subtitle="Check your mic and speaker on this device."
+                    actionLabel="Continue"
+                />
             </Box>
         </ThemeProvider>
     );

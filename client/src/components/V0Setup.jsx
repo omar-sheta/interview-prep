@@ -30,10 +30,10 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
-import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
 import {
     PERSONA_OPTIONS,
     QUICK_INTERVIEW_TYPES,
+    QUICK_JOB_PRESETS,
     getQuickSkillGaps,
     normalizeQuickPersona,
     clampQuickQuestionCount,
@@ -131,12 +131,29 @@ export default function V0Setup() {
     const [quickType, setQuickType] = useState('mixed');
     const [quickQuestionCount, setQuickQuestionCount] = useState('5');
     const [quickStarting, setQuickStarting] = useState(false);
+    const activeQuickPresetId = useMemo(
+        () => QUICK_JOB_PRESETS.find(
+            (preset) =>
+                String(quickRole || '').trim() === preset.jobTitle &&
+                String(quickJD || '').trim() === preset.jobDescription
+        )?.id || '',
+        [quickRole, quickJD],
+    );
 
     const openQuickDialog = () => {
-        setQuickRole(String(targetRole || '').trim());
-        setQuickJD(String(jobDescription || '').trim());
+        const nextRole = String(targetRole || '').trim();
+        const nextJD = String(jobDescription || '').trim();
+        const fallbackPreset = QUICK_JOB_PRESETS[0];
+        setQuickRole(nextRole || fallbackPreset?.jobTitle || '');
+        setQuickJD(nextJD || fallbackPreset?.jobDescription || '');
         setQuickQuestionCount(String(normalizeQuestionCount(questionCountOverride || 5)));
         setQuickOpen(true);
+    };
+
+    const applyQuickPreset = (preset) => {
+        if (!preset) return;
+        setQuickRole(preset.jobTitle);
+        setQuickJD(preset.jobDescription);
     };
 
     useEffect(() => {
@@ -185,14 +202,10 @@ export default function V0Setup() {
             setError('Profile is incomplete. Set target role and job description first.');
             return;
         }
-
-        void primeQuestionAudioPlayback();
-
         setError('');
-        setStartingType(interviewType.id);
 
         const selectedSkillGaps = getSkillGapsForType(interviewType.id, skillMapping?.missing || []);
-
+        setStartingType(interviewType.id);
         startInterview({
             job_title: String(targetRole || '').trim(),
             skill_gaps: selectedSkillGaps,
@@ -216,12 +229,10 @@ export default function V0Setup() {
             setError('Not connected to server yet. Please try again in a moment.');
             return;
         }
-
-        void primeQuestionAudioPlayback();
-
-        setQuickStarting(true);
         setError('');
 
+        const qCount = normalizeQuestionCount(quickQuestionCount || 5);
+        setQuickStarting(true);
         startInterview({
             job_title: role,
             skill_gaps: getQuickSkillGaps(quickType),
@@ -233,7 +244,7 @@ export default function V0Setup() {
             feedback_timing: 'end_only',
             live_scoring: false,
             interviewer_persona: selectedPersona,
-            question_count: normalizeQuestionCount(quickQuestionCount || 5),
+            question_count: qCount,
         });
     };
 
@@ -440,6 +451,23 @@ export default function V0Setup() {
                         </Stack>
                     ) : (
                         <Stack spacing={2.5} sx={{ pt: 1 }}>
+                            <Box>
+                                <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                                    Demo Roles
+                                </Typography>
+                                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                                    {QUICK_JOB_PRESETS.map((preset) => (
+                                        <Chip
+                                            key={preset.id}
+                                            label={preset.title}
+                                            clickable
+                                            color={activeQuickPresetId === preset.id ? 'primary' : 'default'}
+                                            variant={activeQuickPresetId === preset.id ? 'filled' : 'outlined'}
+                                            onClick={() => applyQuickPreset(preset)}
+                                        />
+                                    ))}
+                                </Stack>
+                            </Box>
                             <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1.5fr 0.7fr' }, gap: 1.2 }}>
                                 <TextField
                                     label="Target Role"

@@ -26,10 +26,16 @@ class UserDatabase:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._ensure_demo_user()
     
     def _get_connection(self):
         """Get database connection."""
         return sqlite3.connect(self.db_path)
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        """Return a UTC timestamp using non-deprecated stdlib APIs."""
+        return datetime.now(timezone.utc).replace(tzinfo=None)
     
     def _init_schema(self):
         """Initialize database schema."""
@@ -222,32 +228,112 @@ class UserDatabase:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS auth_sessions (
                 session_token TEXT PRIMARY KEY,
+                session_fingerprint TEXT UNIQUE,
                 user_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_used_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
+                revoked_at TEXT,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
+        """)
+
+        cursor.execute("PRAGMA table_info(auth_sessions)")
+        auth_session_columns = [info[1] for info in cursor.fetchall()]
+        if "session_fingerprint" not in auth_session_columns:
+            print("📦 Migrating database: Adding session_fingerprint to auth_sessions")
+            cursor.execute("ALTER TABLE auth_sessions ADD COLUMN session_fingerprint TEXT")
+        if "revoked_at" not in auth_session_columns:
+            print("📦 Migrating database: Adding revoked_at to auth_sessions")
+            cursor.execute("ALTER TABLE auth_sessions ADD COLUMN revoked_at TEXT")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_sessions_fingerprint ON auth_sessions(session_fingerprint)")
+
+        cursor.execute("""
+            SELECT session_token
+            FROM auth_sessions
+            WHERE session_fingerprint IS NULL OR TRIM(session_fingerprint) = ''
+        """)
+        for (session_token,) in cursor.fetchall():
+            cursor.execute("""
+                UPDATE auth_sessions
+                SET session_fingerprint = ?
+                WHERE session_token = ?
+            """, (self.get_session_token_fingerprint(session_token), session_token))
+
+        # Structured event timeline spanning login sessions and interview sessions.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS session_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                session_id TEXT,
+                auth_session_fingerprint TEXT,
+                sid TEXT,
+                event_type TEXT NOT NULL,
+                event_source TEXT NOT NULL,
+                question_number INTEGER,
+                details_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_events_session
+            ON session_events(session_id, event_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_events_auth_session
+            ON session_events(auth_session_fingerprint, event_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_events_user_created
+            ON session_events(user_id, created_at)
         """)
         
         conn.commit()
         conn.close()
         print("✅ User database schema initialized")
 
+    def _ensure_demo_user(self):
+        """Ensure a local demo account exists for quick manual testing."""
+        demo_email = "demo"
+        demo_username = "demo"
+        demo_password = "demo"
+
+        existing = self.get_user_by_email(demo_email)
+        if existing:
+            return
+
+        self.create_user(
+            email=demo_email,
+            username=demo_username,
+            password=demo_password,
+            profile_data={"seeded_account": True},
+        )
+        print("✅ Seeded demo user: demo / demo")
+
     # ============== Auth Session Tokens ==============
+
+    @staticmethod
+    def get_session_token_fingerprint(token: Optional[str]) -> Optional[str]:
+        """Return a stable, non-secret identifier for an auth session token."""
+        clean_token = str(token or "").strip()
+        if not clean_token:
+            return None
+        return hashlib.sha256(clean_token.encode()).hexdigest()[:16]
 
     def create_session_token(self, user_id: str, ttl_days: int = 30) -> str:
         """Create and persist a new session token for a user."""
         token = secrets.token_urlsafe(48)
-        now = datetime.utcnow()
+        now = self._utcnow()
         expires_at = now + timedelta(days=ttl_days)
+        session_fingerprint = self.get_session_token_fingerprint(token)
 
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO auth_sessions (session_token, user_id, created_at, last_used_at, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (token, user_id, now.isoformat(), now.isoformat(), expires_at.isoformat()))
+            INSERT INTO auth_sessions (session_token, session_fingerprint, user_id, created_at, last_used_at, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
+        """, (token, session_fingerprint, user_id, now.isoformat(), now.isoformat(), expires_at.isoformat()))
         conn.commit()
         conn.close()
         return token
@@ -260,7 +346,7 @@ class UserDatabase:
         conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT user_id, expires_at
+            SELECT user_id, expires_at, revoked_at
             FROM auth_sessions
             WHERE session_token = ?
         """, (token,))
@@ -270,15 +356,17 @@ class UserDatabase:
             conn.close()
             return None
 
-        user_id, expires_at_raw = row
+        user_id, expires_at_raw, revoked_at = row
         try:
             expires_at = datetime.fromisoformat(expires_at_raw)
         except Exception:
-            expires_at = datetime.utcnow() - timedelta(seconds=1)
+            expires_at = self._utcnow() - timedelta(seconds=1)
 
-        if expires_at <= datetime.utcnow():
-            cursor.execute("DELETE FROM auth_sessions WHERE session_token = ?", (token,))
-            conn.commit()
+        if revoked_at:
+            conn.close()
+            return None
+
+        if expires_at <= self._utcnow():
             conn.close()
             return None
 
@@ -286,7 +374,7 @@ class UserDatabase:
             UPDATE auth_sessions
             SET last_used_at = ?
             WHERE session_token = ?
-        """, (datetime.utcnow().isoformat(), token))
+        """, (self._utcnow().isoformat(), token))
         conn.commit()
         conn.close()
         return user_id
@@ -297,9 +385,72 @@ class UserDatabase:
             return
         conn = self._get_connection()
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM auth_sessions WHERE session_token = ?", (token,))
+        cursor.execute("""
+            UPDATE auth_sessions
+            SET revoked_at = ?
+            WHERE session_token = ?
+        """, (self._utcnow().isoformat(), token))
         conn.commit()
         conn.close()
+
+    def log_session_event(
+        self,
+        user_id: str,
+        event_type: str,
+        event_source: str,
+        session_id: Optional[str] = None,
+        auth_session_fingerprint: Optional[str] = None,
+        sid: Optional[str] = None,
+        question_number: Optional[int] = None,
+        details: Optional[dict] = None,
+    ) -> Optional[int]:
+        """Persist a structured timeline event for auth or interview debugging."""
+        clean_user_id = str(user_id or "").strip()
+        clean_event_type = str(event_type or "").strip().lower()
+        clean_event_source = str(event_source or "app").strip().lower()
+        clean_session_id = str(session_id or "").strip() or None
+        clean_auth_fingerprint = str(auth_session_fingerprint or "").strip() or None
+        clean_sid = str(sid or "").strip() or None
+
+        if not clean_user_id or not clean_event_type:
+            return None
+
+        payload = details if isinstance(details, dict) else {}
+        try:
+            normalized_question_number = int(question_number) if question_number is not None else None
+        except Exception:
+            normalized_question_number = None
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO session_events (
+                user_id,
+                session_id,
+                auth_session_fingerprint,
+                sid,
+                event_type,
+                event_source,
+                question_number,
+                details_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            clean_user_id,
+            clean_session_id,
+            clean_auth_fingerprint,
+            clean_sid,
+            clean_event_type,
+            clean_event_source,
+            normalized_question_number,
+            json.dumps(payload),
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        event_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return event_id
     
     # ============== User Management ==============
     
@@ -385,6 +536,15 @@ class UserDatabase:
         if row:
             return self.get_user(row[0])
         return None
+
+    def count_users(self) -> int:
+        """Return the total number of registered users."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        row = cursor.fetchone()
+        conn.close()
+        return int((row or [0])[0] or 0)
     
     def update_last_login(self, user_id: str):
         """Update user's last login timestamp."""
@@ -428,7 +588,159 @@ class UserDatabase:
         
         print(f"📝 Created session {session_id[:8]}... for user {user_id}" + (f" (plan: {plan_node_id})" if plan_node_id else ""))
         return session_id
-    
+
+    def get_session_events(self, session_id: str, limit: int = 300) -> list:
+        """Get structured timeline events for a specific interview session."""
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            return []
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT event_id, user_id, session_id, auth_session_fingerprint, sid,
+                   event_type, event_source, question_number, details_json, created_at
+            FROM session_events
+            WHERE session_id = ?
+            ORDER BY event_id DESC
+            LIMIT ?
+        """, (clean_session_id, max(1, int(limit or 300))))
+        rows = cursor.fetchall()
+        conn.close()
+
+        events = []
+        for row in reversed(rows):
+            try:
+                details = json.loads(row[8]) if row[8] else {}
+            except Exception:
+                details = {}
+            events.append({
+                "event_id": row[0],
+                "user_id": row[1],
+                "session_id": row[2],
+                "auth_session_fingerprint": row[3],
+                "sid": row[4],
+                "event_type": row[5],
+                "event_source": row[6],
+                "question_number": row[7],
+                "details": details if isinstance(details, dict) else {},
+                "created_at": row[9],
+            })
+        return events
+
+    def get_login_session_history(self, user_id: str, limit: int = 20) -> list:
+        """List recent auth/login sessions with timestamps and event counts."""
+        clean_user_id = str(user_id or "").strip()
+        if not clean_user_id:
+            return []
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT a.session_fingerprint, a.created_at, a.last_used_at, a.expires_at, a.revoked_at,
+                   COUNT(se.event_id) AS event_count,
+                   MAX(se.created_at) AS last_event_at
+            FROM auth_sessions a
+            LEFT JOIN session_events se
+                ON se.auth_session_fingerprint = a.session_fingerprint
+            WHERE a.user_id = ?
+            GROUP BY a.session_fingerprint, a.created_at, a.last_used_at, a.expires_at, a.revoked_at
+            ORDER BY a.created_at DESC
+            LIMIT ?
+        """, (clean_user_id, max(1, int(limit or 20))))
+        rows = cursor.fetchall()
+        conn.close()
+
+        sessions = []
+        now = self._utcnow()
+        for row in rows:
+            revoked_at = row[4]
+            try:
+                expires_at = datetime.fromisoformat(row[3]) if row[3] else None
+            except Exception:
+                expires_at = None
+            sessions.append({
+                "session_fingerprint": row[0],
+                "created_at": row[1],
+                "last_used_at": row[2],
+                "expires_at": row[3],
+                "revoked_at": revoked_at,
+                "active": bool(row[0]) and not revoked_at and bool(expires_at and expires_at > now),
+                "event_count": int(row[5] or 0),
+                "last_event_at": row[6],
+            })
+        return sessions
+
+    def get_login_session_details(self, user_id: str, session_fingerprint: str, limit: int = 400) -> Optional[dict]:
+        """Get a full login-session timeline including interview-linked events."""
+        clean_user_id = str(user_id or "").strip()
+        clean_fingerprint = str(session_fingerprint or "").strip()
+        if not clean_user_id or not clean_fingerprint:
+            return None
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT session_fingerprint, created_at, last_used_at, expires_at, revoked_at
+            FROM auth_sessions
+            WHERE user_id = ? AND session_fingerprint = ?
+            LIMIT 1
+        """, (clean_user_id, clean_fingerprint))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+
+        cursor.execute("""
+            SELECT event_id, user_id, session_id, auth_session_fingerprint, sid,
+                   event_type, event_source, question_number, details_json, created_at
+            FROM session_events
+            WHERE auth_session_fingerprint = ?
+            ORDER BY event_id DESC
+            LIMIT ?
+        """, (clean_fingerprint, max(1, int(limit or 400))))
+        event_rows = cursor.fetchall()
+        conn.close()
+
+        events = []
+        interview_session_ids = []
+        for event_row in reversed(event_rows):
+            try:
+                details = json.loads(event_row[8]) if event_row[8] else {}
+            except Exception:
+                details = {}
+            session_id = event_row[2]
+            if session_id and session_id not in interview_session_ids:
+                interview_session_ids.append(session_id)
+            events.append({
+                "event_id": event_row[0],
+                "user_id": event_row[1],
+                "session_id": session_id,
+                "auth_session_fingerprint": event_row[3],
+                "sid": event_row[4],
+                "event_type": event_row[5],
+                "event_source": event_row[6],
+                "question_number": event_row[7],
+                "details": details if isinstance(details, dict) else {},
+                "created_at": event_row[9],
+            })
+
+        try:
+            expires_at = datetime.fromisoformat(row[3]) if row[3] else None
+        except Exception:
+            expires_at = None
+
+        return {
+            "session_fingerprint": row[0],
+            "created_at": row[1],
+            "last_used_at": row[2],
+            "expires_at": row[3],
+            "revoked_at": row[4],
+                "active": bool(row[0]) and not row[4] and bool(expires_at and expires_at > self._utcnow()),
+            "interview_session_ids": interview_session_ids,
+            "events": events,
+        }
+
     def save_answer(self, session_id: str, question_number: int, question_text: str,
                    question_category: str, question_difficulty: str, user_answer: str,
                    evaluation: dict, duration_seconds: float, skipped: bool = False):
@@ -1052,8 +1364,14 @@ class UserDatabase:
                 "skipped": bool(row[7]),
                 "answered_at": row[8]
             })
-        
+
         conn.close()
+        events = self.get_session_events(session_id)
+        auth_session_fingerprint = None
+        for event in events:
+            auth_session_fingerprint = event.get("auth_session_fingerprint")
+            if auth_session_fingerprint:
+                break
         
         return {
             "session_id": session_row[0],
@@ -1065,8 +1383,10 @@ class UserDatabase:
             "total_questions": session_row[6],
             "answered_questions": session_row[7],
             "average_score": session_row[8],
+            "auth_session_fingerprint": auth_session_fingerprint,
             "summary": json.loads(session_row[9]) if session_row[9] else None,
-            "answers": answers
+            "answers": answers,
+            "events": events,
         }
     
     # ============== Career Analysis ==============
@@ -1237,6 +1557,7 @@ class UserDatabase:
                 recording_thresholds = {}
             return {
                 "resume_text": row[0],
+                "has_resume": bool(str(row[0] or "").strip()),
                 "resume_filename": row[1],
                 "target_role": row[2],
                 "target_company": row[3],
@@ -1374,6 +1695,7 @@ class UserDatabase:
             return False
 
         cursor.execute("DELETE FROM answer_retries WHERE session_id = ?", (clean_session_id,))
+        cursor.execute("DELETE FROM session_events WHERE session_id = ?", (clean_session_id,))
         cursor.execute("DELETE FROM interview_answers WHERE session_id = ?", (clean_session_id,))
         cursor.execute("DELETE FROM interview_sessions WHERE session_id = ? AND user_id = ?", (clean_session_id, user_id))
 
@@ -1406,6 +1728,10 @@ class UserDatabase:
             placeholders = ",".join(["?"] * len(session_ids))
             cursor.execute(
                 f"DELETE FROM answer_retries WHERE session_id IN ({placeholders})",
+                session_ids
+            )
+            cursor.execute(
+                f"DELETE FROM session_events WHERE session_id IN ({placeholders})",
                 session_ids
             )
             cursor.execute(
@@ -1549,7 +1875,7 @@ class UserDatabase:
         Returns the updated action queue.
         """
         summary = summary or {}
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = self._utcnow().isoformat()
         existing = self.get_action_queue(user_id)
         pending = [a for a in existing if isinstance(a, dict)]
         existing_titles = {str(a.get("title", "")).strip().lower() for a in pending}

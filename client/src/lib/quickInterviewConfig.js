@@ -53,6 +53,53 @@ export const QUICK_INTERVIEW_TYPES = [
     },
 ];
 
+export const QUICK_JOB_PRESETS = [
+    {
+        id: 'software_engineer',
+        title: 'Software Engineer',
+        jobTitle: 'Software Engineer',
+        jobDescription: [
+            'Build and maintain production software across backend services and user-facing features.',
+            'Design APIs, debug application issues, write tests, and improve reliability and performance.',
+            'Collaborate with product, design, and engineering teammates to ship features and iterate quickly.',
+            'Work with modern development tools, cloud infrastructure, databases, and code review workflows.',
+        ].join(' '),
+    },
+    {
+        id: 'ai_engineer',
+        title: 'AI Engineer',
+        jobTitle: 'AI Engineer',
+        jobDescription: [
+            'Build and deploy AI-powered product features using Python, LLM APIs, and evaluation workflows.',
+            'Design prompts, retrieval pipelines, agent behavior, and guardrails for reliable model outputs.',
+            'Collaborate with product and engineering teams to productionize AI systems and monitor quality.',
+            'Debug latency, cost, and accuracy issues across inference, orchestration, and data pipelines.',
+        ].join(' '),
+    },
+    {
+        id: 'frontend_engineer',
+        title: 'Frontend Engineer',
+        jobTitle: 'Frontend Engineer',
+        jobDescription: [
+            'Build polished web experiences using React, TypeScript, and modern frontend tooling.',
+            'Translate product requirements into accessible, responsive UI with strong performance and usability.',
+            'Own component architecture, client-side state, debugging, testing, and collaboration with design.',
+            'Improve page load speed, reliability, and maintainability across the frontend codebase.',
+        ].join(' '),
+    },
+    {
+        id: 'data_engineer',
+        title: 'Data Engineer',
+        jobTitle: 'Data Engineer',
+        jobDescription: [
+            'Design and maintain reliable data pipelines for analytics, machine learning, and operational reporting.',
+            'Build ETL workflows using SQL and Python, manage data quality, and optimize warehouse performance.',
+            'Partner with analysts, data scientists, and engineering teams to model and deliver trusted datasets.',
+            'Monitor jobs, troubleshoot failures, and improve scalability, observability, and cost efficiency.',
+        ].join(' '),
+    },
+];
+
 export function getQuickSkillGaps(interviewType) {
     if (interviewType === 'behavioral') return ['communication', 'stakeholder management', 'leadership', 'conflict resolution'];
     if (interviewType === 'technical') return ['technical fundamentals', 'problem solving', 'debugging'];

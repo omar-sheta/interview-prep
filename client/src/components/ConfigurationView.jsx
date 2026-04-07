@@ -34,7 +34,6 @@ import {
 import {
     PlayArrow,
     Save,
-    UploadFile,
     DeleteSweep,
     CheckCircleOutline,
     ErrorOutline,
@@ -48,10 +47,10 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
-import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
 import {
     PERSONA_OPTIONS,
     QUICK_INTERVIEW_TYPES,
+    QUICK_JOB_PRESETS,
     getQuickSkillGaps,
 } from '@/lib/quickInterviewConfig';
 
@@ -213,6 +212,8 @@ export default function ConfigurationView() {
         targetRole,
         targetCompany,
         jobDescription: storedJobDescription,
+        savedResumeFilename,
+        hasSavedResume,
         questionCountOverride,
         interviewerPersona,
         ttsProvider,
@@ -250,7 +251,6 @@ export default function ConfigurationView() {
     const [resumeFilename, setResumeFilename] = useState('');
     const [status, setStatus] = useState('');
     const [error, setError] = useState('');
-    const [resumeOpen, setResumeOpen] = useState(false);
     const [advancedOpen, setAdvancedOpen] = useState(false);
     const [skillFilter, setSkillFilter] = useState('actionable');
     const [selectedSkillId, setSelectedSkillId] = useState('');
@@ -264,6 +264,16 @@ export default function ConfigurationView() {
     const [quickQuestionCount, setQuickQuestionCount] = useState('5');
     const [quickStarting, setQuickStarting] = useState(false);
     const [resetDialogOpen, setResetDialogOpen] = useState(false);
+
+    const displayedResumeFilename = String(resumeFilename || savedResumeFilename || '').trim();
+    const activeQuickPresetId = useMemo(
+        () => QUICK_JOB_PRESETS.find(
+            (preset) =>
+                String(quickRole || '').trim() === preset.jobTitle &&
+                String(quickJD || '').trim() === preset.jobDescription
+        )?.id || '',
+        [quickRole, quickJD],
+    );
 
     useEffect(() => {
         connect();
@@ -323,12 +333,6 @@ export default function ConfigurationView() {
     useEffect(() => {
         setRecordingDraft(normalizeRecordingThresholds(recordingThresholds));
     }, [recordingThresholds]);
-
-    useEffect(() => {
-        if (resumeFilename || resumeBase64) {
-            setResumeOpen(true);
-        }
-    }, [resumeFilename, resumeBase64]);
 
     const skillBoard = useMemo(() => normalizeSkillBoard(skillMapping), [skillMapping]);
     const analyzingSteps = useMemo(
@@ -396,7 +400,7 @@ export default function ConfigurationView() {
         setPiperStyle(normalizedVoiceStyle);
         setTtsProvider(voiceEngine);
         setRecordingDraft(normalizedRecording);
-        savePreferences({
+        const preferencesPayload = {
             target_role: normalizedRole,
             target_company: normalizedCompany,
             job_description: normalizedDescription,
@@ -405,9 +409,13 @@ export default function ConfigurationView() {
             piper_style: normalizedVoiceStyle,
             tts_provider: voiceEngine,
             recording_thresholds: normalizedRecording,
-            resume_filename: resumeFilename || undefined,
-        });
-        setStatus('Profile saved.');
+        };
+        if (resumeBase64) {
+            preferencesPayload.resume = `data:application/pdf;base64,${resumeBase64}`;
+            preferencesPayload.resume_filename = resumeFilename || undefined;
+        }
+        savePreferences(preferencesPayload);
+        setStatus(resumeBase64 ? 'Profile saved with resume context.' : 'Profile saved.');
         return true;
     };
 
@@ -425,6 +433,10 @@ export default function ConfigurationView() {
             setError('Job description is required for analysis.');
             return;
         }
+        if (!resumeBase64 && !hasSavedResume) {
+            setError('Upload a resume before running analysis.');
+            return;
+        }
 
         setError('');
         setStatus('');
@@ -432,7 +444,8 @@ export default function ConfigurationView() {
             resumeBase64 ? `data:application/pdf;base64,${resumeBase64}` : '',
             normalizedRole,
             normalizedCompany,
-            normalizedDescription
+            normalizedDescription,
+            resumeFilename
         );
     };
 
@@ -465,11 +478,20 @@ export default function ConfigurationView() {
     };
 
     const openQuickDialog = (typeId = 'mixed') => {
-        setQuickRole(String(jobTitle || targetRole || '').trim());
-        setQuickJD(String(jobDescription || storedJobDescription || '').trim());
+        const nextRole = String(jobTitle || targetRole || '').trim();
+        const nextJD = String(jobDescription || storedJobDescription || '').trim();
+        const fallbackPreset = QUICK_JOB_PRESETS[0];
+        setQuickRole(nextRole || fallbackPreset?.jobTitle || '');
+        setQuickJD(nextJD || fallbackPreset?.jobDescription || '');
         setQuickType(typeId);
         setQuickQuestionCount(String(clampQuestionCount(questionCount) || clampQuestionCount(questionCountOverride) || 5));
         setQuickOpen(true);
+    };
+
+    const applyQuickPreset = (preset) => {
+        if (!preset) return;
+        setQuickRole(preset.jobTitle);
+        setQuickJD(preset.jobDescription);
     };
 
     const handleQuickStart = () => {
@@ -480,14 +502,10 @@ export default function ConfigurationView() {
             setError('Not connected to server yet. Please try again in a moment.');
             return;
         }
-
-        void primeQuestionAudioPlayback();
-
-        setQuickStarting(true);
         setError('');
 
         const qCount = clampQuestionCount(quickQuestionCount) || clampQuestionCount(questionCount) || 5;
-
+        setQuickStarting(true);
         startInterview({
             job_title: role,
             skill_gaps: getQuickSkillGaps(quickType),
@@ -501,7 +519,6 @@ export default function ConfigurationView() {
             interviewer_persona: defaultPersona,
             question_count: qCount,
         });
-
     };
 
     return (
@@ -520,11 +537,18 @@ export default function ConfigurationView() {
                             <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1.2} sx={{ mb: 1.2 }}>
                                 <Box>
                                     <Typography variant="h5">Profile</Typography>
-                                    <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.2 }}>
-                                        Keep the core profile tight here. Resume and audio controls stay available without taking over the page.
-                                    </Typography>
                                 </Box>
-                                <Chip size="small" label={`Readiness ${readinessPercent}%`} variant="outlined" />
+                                <Chip 
+                                    size="small" 
+                                    label={`Readiness ${readinessPercent}%`} 
+                                    sx={{ 
+                                        fontWeight: 600, 
+                                        background: 'linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15))',
+                                        color: '#a78bfa',
+                                        borderColor: 'rgba(139,92,246,0.3)',
+                                        border: '1px solid'
+                                    }} 
+                                />
                             </Stack>
                             <Divider sx={{ mb: 1.5 }} />
 
@@ -563,83 +587,44 @@ export default function ConfigurationView() {
                                     onChange={(e) => setJobDescription(e.target.value)}
                                     inputProps={{ style: { overflowY: 'auto' } }}
                                     InputLabelProps={{ shrink: true }}
-                                    helperText="Paste the core responsibilities and expectations. Keep it concise if you want faster iteration."
                                 />
 
                                 <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '0.88fr 1.12fr' }, gap: 1.3, alignItems: 'start' }}>
                                     <Paper variant="outlined" sx={{ borderRadius: 2.4, overflow: 'hidden' }}>
-                                        <Accordion
-                                            disableGutters
-                                            elevation={0}
-                                            expanded={resumeOpen}
-                                            onChange={(_, expanded) => setResumeOpen(expanded)}
-                                            sx={{
-                                                bgcolor: 'transparent',
-                                                '&::before': { display: 'none' },
-                                            }}
-                                        >
-                                            <AccordionSummary
-                                                expandIcon={<ExpandMore />}
+                                        <Stack spacing={1} sx={{ px: 1.4, py: 1.4 }}>
+                                            <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+                                                Upload Resume
+                                            </Typography>
+                                            <Box
                                                 sx={{
-                                                    px: 1.4,
-                                                    py: 0.4,
-                                                    '& .MuiAccordionSummary-content': { my: 0.8 },
+                                                    minHeight: 180,
+                                                    border: '1px dashed rgba(249,115,22,0.35)',
+                                                    borderRadius: 2,
+                                                    overflow: 'hidden',
                                                 }}
                                             >
-                                                <Stack spacing={0.4}>
-                                                    <Stack direction="row" spacing={0.8} alignItems="center" useFlexGap flexWrap="wrap">
-                                                        <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-                                                            Resume Context
-                                                        </Typography>
-                                                        <Chip size="small" label="Optional" variant="outlined" />
-                                                        {resumeFilename && (
-                                                            <Chip
-                                                                icon={<UploadFile />}
-                                                                size="small"
-                                                                label="Uploaded"
-                                                                color="success"
-                                                                variant="outlined"
-                                                            />
-                                                        )}
-                                                    </Stack>
-                                                    <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                                        Add a resume when you want analysis and question generation to use your actual experience.
-                                                    </Typography>
-                                                </Stack>
-                                            </AccordionSummary>
-                                            <AccordionDetails sx={{ px: 1.4, pt: 0, pb: 1.4 }}>
-                                                <Stack spacing={1}>
-                                                    <Box
-                                                        sx={{
-                                                            minHeight: 180,
-                                                            border: '1px dashed rgba(249,115,22,0.35)',
-                                                            borderRadius: 2,
-                                                            overflow: 'hidden',
-                                                        }}
-                                                    >
-                                                        <PDFDropzone
-                                                            onUpload={(base64, filename) => {
-                                                                setResumeBase64(base64 || '');
-                                                                setResumeFilename(filename || '');
-                                                            }}
-                                                            isLoading={isAnalyzing}
-                                                        />
-                                                    </Box>
-                                                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                                        If you skip this, HiveMindPrep will keep using the last saved profile context.
-                                                    </Typography>
-                                                </Stack>
-                                            </AccordionDetails>
-                                        </Accordion>
+                                                <PDFDropzone
+                                                    onUpload={(base64, filename) => {
+                                                        setResumeBase64(base64 || '');
+                                                        setResumeFilename(filename || '');
+                                                    }}
+                                                    isLoading={isAnalyzing}
+                                                    hasSavedResume={Boolean(displayedResumeFilename)}
+                                                    savedLabel={displayedResumeFilename}
+                                                />
+                                            </Box>
+                                            {displayedResumeFilename && (
+                                                <Typography variant="caption" sx={{ color: 'success.main', fontWeight: 600 }}>
+                                                    {displayedResumeFilename}
+                                                </Typography>
+                                            )}
+                                        </Stack>
                                     </Paper>
 
                                     <Paper variant="outlined" sx={{ p: 1.3, borderRadius: 2.4 }}>
                                         <Stack spacing={1.15}>
                                             <Box>
                                                 <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>Interview Defaults</Typography>
-                                                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                                    Keep the default interview behavior light here. Advanced audio tuning stays tucked away below.
-                                                </Typography>
                                             </Box>
 
                                             <FormControl fullWidth size="small">
@@ -719,7 +704,7 @@ export default function ConfigurationView() {
                                                             Advanced Audio Settings
                                                         </Typography>
                                                         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                                            Fine-tune Piper style, silence sensitivity, and workspace reset only when needed.
+                                                            Adjust voice tone, silence sensitivity, and workspace configurations if necessary.
                                                         </Typography>
                                                     </Box>
                                                 </AccordionSummary>
@@ -803,29 +788,37 @@ export default function ConfigurationView() {
 
                             <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} sx={{ mt: 1.35 }}>
                                 <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                                    {analysisProgress || 'Save your profile, then analyze to refresh readiness and skill gaps.'}
+                                    {analysisProgress || ''}
                                 </Typography>
-                                <Stack direction="row" spacing={1}>
+                                <Box sx={{ display: 'flex', gap: 2.5, alignItems: 'center' }}>
                                     <Button
                                         variant="text"
                                         color="error"
+                                        size="small"
                                         onClick={() => setClearDialogOpen(true)}
                                         disabled={isAnalyzing}
                                     >
-                                        Clear Profile
+                                        Clear
                                     </Button>
-                                    <Button variant="outlined" startIcon={<Save />} onClick={saveConfig} disabled={isAnalyzing}>
-                                        Save
-                                    </Button>
-                                    <Button
-                                        variant="contained"
-                                        startIcon={isAnalyzing ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
-                                        onClick={runAnalysis}
-                                        disabled={isAnalyzing}
-                                    >
-                                        {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
-                                    </Button>
-                                </Stack>
+                                    <Stack direction="row" spacing={1.5}>
+                                        <Button variant="outlined" startIcon={<Save />} onClick={saveConfig} disabled={isAnalyzing}>
+                                            Save
+                                        </Button>
+                                        <Button
+                                            variant="contained"
+                                            startIcon={isAnalyzing ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
+                                            onClick={runAnalysis}
+                                            disabled={isAnalyzing}
+                                            sx={{
+                                                background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                                                '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
+                                                boxShadow: '0 4px 14px 0 rgba(99, 102, 241, 0.39)',
+                                            }}
+                                        >
+                                            {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
+                                        </Button>
+                                    </Stack>
+                                </Box>
                             </Stack>
                         </Paper>
 
@@ -870,8 +863,14 @@ export default function ConfigurationView() {
                                     size="small"
                                     icon={<TrendingUp />}
                                     label={`Readiness ${Math.round(clamp01(readinessScore, 0) * 100)}%`}
-                                    color="warning"
-                                    variant="outlined"
+                                    sx={{ 
+                                        fontWeight: 600, 
+                                        background: 'linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15))',
+                                        color: '#a78bfa',
+                                        borderColor: 'rgba(139,92,246,0.3)',
+                                        border: '1px solid',
+                                        '& .MuiChip-icon': { color: '#a78bfa' }
+                                    }}
                                 />
                             </Stack>
                             <Divider sx={{ mb: 1.5 }} />
@@ -1231,6 +1230,23 @@ export default function ConfigurationView() {
                             </Stack>
                         ) : (
                             <Stack spacing={2.5} sx={{ pt: 1 }}>
+                                <Box>
+                                    <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+                                        Demo Roles
+                                    </Typography>
+                                    <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                                        {QUICK_JOB_PRESETS.map((preset) => (
+                                            <Chip
+                                                key={preset.id}
+                                                label={preset.title}
+                                                clickable
+                                                color={activeQuickPresetId === preset.id ? 'primary' : 'default'}
+                                                variant={activeQuickPresetId === preset.id ? 'filled' : 'outlined'}
+                                                onClick={() => applyQuickPreset(preset)}
+                                            />
+                                        ))}
+                                    </Stack>
+                                </Box>
                                 <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1.5fr 0.7fr' }, gap: 1.2 }}>
                                     <TextField
                                         label="Target Role"

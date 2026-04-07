@@ -52,6 +52,57 @@ const normalizeTtsProvider = (provider, fallback = 'piper') => {
     return ALLOWED_TTS_PROVIDERS.has(normalized) ? normalized : fallbackNormalized;
 };
 
+const TOUR_SEEN_STORAGE_PREFIX = 'beePrepared.hasSeenTour';
+
+function getTourSeenStorageKey(userId) {
+    const normalizedUserId = String(userId || '').trim() || 'anonymous';
+    return `${TOUR_SEEN_STORAGE_PREFIX}:${normalizedUserId}`;
+}
+
+function readPersistedTourFlag(userId) {
+    if (typeof window === 'undefined') return false;
+
+    try {
+        const storageKey = getTourSeenStorageKey(userId);
+        const value = localStorage.getItem(storageKey) === 'true';
+        console.log('[TourDebug] readPersistedTourFlag', { userId, storageKey, value });
+        return value;
+    } catch {
+        console.warn('[TourDebug] readPersistedTourFlag failed', { userId });
+        return false;
+    }
+}
+
+function writePersistedTourFlag(userId, seen) {
+    if (typeof window === 'undefined') return;
+
+    try {
+        const storageKey = getTourSeenStorageKey(userId);
+        localStorage.setItem(storageKey, seen ? 'true' : 'false');
+        console.log('[TourDebug] writePersistedTourFlag', { userId, storageKey, seen: Boolean(seen) });
+    } catch {
+        console.warn('[TourDebug] writePersistedTourFlag failed', { userId, seen: Boolean(seen) });
+        // Ignore storage write failures; store state still updates.
+    }
+}
+
+function mergeTourSeenState({
+    backendHasSeenTour = false,
+    targetUserId = '',
+    currentStoreUserId = '',
+    currentStoreHasSeenTour = false,
+}) {
+    const persistedTourSeen = readPersistedTourFlag(targetUserId);
+    const sameUser = String(targetUserId || '').trim() !== '' && String(targetUserId || '').trim() === String(currentStoreUserId || '').trim();
+    const inMemoryTourSeen = sameUser ? Boolean(currentStoreHasSeenTour) : false;
+    return {
+        hasSeenTour: Boolean(backendHasSeenTour) || persistedTourSeen || inMemoryTourSeen,
+        persistedTourSeen,
+        sameUser,
+        inMemoryTourSeen,
+    };
+}
+
 // Socket.IO instance managed in state
 const useInterviewStore = create(
     persist(
@@ -62,11 +113,13 @@ const useInterviewStore = create(
             connectionError: null,
             userId: null,  // User ID from server
             userEmail: null,  // User email for authentication
+            isAdmin: false,
             sessionToken: null, // Server-issued auth token
 
             // App state
             appState: APP_STATES.IDLE,
             onboardingComplete: false, // Tracks if user has logged in/completed onboarding
+            hasSeenTour: false, // Tracks if user has seen Joyride tour
             darkMode: false,
 
             // Career Analysis (PERSISTED)
@@ -83,6 +136,9 @@ const useInterviewStore = create(
             targetRole: '',
             targetCompany: '',
             jobDescription: '',
+            savedResumeFilename: '',
+            hasSavedResume: false,
+            micPermissionGranted: false,
             questionCountOverride: null,
             interviewerPersona: 'friendly',
             piperStyle: 'interviewer',
@@ -94,7 +150,7 @@ const useInterviewStore = create(
             suggestedSessions: [],
             practicePlan: null,
 
-            // Interview (not persisted - live session)
+            // Interview
             transcript: '',
             lastTranscript: '', // New: For tracking latest speech chunk
             currentTokens: '',
@@ -103,7 +159,7 @@ const useInterviewStore = create(
             isRecording: false,
             interviewPhase: 'warmup',
 
-            // Interview Practice State (not persisted)
+            // Interview Practice State
             interviewActive: false,
             interviewMode: 'practice', // 'practice' | 'coaching'
             interviewFeedbackTiming: 'end_only', // 'end_only' | 'live'
@@ -136,6 +192,19 @@ const useInterviewStore = create(
             // ============== Actions ==============
             toggleDarkMode: () => set((state) => ({ darkMode: !state.darkMode })),
             setDarkMode: (enabled) => set({ darkMode: Boolean(enabled) }),
+            setHasSeenTour: (val) => {
+                writePersistedTourFlag(get().userId, Boolean(val));
+                console.log('[Tour] setHasSeenTour called with:', val);
+                set({ hasSeenTour: Boolean(val) });
+                console.log('[Tour] zustand state set, hasSeenTour:', get().hasSeenTour);
+                const { socket } = get();
+                if (socket?.connected) {
+                    console.log('[Tour] emitting save_preferences { has_seen_tour:', Boolean(val), '}');
+                    socket.emit('save_preferences', { has_seen_tour: Boolean(val) });
+                } else {
+                    console.warn('[Tour] socket not connected — backend save skipped');
+                }
+            },
             clearInterviewError: () => set({ interviewError: '' }),
 
             // Connect to Socket.IO Server
@@ -173,7 +242,7 @@ const useInterviewStore = create(
 
                 // Prevent stale user binding when no valid token is available.
                 if (!sessionToken && userId && userId !== 'anonymous') {
-                    set({ userId: null, onboardingComplete: false });
+                    set({ userId: null, onboardingComplete: false, isAdmin: false });
                     userId = null;
                 }
 
@@ -224,13 +293,60 @@ const useInterviewStore = create(
                 newSocket.on('auth_success', (data) => {
                     if (data.user?.user_id) {
                         const prefs = data.preferences || {};
+                        const currentStoreUserId = get().userId;
+                        const currentStoreHasSeenTour = get().hasSeenTour;
+                        const tourState = mergeTourSeenState({
+                            backendHasSeenTour: Boolean(prefs.has_seen_tour),
+                            targetUserId: data.user.user_id,
+                            currentStoreUserId,
+                            currentStoreHasSeenTour,
+                        });
+                        const hasSeenTour = tourState.hasSeenTour;
+                        console.log('[TourDebug] auth_success merge', {
+                            userId: data.user.user_id,
+                            backendHasSeenTour: Boolean(prefs.has_seen_tour),
+                            storeHasSeenTour: currentStoreHasSeenTour,
+                            currentStoreUserId,
+                            sameUser: tourState.sameUser,
+                            persistedTourSeen: tourState.persistedTourSeen,
+                            mergedHasSeenTour: hasSeenTour,
+                        });
+                        const reportState = tourState.sameUser
+                            ? {
+                                allEvaluations: get().allEvaluations,
+                                interviewSummary: get().interviewSummary,
+                                currentSessionId: get().currentSessionId,
+                                retryAttemptsByQuestion: get().retryAttemptsByQuestion,
+                                retrySubmitting: get().retrySubmitting,
+                                retryErrors: get().retryErrors,
+                                selectedSession: get().selectedSession,
+                                interviewHistory: get().interviewHistory,
+                            }
+                            : {
+                                allEvaluations: [],
+                                interviewSummary: null,
+                                currentSessionId: null,
+                                retryAttemptsByQuestion: {},
+                                retrySubmitting: {},
+                                retryErrors: {},
+                                selectedSession: null,
+                                interviewHistory: [],
+                            };
+                        if (hasSeenTour) {
+                            writePersistedTourFlag(data.user.user_id, true);
+                        }
                         const nextState = {
                             userId: data.user.user_id,
                             userEmail: data.user.email || get().userEmail,
+                            isAdmin: Boolean(data.user?.is_admin),
                             onboardingComplete: true,
+                            hasSeenTour,
                             targetRole: prefs.target_role || '',
                             targetCompany: prefs.target_company || '',
                             jobDescription: prefs.job_description || '',
+                            savedResumeFilename: prefs.resume_filename || '',
+                            hasSavedResume: Boolean(prefs.has_resume || prefs.resume_text),
+                            micPermissionGranted: Boolean(prefs.mic_permission_granted),
                             questionCountOverride:
                                 prefs.question_count_override !== undefined && prefs.question_count_override !== null
                                     ? Number(prefs.question_count_override)
@@ -259,14 +375,7 @@ const useInterviewStore = create(
                             totalQuestions: 0,
                             answerEvaluation: null,
                             coachingHint: null,
-                            allEvaluations: [],
-                            interviewSummary: null,
-                            currentSessionId: null,
-                            retryAttemptsByQuestion: {},
-                            retrySubmitting: {},
-                            retryErrors: {},
-                            interviewHistory: [],
-                            selectedSession: null,
+                            ...reportState,
                         };
                         if (data.session_token) {
                             nextState.sessionToken = data.session_token;
@@ -289,6 +398,7 @@ const useInterviewStore = create(
                             sessionToken: null,
                             userId: null,
                             userEmail: null,
+                            isAdmin: false,
                             onboardingComplete: false,
                             historyLoading: false,
                             deletingSessionIds: {},
@@ -307,6 +417,7 @@ const useInterviewStore = create(
                     const nextState = {
                         userId: data.user?.user_id || get().userId,
                         userEmail: data.user?.email || get().userEmail,
+                        isAdmin: Boolean(data.user?.is_admin),
                         onboardingComplete: true,
                     };
                     if (data.session_token) {
@@ -326,6 +437,9 @@ const useInterviewStore = create(
                     if (isInInterview) {
                         set({
                             ...nextState,
+                            savedResumeFilename: prefs.resume_filename || '',
+                            hasSavedResume: Boolean(prefs.has_resume || prefs.resume_text),
+                            micPermissionGranted: Boolean(prefs.mic_permission_granted),
                             interviewerPersona: String(prefs.interviewer_persona || 'friendly').trim().toLowerCase() || 'friendly',
                             piperStyle: normalizePiperStyle(prefs.piper_style, get().piperStyle || 'interviewer'),
                             ttsProvider: normalizeTtsProvider(prefs.tts_provider, get().ttsProvider || 'piper'),
@@ -335,11 +449,53 @@ const useInterviewStore = create(
                         return;
                     }
 
+                    const currentStoreUserId = get().userId;
+                    const currentStoreHasSeenTour = get().hasSeenTour;
+                    const tourState = mergeTourSeenState({
+                        backendHasSeenTour: Boolean(prefs.has_seen_tour),
+                        targetUserId: nextState.userId,
+                        currentStoreUserId,
+                        currentStoreHasSeenTour,
+                    });
+                    console.log('[TourDebug] restore_session merge', {
+                        userId: nextState.userId,
+                        backendHasSeenTour: Boolean(prefs.has_seen_tour),
+                        storeHasSeenTour: currentStoreHasSeenTour,
+                        currentStoreUserId,
+                        sameUser: tourState.sameUser,
+                        persistedTourSeen: tourState.persistedTourSeen,
+                        mergedHasSeenTour: tourState.hasSeenTour,
+                    });
+                    const reportState = tourState.sameUser
+                        ? {
+                            allEvaluations: get().allEvaluations,
+                            interviewSummary: get().interviewSummary,
+                            currentSessionId: get().currentSessionId,
+                            retryAttemptsByQuestion: get().retryAttemptsByQuestion,
+                            retrySubmitting: get().retrySubmitting,
+                            retryErrors: get().retryErrors,
+                            selectedSession: get().selectedSession,
+                            interviewHistory: get().interviewHistory,
+                        }
+                        : {
+                            allEvaluations: [],
+                            interviewSummary: null,
+                            currentSessionId: null,
+                            retryAttemptsByQuestion: {},
+                            retrySubmitting: {},
+                            retryErrors: {},
+                            selectedSession: null,
+                            interviewHistory: [],
+                        };
                     set({
                         ...nextState,
+                        hasSeenTour: tourState.hasSeenTour,
                         targetRole: prefs.target_role || '',
                         targetCompany: prefs.target_company || '',
                         jobDescription: prefs.job_description || '',
+                        savedResumeFilename: prefs.resume_filename || '',
+                        hasSavedResume: Boolean(prefs.has_resume || prefs.resume_text),
+                        micPermissionGranted: Boolean(prefs.mic_permission_granted),
                         questionCountOverride:
                             prefs.question_count_override !== undefined && prefs.question_count_override !== null
                                 ? Number(prefs.question_count_override)
@@ -368,14 +524,7 @@ const useInterviewStore = create(
                         totalQuestions: 0,
                         answerEvaluation: null,
                         coachingHint: null,
-                        allEvaluations: [],
-                        interviewSummary: null,
-                        currentSessionId: null,
-                        retryAttemptsByQuestion: {},
-                        retrySubmitting: {},
-                        retryErrors: {},
-                        interviewHistory: [],
-                        selectedSession: null,
+                        ...reportState,
                     });
                 });
 
@@ -767,6 +916,9 @@ const useInterviewStore = create(
                         targetRole: '',
                         targetCompany: '',
                         jobDescription: '',
+                        savedResumeFilename: '',
+                        hasSavedResume: false,
+                        micPermissionGranted: false,
                         questionCountOverride: null,
                         interviewerPersona: 'friendly',
                         piperStyle: 'interviewer',
@@ -812,6 +964,9 @@ const useInterviewStore = create(
                         targetRole: '',
                         targetCompany: '',
                         jobDescription: '',
+                        savedResumeFilename: '',
+                        hasSavedResume: false,
+                        micPermissionGranted: false,
                         questionCountOverride: null,
                         interviewerPersona: 'friendly',
                         piperStyle: 'interviewer',
@@ -832,12 +987,48 @@ const useInterviewStore = create(
                     get().addThinking('♻️ All data reset complete');
                 });
 
+                onSafe('preferences_saved', (data) => {
+                    if (!data?.success) {
+                        get().addThinking(`❌ ${data?.error || 'Failed to save preferences'}`);
+                        return;
+                    }
+
+                    set((state) => ({
+                        savedResumeFilename: data.resume_filename || state.savedResumeFilename || '',
+                        hasSavedResume: Boolean(data.has_resume || state.hasSavedResume),
+                    }));
+                });
+
                 onSafe('user_preferences', (data) => {
                     const prefs = data?.preferences || {};
+                    const currentStoreUserId = get().userId;
+                    const currentStoreHasSeenTour = get().hasSeenTour;
+                    const tourState = mergeTourSeenState({
+                        backendHasSeenTour: Boolean(prefs.has_seen_tour),
+                        targetUserId: currentStoreUserId,
+                        currentStoreUserId,
+                        currentStoreHasSeenTour,
+                    });
+                    const hasSeenTour = tourState.hasSeenTour;
+                    console.log('[TourDebug] user_preferences merge', {
+                        userId: currentStoreUserId,
+                        backendHasSeenTour: Boolean(prefs.has_seen_tour),
+                        persistedTourSeen: tourState.persistedTourSeen,
+                        storeHasSeenTour: currentStoreHasSeenTour,
+                        sameUser: tourState.sameUser,
+                        mergedHasSeenTour: hasSeenTour,
+                    });
+                    if (hasSeenTour) {
+                        writePersistedTourFlag(currentStoreUserId, true);
+                    }
                     set({
+                        hasSeenTour,
                         targetRole: prefs.target_role || '',
                         targetCompany: prefs.target_company || '',
                         jobDescription: prefs.job_description || '',
+                        savedResumeFilename: prefs.resume_filename || '',
+                        hasSavedResume: Boolean(prefs.has_resume || prefs.resume_text),
+                        micPermissionGranted: Boolean(prefs.mic_permission_granted),
                         questionCountOverride:
                             prefs.question_count_override !== undefined && prefs.question_count_override !== null
                                 ? Number(prefs.question_count_override)
@@ -946,8 +1137,9 @@ const useInterviewStore = create(
             },
 
             // Start career analysis
-            startCareerAnalysis: (resumeBase64, jobTitle, company = '', jobDescription = '') => {
+            startCareerAnalysis: (resumeBase64, jobTitle, company = '', jobDescription = '', resumeFilename = '') => {
                 console.log('🚀 Starting career analysis...', { jobTitle, company });
+                const hasIncomingResume = Boolean(String(resumeBase64 || '').trim());
 
                 // Clear old data before starting new analysis
                 get().resetForNewAnalysis();
@@ -956,12 +1148,19 @@ const useInterviewStore = create(
                 set({
                     appState: APP_STATES.ANALYZING,
                     jobDescription: jobDescription || '',
-                    analysisProgress: 'Uploading resume and preparing analysis...',
-                    analysisStageHistory: ['Uploading resume and preparing analysis...'],
+                    analysisProgress: hasIncomingResume
+                        ? 'Uploading resume and preparing analysis...'
+                        : 'Preparing analysis with your saved resume...',
+                    analysisStageHistory: [
+                        hasIncomingResume
+                            ? 'Uploading resume and preparing analysis...'
+                            : 'Preparing analysis with your saved resume...',
+                    ],
                 });
 
                 const payload = {
                     resume: resumeBase64,
+                    resume_filename: resumeFilename || undefined,
                     job_title: jobTitle,
                     company: company,
                     job_description: jobDescription
@@ -1118,6 +1317,9 @@ const useInterviewStore = create(
                 targetRole: '',
                 targetCompany: '',
                 jobDescription: '',
+                savedResumeFilename: '',
+                hasSavedResume: false,
+                micPermissionGranted: false,
                 questionCountOverride: null,
                 interviewerPersona: 'friendly',
                 piperStyle: 'interviewer',
@@ -1247,15 +1449,37 @@ const useInterviewStore = create(
                         const handleSuccess = (data) => {
                             socket.off('auth_success', handleSuccess);
                             socket.off('auth_error', handleError);
+                            const targetUserId = data.user.user_id;
+                            const currentStoreUserId = get().userId;
+                            const currentStoreHasSeenTour = get().hasSeenTour;
+                            const tourState = mergeTourSeenState({
+                                backendHasSeenTour: Boolean(data.preferences?.has_seen_tour),
+                                targetUserId,
+                                currentStoreUserId,
+                                currentStoreHasSeenTour,
+                            });
+                            console.log('[TourDebug] login handleSuccess merge', {
+                                userId: targetUserId,
+                                backendHasSeenTour: Boolean(data.preferences?.has_seen_tour),
+                                currentStoreUserId,
+                                storeHasSeenTour: currentStoreHasSeenTour,
+                                sameUser: tourState.sameUser,
+                                persistedTourSeen: tourState.persistedTourSeen,
+                                mergedHasSeenTour: tourState.hasSeenTour,
+                            });
+                            if (tourState.hasSeenTour) {
+                                writePersistedTourFlag(targetUserId, true);
+                            }
                             // Update state
                             set({
-                                userId: data.user.user_id,
+                                userId: targetUserId,
                                 userEmail: data.user.email,
                                 onboardingComplete: true,
+                                hasSeenTour: tourState.hasSeenTour,
                                 sessionToken: data.session_token || get().sessionToken
                             });
                             // Persist basic auth
-                            localStorage.setItem('user_id', data.user.user_id);
+                            localStorage.setItem('user_id', targetUserId);
                             localStorage.setItem('onboarding_complete', 'true');
                             if (data.session_token) {
                                 localStorage.setItem('session_token', data.session_token);
@@ -1314,15 +1538,22 @@ const useInterviewStore = create(
                         const handleSuccess = (data) => {
                             socket.off('auth_success', handleSuccess);
                             socket.off('auth_error', handleError);
+                            const targetUserId = data.user.user_id;
+                            writePersistedTourFlag(targetUserId, false);
+                            console.log('[TourDebug] signup handleSuccess reset', {
+                                userId: targetUserId,
+                                backendHasSeenTour: Boolean(data.preferences?.has_seen_tour),
+                            });
                             // Update state
                             set({
-                                userId: data.user.user_id,
+                                userId: targetUserId,
                                 userEmail: data.user.email,
                                 onboardingComplete: true,
+                                hasSeenTour: false,
                                 sessionToken: data.session_token || get().sessionToken
                             });
                             // Persist basic auth
-                            localStorage.setItem('user_id', data.user.user_id);
+                            localStorage.setItem('user_id', targetUserId);
                             localStorage.setItem('onboarding_complete', 'true');
                             localStorage.setItem('user_name', data.user.username);
                             if (data.session_token) {
@@ -1395,10 +1626,12 @@ const useInterviewStore = create(
                 set({
                     userId: null,
                     userEmail: null,
+                    isAdmin: false,
                     sessionToken: null,
                     socket: null,
                     isConnected: false,
                     onboardingComplete: false,
+                    hasSeenTour: false,
                     appState: APP_STATES.IDLE,
 
                     // Clear persisted analysis
@@ -1413,6 +1646,9 @@ const useInterviewStore = create(
                     targetRole: '',
                     targetCompany: '',
                     jobDescription: '',
+                    savedResumeFilename: '',
+                    hasSavedResume: false,
+                    micPermissionGranted: false,
                     questionCountOverride: null,
                     interviewerPersona: 'friendly',
                     piperStyle: 'interviewer',
@@ -1609,6 +1845,18 @@ const useInterviewStore = create(
                     if (Object.prototype.hasOwnProperty.call(preferences, 'job_description')) {
                         nextState.jobDescription = preferences.job_description || '';
                     }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'resume_filename')) {
+                        nextState.savedResumeFilename = preferences.resume_filename || '';
+                    }
+                    if (
+                        Object.prototype.hasOwnProperty.call(preferences, 'resume') ||
+                        Object.prototype.hasOwnProperty.call(preferences, 'resume_text')
+                    ) {
+                        nextState.hasSavedResume = Boolean(preferences.resume || preferences.resume_text || get().hasSavedResume);
+                    }
+                    if (Object.prototype.hasOwnProperty.call(preferences, 'mic_permission_granted')) {
+                        nextState.micPermissionGranted = Boolean(preferences.mic_permission_granted);
+                    }
                     if (Object.prototype.hasOwnProperty.call(preferences, 'question_count_override')) {
                         const raw = preferences.question_count_override;
                         nextState.questionCountOverride =
@@ -1790,6 +2038,7 @@ const useInterviewStore = create(
             partialize: (state) => ({
                 // Only persist these fields:
                 userId: state.userId,
+                isAdmin: state.isAdmin,
                 sessionToken: state.sessionToken,
                 appState: state.appState,
                 onboardingComplete: state.onboardingComplete,
@@ -1803,6 +2052,9 @@ const useInterviewStore = create(
                 targetRole: state.targetRole,
                 targetCompany: state.targetCompany,
                 jobDescription: state.jobDescription,
+                savedResumeFilename: state.savedResumeFilename,
+                hasSavedResume: state.hasSavedResume,
+                micPermissionGranted: state.micPermissionGranted,
                 questionCountOverride: state.questionCountOverride,
                 interviewerPersona: state.interviewerPersona,
                 piperStyle: state.piperStyle,
@@ -1813,6 +2065,13 @@ const useInterviewStore = create(
                 lastAnalysisTime: state.lastAnalysisTime,
                 suggestedSessions: state.suggestedSessions,
                 practicePlan: state.practicePlan,
+                interviewActive: state.interviewActive,
+                interviewMode: state.interviewMode,
+                interviewFeedbackTiming: state.interviewFeedbackTiming,
+                currentQuestion: state.currentQuestion,
+                questionNumber: state.questionNumber,
+                totalQuestions: state.totalQuestions,
+                coachingEnabled: state.coachingEnabled,
                 currentSessionId: state.currentSessionId,
                 selectedSession: state.selectedSession,
                 interviewSummary: state.interviewSummary,

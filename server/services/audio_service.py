@@ -116,7 +116,8 @@ class AudioProcessor:
     def __init__(self):
         self.model_id = WHISPER_MODEL_ID
         self.sample_rate = 16000  # Whisper expects 16kHz audio
-        self._mlx_lock = threading.Lock()
+        # Allow up to 2 concurrent STT calls on DGX Spark (enough VRAM).
+        self._stt_semaphore = threading.Semaphore(2)
     
     def transcribe_buffer(self, audio_data: bytes, sample_rate: int = 16000) -> str:
         """
@@ -145,7 +146,7 @@ class AudioProcessor:
         # no_speech_threshold=0.6 avoids transcribing silence as phantom words
         # Faster-whisper model access should remain serialized here.
         # Keep final-pass calls serialized to avoid backend crashes.
-        with self._mlx_lock:
+        with self._stt_semaphore:
             segments, _ = _whisper_model.transcribe(
                 audio_array,
                 language="en",
@@ -173,7 +174,7 @@ class AudioProcessor:
         """
         _ensure_whisper_loaded()
         
-        with self._mlx_lock:
+        with self._stt_semaphore:
             segments, _ = _whisper_model.transcribe(
                 file_path,
                 language="en",

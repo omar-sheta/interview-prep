@@ -20,6 +20,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore"
     )
+
+    ADMIN_EMAILS: Annotated[list[str], NoDecode] = []
     
     # Model paths
     MODEL_PATH: str = str(Path.home() / ".cache" / "huggingface")
@@ -51,8 +53,8 @@ class Settings(BaseSettings):
     # Reuse one shared model client instance for all flows (analysis/interview/coaching)
     # to avoid loading/seating multiple model sessions on constrained memory machines.
     LLM_SINGLE_INSTANCE: bool = True
-    # Max concurrent LLM requests in-process. Set to 1 to avoid multi-slot contention.
-    LLM_MAX_CONCURRENCY: int = 1
+    # Max concurrent LLM requests in-process. DGX Spark can handle parallel requests via LM Studio.
+    LLM_MAX_CONCURRENCY: int = 3
 
     # LM Studio / OpenAI-compatible generation guards.
     # Disables model "thinking" traces for Qwen chat templates when supported.
@@ -112,6 +114,25 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in raw.split(",") if origin.strip()]
         if isinstance(value, list):
             return [str(origin).strip() for origin in value if str(origin).strip()]
+        return value
+
+    @field_validator("ADMIN_EMAILS", mode="before")
+    @classmethod
+    def parse_admin_emails(cls, value):
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        return [str(item).strip().lower() for item in parsed if str(item).strip()]
+                except json.JSONDecodeError:
+                    pass
+            return [email.strip().lower() for email in raw.split(",") if email.strip()]
+        if isinstance(value, list):
+            return [str(email).strip().lower() for email in value if str(email).strip()]
         return value
     
     # Server configuration

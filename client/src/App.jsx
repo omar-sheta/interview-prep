@@ -10,10 +10,12 @@ import InterviewView from '@/components/InterviewView';
 import SessionReport from '@/components/SessionReport';
 import HistoryView from '@/components/HistoryView';
 import ConfigurationView from '@/components/ConfigurationView';
+import AdminView from '@/components/AdminView';
 // import OnboardingFlow from '@/components/OnboardingFlow'; // Deprecated
 import LoginScreen from '@/components/LoginScreen';
 import SignupScreen from '@/components/SignupScreen';
 import V0Setup from '@/components/V0Setup';
+import TourGuide from '@/components/TourGuide';
 import './index.css';
 
 // Route controller that handles navigation based on app state
@@ -26,6 +28,7 @@ function AppRouter() {
     appState,
     onboardingComplete,
     sessionToken,
+    isAdmin,
     targetRole,
     jobDescription,
     skillMapping,
@@ -98,6 +101,7 @@ function AppRouter() {
       <Route path="/session" element={showAuth ? <Navigate to="/login" replace /> : <InterviewView />} />
       <Route path="/report" element={showAuth ? <Navigate to="/login" replace /> : <SessionReport />} />
       <Route path="/history" element={showAuth ? <Navigate to="/login" replace /> : <HistoryView />} />
+      <Route path="/admin" element={showAuth ? <Navigate to="/login" replace /> : (isAdmin ? <AdminView /> : <Navigate to={defaultAuthedRoute} replace />)} />
       <Route path="/settings" element={showAuth ? <Navigate to="/login" replace /> : <Navigate to="/config" replace />} />
     </Routes>
   );
@@ -106,6 +110,7 @@ function AppRouter() {
 function App() {
   return (
     <BrowserRouter>
+      <TourGuide />
       <AppRouter />
     </BrowserRouter>
   );

@@ -16,7 +16,7 @@ except ImportError:
     mx = None  # MLX not available (non-Apple Silicon)
 import socketio
 import os
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.graph import END, START, StateGraph
@@ -30,6 +30,8 @@ from server.metrics import (
 from server.session import (
     SessionState,
     active_tasks,
+    disconnected_interview_cleanup_tasks,
+    disconnected_interview_sessions,
     pending_disconnect_cancels,
     sessions,
     sid_to_user,
@@ -71,6 +73,16 @@ def _public_user_id(session: SessionState) -> str:
     return session.user_id if session.is_authenticated else "anonymous"
 
 
+def _is_admin_user(user: Optional[dict]) -> bool:
+    """Return whether a verified user is allowed to access admin features."""
+    if not user:
+        return False
+    email = str(user.get("email") or "").strip().lower()
+    if not email:
+        return False
+    return email in set(settings.ADMIN_EMAILS or [])
+
+
 def _safe_user_payload(user: Optional[dict]) -> dict:
     """Strip sensitive user fields before sending to client."""
     if not user:
@@ -82,6 +94,7 @@ def _safe_user_payload(user: Optional[dict]) -> dict:
         "created_at": user.get("created_at"),
         "last_login": user.get("last_login"),
         "profile": user.get("profile", {}),
+        "is_admin": _is_admin_user(user),
     }
 
 
@@ -219,6 +232,16 @@ async def _get_authenticated_rest_user_id(
     return user_id
 
 
+async def _require_admin_rest_user(
+    auth_user_id: str = Depends(_get_authenticated_rest_user_id),
+):
+    """Require a valid authenticated session that belongs to an allowlisted admin email."""
+    user = get_user_db().get_user(auth_user_id)
+    if not _is_admin_user(user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
 async def _require_socket_auth(sid: str) -> Optional[SessionState]:
     """Ensure socket request belongs to an authenticated session."""
     session = sessions.get(sid)
@@ -241,7 +264,7 @@ async def _emit_transcript_update(session: SessionState, is_final: bool = False)
             "is_final": is_final,
             "user_id": session.user_id,
         },
-        room=str(session.user_id),
+        room=session.sid,
     )
 
 
@@ -299,7 +322,27 @@ async def _maybe_emit_coaching_hint(session: SessionState, current_time: float, 
                 payload = {"message": hint_message, "level": hint_level, "user_id": session.user_id}
                 if isinstance(hint, dict):
                     payload.update({k: v for k, v in hint.items() if k != "message"})
-                await sio.emit("coaching_hint", payload, room=str(session.user_id))
+                await sio.emit("coaching_hint", payload, room=session.sid)
+                try:
+                    user_db = get_user_db()
+                    user_db.log_session_event(
+                        user_id=session.user_id,
+                        session_id=getattr(session, "db_session_id", None),
+                        auth_session_fingerprint=user_db.get_session_token_fingerprint(
+                            getattr(session, "session_token", None)
+                        ),
+                        sid=session.sid,
+                        event_type="hint_sent",
+                        event_source="coaching",
+                        question_number=session.current_question_index + 1,
+                        details={
+                            "hint_origin": "silence_detector",
+                            "hint_level": hint_level,
+                            "message": hint_message,
+                        },
+                    )
+                except Exception as log_exc:
+                    print(f"⚠️ Failed logging coaching hint: {log_exc}")
         except Exception as e:
             print(f"⚠️ Hint error: {e}")
 
@@ -493,8 +536,13 @@ _rest_routes = register_rest_routes(
         build_sanity_check_graph=lambda: build_sanity_check_graph(),
         check_qdrant_status=lambda: check_qdrant_status(),
         get_authenticated_rest_user_id=_get_authenticated_rest_user_id,
+        require_admin_rest_user=_require_admin_rest_user,
         get_user_db=lambda: get_user_db(),
         safe_user_payload=lambda user: _safe_user_payload(user),
+        sessions=sessions,
+        user_connection_count=user_connection_count,
+        active_tasks=active_tasks,
+        feedback_metrics=feedback_metrics,
     ),
 )
 health_check = _rest_routes.health_check
@@ -504,6 +552,8 @@ get_user_sessions_api = _rest_routes.get_user_sessions_api
 get_session_details_api = _rest_routes.get_session_details_api
 export_session_pdf = _rest_routes.export_session_pdf
 get_career_analyses_api = _rest_routes.get_career_analyses_api
+get_admin_overview_api = _rest_routes.get_admin_overview_api
+cancel_admin_task_api = _rest_routes.cancel_admin_task_api
 
 _auth_events = register_auth_events(
     sio,
@@ -513,6 +563,9 @@ _auth_events = register_auth_events(
         sessions=sessions,
         sid_to_user=sid_to_user,
         user_connection_count=user_connection_count,
+        disconnected_interview_sessions=disconnected_interview_sessions,
+        disconnected_interview_cleanup_tasks=disconnected_interview_cleanup_tasks,
+        reconnect_grace_sec=DISCONNECT_TASK_CANCEL_GRACE_SEC,
         get_user_db=lambda: get_user_db(),
         public_user_id=lambda session: _public_user_id(session),
         safe_user_payload=lambda user: _safe_user_payload(user),
@@ -661,6 +714,7 @@ _audio_events = register_audio_events(
     sio,
     SimpleNamespace(
         sessions=sessions,
+        get_user_db=lambda: get_user_db(),
         get_audio_processor=lambda: get_audio_processor(),
         get_streaming_audio_processor=lambda: get_streaming_audio_processor(),
         get_chat_model=lambda: get_chat_model(),

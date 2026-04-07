@@ -1,13 +1,28 @@
 """REST endpoint registration for the interview server."""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from fastapi import Depends, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 
 def register_rest_routes(fast_app, deps):
     """Register REST endpoints and return the bound handler functions."""
+
+    def _admin_response(payload, status_code: int = 200):
+        return JSONResponse(
+            payload,
+            status_code=status_code,
+            headers={
+                "Cache-Control": "no-store, private",
+                "Pragma": "no-cache",
+                "X-Robots-Tag": "noindex, nofollow",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
 
     async def health_check():
         """Health check endpoint with LangGraph sanity verification."""
@@ -64,6 +79,34 @@ def register_rest_routes(fast_app, deps):
         user_db = deps.get_user_db()
         sessions_list = user_db.get_session_history(user_id, limit)
         return {"sessions": sessions_list}
+
+    async def get_login_sessions_api(
+        user_id: str,
+        limit: int = 20,
+        auth_user_id: str = Depends(deps.get_authenticated_rest_user_id),
+    ):
+        """Get recent login/auth sessions for a user with timestamps."""
+        if user_id != auth_user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        user_db = deps.get_user_db()
+        login_sessions = user_db.get_login_session_history(user_id, limit)
+        return {"login_sessions": login_sessions}
+
+    async def get_login_session_details_api(
+        user_id: str,
+        session_fingerprint: str,
+        auth_user_id: str = Depends(deps.get_authenticated_rest_user_id),
+    ):
+        """Get the full event timeline for a specific login/auth session."""
+        if user_id != auth_user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        user_db = deps.get_user_db()
+        session_details = user_db.get_login_session_details(user_id, session_fingerprint)
+        if not session_details:
+            raise HTTPException(status_code=404, detail="Login session not found")
+        return session_details
 
     async def get_session_details_api(
         session_id: str,
@@ -499,20 +542,147 @@ def register_rest_routes(fast_app, deps):
         analyses = user_db.get_career_analyses(user_id, limit)
         return {"analyses": analyses}
 
+    async def get_admin_overview_api(
+        admin_user: dict = Depends(deps.require_admin_rest_user),
+    ):
+        """Return a tightly scoped admin overview for live demo operations."""
+        user_db = deps.get_user_db()
+        live_user_ids = sorted(
+            user_id
+            for user_id, count in (deps.user_connection_count or {}).items()
+            if count > 0 and user_id and not str(user_id).startswith("anon_")
+        )
+
+        live_users = []
+        for user_id in live_user_ids:
+            user = user_db.get_user(user_id)
+            if not user:
+                continue
+            user_sessions = [
+                session
+                for session in (deps.sessions or {}).values()
+                if getattr(session, "user_id", None) == user_id and getattr(session, "is_authenticated", False)
+            ]
+            live_users.append(
+                {
+                    "user_id": user_id,
+                    "email": user.get("email"),
+                    "username": user.get("username"),
+                    "connections": int((deps.user_connection_count or {}).get(user_id, 0) or 0),
+                    "active_interview": any(bool(getattr(session, "interview_active", False)) for session in user_sessions),
+                    "active_analysis_task": bool(
+                        (deps.active_tasks or {}).get(user_id)
+                        and not (deps.active_tasks or {})[user_id].done()
+                    ),
+                    "current_question": max(
+                        (
+                            int(getattr(session, "current_question_index", 0) or 0) + 1
+                            for session in user_sessions
+                            if bool(getattr(session, "interview_active", False))
+                        ),
+                        default=0,
+                    ),
+                }
+            )
+
+        active_tasks = []
+        for user_id, task in sorted((deps.active_tasks or {}).items()):
+            user = user_db.get_user(user_id)
+            active_tasks.append(
+                {
+                    "user_id": user_id,
+                    "email": user.get("email") if user else None,
+                    "username": user.get("username") if user else None,
+                    "done": bool(task.done()) if task else True,
+                    "cancelled": bool(task.cancelled()) if task and task.done() else False,
+                    "connections": int((deps.user_connection_count or {}).get(user_id, 0) or 0),
+                }
+            )
+
+        payload = {
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "admin": {
+                "user_id": admin_user.get("user_id"),
+                "email": admin_user.get("email"),
+            },
+            "counts": {
+                "registered_users": user_db.count_users(),
+                "live_users": len(live_users),
+                "live_connections": sum(int(count or 0) for count in (deps.user_connection_count or {}).values()),
+                "socket_sessions": len(deps.sessions or {}),
+                "authenticated_socket_sessions": sum(
+                    1 for session in (deps.sessions or {}).values() if bool(getattr(session, "is_authenticated", False))
+                ),
+                "active_analysis_tasks": sum(
+                    1 for task in (deps.active_tasks or {}).values() if task and not task.done()
+                ),
+                "active_interviews": sum(
+                    1
+                    for session in (deps.sessions or {}).values()
+                    if bool(getattr(session, "is_authenticated", False))
+                    and bool(getattr(session, "interview_active", False))
+                ),
+            },
+            "live_users": live_users,
+            "active_tasks": active_tasks,
+            "feedback_metrics": dict(deps.feedback_metrics or {}),
+        }
+        return _admin_response(payload)
+
+    async def cancel_admin_task_api(
+        user_id: str,
+        admin_user: dict = Depends(deps.require_admin_rest_user),
+    ):
+        """Cancel an active analysis task for a specific user."""
+        task = (deps.active_tasks or {}).get(user_id)
+        if not task or task.done():
+            return _admin_response(
+                {
+                    "success": True,
+                    "cancelled": False,
+                    "message": "No active task found",
+                    "user_id": user_id,
+                    "requested_by": admin_user.get("email"),
+                }
+            )
+
+        task.cancel()
+        return _admin_response(
+            {
+                "success": True,
+                "cancelled": True,
+                "message": "Cancellation requested",
+                "user_id": user_id,
+                "requested_by": admin_user.get("email"),
+            }
+        )
+
     fast_app.add_api_route("/health", health_check, methods=["GET"])
     fast_app.add_api_route("/", root, methods=["GET"])
     fast_app.add_api_route("/api/user/{user_id}/progress", get_user_progress_api, methods=["GET"])
     fast_app.add_api_route("/api/user/{user_id}/sessions", get_user_sessions_api, methods=["GET"])
+    fast_app.add_api_route("/api/user/{user_id}/login-sessions", get_login_sessions_api, methods=["GET"])
+    fast_app.add_api_route(
+        "/api/user/{user_id}/login-sessions/{session_fingerprint}",
+        get_login_session_details_api,
+        methods=["GET"],
+    )
     fast_app.add_api_route("/api/session/{session_id}", get_session_details_api, methods=["GET"])
     fast_app.add_api_route("/api/session/{session_id}/export", export_session_pdf, methods=["GET"])
     fast_app.add_api_route("/api/user/{user_id}/career_analyses", get_career_analyses_api, methods=["GET"])
+    fast_app.add_api_route("/api/admin/overview", get_admin_overview_api, methods=["GET"])
+    fast_app.add_api_route("/api/admin/tasks/{user_id}/cancel", cancel_admin_task_api, methods=["POST"])
 
     return SimpleNamespace(
         health_check=health_check,
         root=root,
         get_user_progress_api=get_user_progress_api,
         get_user_sessions_api=get_user_sessions_api,
+        get_login_sessions_api=get_login_sessions_api,
+        get_login_session_details_api=get_login_session_details_api,
         get_session_details_api=get_session_details_api,
         export_session_pdf=export_session_pdf,
         get_career_analyses_api=get_career_analyses_api,
+        get_admin_overview_api=get_admin_overview_api,
+        cancel_admin_task_api=cancel_admin_task_api,
     )
