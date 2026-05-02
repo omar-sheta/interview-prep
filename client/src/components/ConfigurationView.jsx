@@ -47,6 +47,7 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
+import SectionCard from '@/components/ui/SectionCard';
 import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
 import {
     PERSONA_OPTIONS,
@@ -545,40 +546,57 @@ export default function ConfigurationView() {
                     onQuickAction={() => openQuickDialog('mixed')}
                 />
                 <Container maxWidth="lg" sx={{ pt: { xs: 2.5, md: 4 } }}>
-                    <Stack spacing={1.8}>
-                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
-                            <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1.2} sx={{ mb: 1.2 }}>
-                                <Box>
-                                    <Typography variant="h5">Profile</Typography>
-                                </Box>
-                                <Chip 
-                                    size="small" 
-                                    label={`Readiness ${readinessPercent}%`} 
-                                    sx={{ 
-                                        fontWeight: 600, 
-                                        background: 'linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15))',
-                                        color: '#a78bfa',
-                                        borderColor: 'rgba(139,92,246,0.3)',
-                                        border: '1px solid'
-                                    }} 
-                                />
-                            </Stack>
-                            <Divider sx={{ mb: 1.5 }} />
-
-                            <Stack spacing={1.5}>
-                                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1.25fr 1fr 0.7fr' }, gap: 1.2 }}>
+                    <Stack spacing={{ xs: 2.4, md: 3 }}>
+                        <SectionCard
+                            eyebrow="Profile"
+                            title="Your Interview Workspace"
+                            description="Keep the essentials visible: target role, job description, resume, and interview defaults. Advanced audio controls stay tucked away until you need them."
+                            action={(
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', md: 'auto' } }}>
+                                    <Chip
+                                        size="small"
+                                        label={`Readiness ${readinessPercent}%`}
+                                        sx={{
+                                            fontWeight: 700,
+                                            alignSelf: { xs: 'stretch', sm: 'center' },
+                                            justifyContent: 'center',
+                                            background: 'linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15))',
+                                            color: '#a78bfa',
+                                            borderColor: 'rgba(139,92,246,0.3)',
+                                            border: '1px solid',
+                                        }}
+                                    />
+                                    <Button variant="outlined" startIcon={<Save />} onClick={saveConfig} disabled={isAnalyzing}>
+                                        Save
+                                    </Button>
+                                    <Button
+                                        variant="contained"
+                                        startIcon={isAnalyzing ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
+                                        onClick={runAnalysis}
+                                        disabled={isAnalyzing}
+                                        sx={{
+                                            background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                                            '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
+                                            boxShadow: '0 4px 14px 0 rgba(99, 102, 241, 0.28)',
+                                        }}
+                                    >
+                                        {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
+                                    </Button>
+                                </Stack>
+                            )}
+                        >
+                            <Stack spacing={{ xs: 2, md: 2.4 }}>
+                                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1.25fr 1fr 0.72fr' }, gap: { xs: 1.4, md: 1.8 } }}>
                                     <TextField
                                         label="Target Role"
                                         value={jobTitle}
                                         onChange={(e) => setJobTitle(e.target.value)}
-                                        size="small"
                                         InputLabelProps={{ shrink: true }}
                                     />
                                     <TextField
                                         label="Target Company"
                                         value={company}
                                         onChange={(e) => setCompany(e.target.value)}
-                                        size="small"
                                         InputLabelProps={{ shrink: true }}
                                     />
                                     <TextField
@@ -587,7 +605,6 @@ export default function ConfigurationView() {
                                         value={questionCount}
                                         onChange={(e) => setQuestionCount(e.target.value)}
                                         inputProps={{ min: 1, max: 12 }}
-                                        size="small"
                                         InputLabelProps={{ shrink: true }}
                                     />
                                 </Box>
@@ -595,24 +612,22 @@ export default function ConfigurationView() {
                                 <TextField
                                     label="Job Description"
                                     multiline
-                                    rows={4}
+                                    rows={6}
                                     value={jobDescription}
                                     onChange={(e) => setJobDescription(e.target.value)}
                                     inputProps={{ style: { overflowY: 'auto' } }}
                                     InputLabelProps={{ shrink: true }}
                                 />
 
-                                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '0.88fr 1.12fr' }, gap: 1.3, alignItems: 'start' }}>
-                                    <Paper variant="outlined" sx={{ borderRadius: 2.4, overflow: 'hidden' }}>
-                                        <Stack spacing={1} sx={{ px: 1.4, py: 1.4 }}>
+                                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '0.92fr 1.08fr' }, gap: { xs: 1.6, md: 2 }, alignItems: 'start' }}>
+                                    <Paper variant="outlined" sx={{ borderRadius: 3, overflow: 'hidden' }}>
+                                        <Stack spacing={1.4} sx={{ p: { xs: 1.6, md: 2 } }}>
                                             <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
                                                 Upload Resume
                                             </Typography>
                                             <Box
                                                 sx={{
-                                                    minHeight: 180,
-                                                    border: '1px dashed rgba(249,115,22,0.35)',
-                                                    borderRadius: 2,
+                                                    borderRadius: 3,
                                                     overflow: 'hidden',
                                                 }}
                                             >
@@ -634,10 +649,13 @@ export default function ConfigurationView() {
                                         </Stack>
                                     </Paper>
 
-                                    <Paper variant="outlined" sx={{ p: 1.3, borderRadius: 2.4 }}>
-                                        <Stack spacing={1.15}>
+                                    <Paper variant="outlined" sx={{ p: { xs: 1.6, md: 2 }, borderRadius: 3 }}>
+                                        <Stack spacing={1.7}>
                                             <Box>
                                                 <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>Interview Defaults</Typography>
+                                                <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.35 }}>
+                                                    Defaults apply to every new session unless you change them here.
+                                                </Typography>
                                             </Box>
 
                                             <FormControl fullWidth size="small">
@@ -803,37 +821,18 @@ export default function ConfigurationView() {
                                 <Typography variant="caption" sx={{ color: 'text.secondary' }}>
                                     {analysisProgress || ''}
                                 </Typography>
-                                <Box sx={{ display: 'flex', gap: 2.5, alignItems: 'center' }}>
-                                    <Button
-                                        variant="text"
-                                        color="error"
-                                        size="small"
-                                        onClick={() => setClearDialogOpen(true)}
-                                        disabled={isAnalyzing}
-                                    >
-                                        Clear
-                                    </Button>
-                                    <Stack direction="row" spacing={1.5}>
-                                        <Button variant="outlined" startIcon={<Save />} onClick={saveConfig} disabled={isAnalyzing}>
-                                            Save
-                                        </Button>
-                                        <Button
-                                            variant="contained"
-                                            startIcon={isAnalyzing ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
-                                            onClick={runAnalysis}
-                                            disabled={isAnalyzing}
-                                            sx={{
-                                                background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
-                                                '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
-                                                boxShadow: '0 4px 14px 0 rgba(99, 102, 241, 0.39)',
-                                            }}
-                                        >
-                                            {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
-                                        </Button>
-                                    </Stack>
-                                </Box>
+                                <Button
+                                    variant="text"
+                                    color="error"
+                                    size="small"
+                                    onClick={() => setClearDialogOpen(true)}
+                                    disabled={isAnalyzing}
+                                    sx={{ alignSelf: { xs: 'flex-start', sm: 'center' } }}
+                                >
+                                    Clear Profile
+                                </Button>
                             </Stack>
-                        </Paper>
+                        </SectionCard>
 
                         {isAnalyzing && (
                             <Paper sx={{ p: { xs: 1.6, md: 2 } }}>

@@ -35,6 +35,7 @@ export default function HiveTopNav({
 
     useEffect(() => {
         if (!shouldConfirmExit && pendingAction) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- Leaving the guarded session clears the pending navigation confirmation.
             setPendingAction(null);
         }
     }, [shouldConfirmExit, pendingAction]);

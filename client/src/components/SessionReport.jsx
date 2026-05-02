@@ -299,7 +299,7 @@ export default function SessionReport() {
     const theme = useMemo(() => createHiveTheme(darkMode ? 'dark' : 'light'), [darkMode]);
     const reportSessionId = String(currentSessionId || selectedSession?.session_id || '').trim() || null;
 
-    const summary = interviewSummary || {};
+    const summary = useMemo(() => interviewSummary || {}, [interviewSummary]);
     const hasSummaryData = Object.keys(summary).length > 0;
     const hasEvaluationData = Array.isArray(allEvaluations) && allEvaluations.length > 0;
     const questions = useMemo(
@@ -371,9 +371,12 @@ export default function SessionReport() {
         return Object.fromEntries(dims.map((d) => [d, round1(totals[d] / scorableQuestions.length)]));
     }, [scorableQuestions]);
 
-    const summaryBreakdown = (summary.overall_breakdown && typeof summary.overall_breakdown === 'object')
-        ? summary.overall_breakdown
-        : ((summary.score_breakdown && typeof summary.score_breakdown === 'object') ? summary.score_breakdown : {});
+    const summaryBreakdown = useMemo(
+        () => (summary.overall_breakdown && typeof summary.overall_breakdown === 'object')
+            ? summary.overall_breakdown
+            : ((summary.score_breakdown && typeof summary.score_breakdown === 'object') ? summary.score_breakdown : {}),
+        [summary.overall_breakdown, summary.score_breakdown]
+    );
 
     const overallBreakdown = useMemo(
         () => {

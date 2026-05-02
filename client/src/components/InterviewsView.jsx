@@ -30,6 +30,7 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
+import SectionCard from '@/components/ui/SectionCard';
 import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
 import {
     PERSONA_OPTIONS,
@@ -196,6 +197,7 @@ export default function InterviewsView() {
     const hasConfiguration = String(targetRole || '').trim() && String(jobDescription || '').trim();
     const questionCount = normalizeQuestionCount(questionCountOverride || 5);
     const activePersona = PERSONA_OPTIONS.find((persona) => persona.id === selectedPersona) || PERSONA_OPTIONS[0];
+    const recommendedType = INTERVIEW_TYPES.find((type) => type.id === 'mixed') || INTERVIEW_TYPES[0];
 
     const handlePersonaSelect = (personaId) => {
         const normalized = normalizeQuickPersona(personaId);
@@ -274,45 +276,67 @@ export default function InterviewsView() {
                 />
 
                 <Container maxWidth="lg" sx={{ pt: { xs: 3.5, sm: 3, md: 4 } }}>
-                    <Stack spacing={2.2}>
-                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
-                            <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1.2}>
+                    <Stack spacing={{ xs: 2.4, md: 3 }}>
+                        <SectionCard
+                            eyebrow="Practice Console"
+                            title="Choose a session and start talking."
+                            description="Keep the setup light: use your analyzed profile for targeted practice, or launch a quick mock interview when you just want reps."
+                            sx={{
+                                background: darkMode
+                                    ? 'linear-gradient(135deg, rgba(245,158,11,0.16), rgba(23,23,23,0.94) 48%, rgba(99,102,241,0.11))'
+                                    : 'linear-gradient(135deg, rgba(255,247,237,0.96), rgba(255,255,255,0.96) 52%, rgba(238,242,255,0.86))',
+                            }}
+                            action={(
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', md: 'auto' } }}>
+                                    <Button
+                                        variant="contained"
+                                        startIcon={<PlayArrow />}
+                                        onClick={() => hasConfiguration ? handleStart(recommendedType) : openQuickDialog('mixed')}
+                                        disabled={isAnalyzing || startingType === recommendedType.id}
+                                        fullWidth
+                                    >
+                                        {hasConfiguration ? 'Start Recommended' : 'Start Quick Mock'}
+                                    </Button>
+                                    <Button variant="outlined" onClick={() => navigate('/config')} fullWidth>
+                                        Edit Profile
+                                    </Button>
+                                </Stack>
+                            )}
+                        >
+                            <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={2}>
                                 <Box>
-                                    <Typography variant="h4">Choose Interview Type</Typography>
-                                    <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                        Select the exact interview style you want to practice.
+                                    <Typography variant="subtitle2" sx={{ color: 'text.secondary', mb: 0.7 }}>
+                                        Current profile
+                                    </Typography>
+                                    <Typography variant="h6">
+                                        {targetRole || 'No target role yet'} {targetCompany ? `at ${targetCompany}` : ''}
+                                    </Typography>
+                                    <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5, maxWidth: 620 }}>
+                                        {hasConfiguration
+                                            ? `${questionCount} questions with the ${activePersona.label.toLowerCase()} persona.`
+                                            : 'You can still launch a quick mock interview, then come back to add resume-based analysis.'}
                                     </Typography>
                                 </Box>
                                 <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                                     <Chip size="small" label={isConnected ? 'Connected' : 'Connecting'} color={isConnected ? 'success' : 'default'} variant="outlined" />
                                     <Chip size="small" label={readinessPercent > 0 ? `Readiness ${readinessPercent}%` : 'Quick Start'} color={readinessPercent > 0 ? 'default' : 'info'} variant="outlined" />
                                     <Chip size="small" label={`${questionCount} questions`} variant="outlined" />
-                                    <Chip size="small" label="Mock Mode" variant="outlined" />
                                     <Chip size="small" label={activePersona.label} variant="outlined" />
                                 </Stack>
                             </Stack>
-                            <Divider sx={{ my: 1.4 }} />
-                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                Profile: {targetRole || 'Not set'} {targetCompany ? `• ${targetCompany}` : ''}
-                            </Typography>
                             {analysisProgress && (
-                                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 1.6 }}>
                                     {analysisProgress}
                                 </Typography>
                             )}
-                        </Paper>
+                        </SectionCard>
 
-                        <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
-                            <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1.2} sx={{ mb: 1.2 }}>
-                                <Box>
-                                    <Typography variant="h6">Interviewer Persona</Typography>
-                                    <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                                        Choose how the interviewer behaves during the session.
-                                    </Typography>
-                                </Box>
-                                <Chip size="small" label={`Active: ${activePersona.label}`} color="secondary" variant="outlined" />
-                            </Stack>
-                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 0.9 }}>
+                        <SectionCard
+                            title="Interviewer Style"
+                            description="Pick the vibe once; every session below uses it."
+                            action={<Chip size="small" label={`Active: ${activePersona.label}`} color="secondary" variant="outlined" />}
+                        >
+                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.2 }}>
                                 {PERSONA_OPTIONS.map((persona) => {
                                     const Icon = persona.icon;
                                     const selected = selectedPersona === persona.id;
@@ -329,12 +353,18 @@ export default function InterviewsView() {
                                                 }
                                             }}
                                             sx={{
-                                                p: 1.2,
+                                                p: 1.5,
+                                                borderRadius: 3,
                                                 cursor: 'pointer',
                                                 border: selected
                                                     ? '1px solid rgba(245, 158, 11, 0.72)'
                                                     : '1px solid rgba(245, 158, 11, 0.2)',
                                                 boxShadow: selected ? '0 0 0 1px rgba(245,158,11,0.25)' : undefined,
+                                                transition: 'transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease',
+                                                '&:hover': {
+                                                    transform: 'translateY(-1px)',
+                                                    borderColor: 'rgba(245, 158, 11, 0.5)',
+                                                },
                                             }}
                                         >
                                             <Stack direction="row" spacing={1} alignItems="center">
@@ -352,20 +382,18 @@ export default function InterviewsView() {
                                     );
                                 })}
                             </Box>
-                        </Paper>
+                        </SectionCard>
 
                         {!hasConfiguration && (
-                            <Paper sx={{ p: 2 }}>
-                                <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-                                    Full Interview (with Analysis)
-                                </Typography>
-                                <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.2 }}>
-                                    For personalized questions based on your resume, set up your profile and run analysis first.
-                                </Typography>
-                                <Button variant="outlined" endIcon={<ArrowForward />} onClick={() => navigate('/config')}>
-                                    Open Profile
-                                </Button>
-                            </Paper>
+                            <SectionCard
+                                title="Want personalized questions?"
+                                description="Add your resume and job description once, then BeePrepared can generate targeted sessions from your actual gaps."
+                                action={(
+                                    <Button variant="outlined" endIcon={<ArrowForward />} onClick={() => navigate('/config')}>
+                                        Open Profile
+                                    </Button>
+                                )}
+                            />
                         )}
 
                         {error && (
@@ -375,7 +403,7 @@ export default function InterviewsView() {
                         )}
 
                         {hasConfiguration && (
-                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.4 }}>
+                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.8 }}>
                                 {INTERVIEW_TYPES.map((type) => {
                                     const quickTypeMatch = QUICK_INTERVIEW_TYPES.find((item) => item.id === type.id);
                                     const Icon = quickTypeMatch?.icon;
@@ -383,32 +411,64 @@ export default function InterviewsView() {
                                     return (
                                         <Paper
                                             key={type.id}
+                                            role="button"
+                                            tabIndex={0}
+                                            onClick={() => !isStarting && !isAnalyzing && handleStart(type)}
+                                            onKeyDown={(event) => {
+                                                if ((event.key === 'Enter' || event.key === ' ') && !isStarting && !isAnalyzing) {
+                                                    event.preventDefault();
+                                                    handleStart(type);
+                                                }
+                                            }}
                                             sx={{
-                                                p: 2,
+                                                p: { xs: 2.2, md: 2.6 },
+                                                minHeight: 236,
+                                                display: 'flex',
+                                                flexDirection: 'column',
+                                                justifyContent: 'space-between',
+                                                cursor: isStarting || isAnalyzing ? 'default' : 'pointer',
                                                 border: '1px solid rgba(249, 115, 22, 0.18)',
                                                 bgcolor: darkMode ? 'rgba(249, 115, 22, 0.06)' : 'rgba(249, 115, 22, 0.03)',
+                                                transition: 'transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease',
+                                                '&:hover': isStarting || isAnalyzing ? {} : {
+                                                    transform: 'translateY(-3px)',
+                                                    borderColor: 'rgba(249, 115, 22, 0.42)',
+                                                    boxShadow: darkMode
+                                                        ? '0 18px 44px rgba(0,0,0,0.32)'
+                                                        : '0 18px 44px rgba(124,45,18,0.08)',
+                                                },
                                             }}
                                         >
-                                            <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.8 }}>
-                                                {Icon ? <Icon sx={{ color: 'primary.main' }} /> : null}
-                                                <Typography variant="h6">{type.title}</Typography>
+                                            <Box>
+                                                <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+                                                    {Icon ? <Icon sx={{ color: 'primary.main' }} /> : null}
+                                                    <Typography variant="h6">{type.title}</Typography>
+                                                </Stack>
+                                                <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.6 }}>
+                                                    {type.description}
+                                                </Typography>
+                                                <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mb: 1.8 }}>
+                                                    {type.tags.map((tag) => (
+                                                        <Chip key={`${type.id}-${tag}`} size="small" label={tag} variant="outlined" />
+                                                    ))}
+                                                </Stack>
+                                            </Box>
+                                            <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                                                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                                                    Click card or button
+                                                </Typography>
+                                                <Button
+                                                    variant="contained"
+                                                    startIcon={isStarting ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
+                                                    onClick={(event) => {
+                                                        event.stopPropagation();
+                                                        handleStart(type);
+                                                    }}
+                                                    disabled={isStarting || isAnalyzing}
+                                                >
+                                                    {isStarting ? 'Starting...' : 'Start'}
+                                                </Button>
                                             </Stack>
-                                            <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.2 }}>
-                                                {type.description}
-                                            </Typography>
-                                            <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mb: 1.4 }}>
-                                                {type.tags.map((tag) => (
-                                                    <Chip key={`${type.id}-${tag}`} size="small" label={tag} variant="outlined" />
-                                                ))}
-                                            </Stack>
-                                            <Button
-                                                variant="contained"
-                                                startIcon={isStarting ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
-                                                onClick={() => handleStart(type)}
-                                                disabled={isStarting || isAnalyzing}
-                                            >
-                                                {isStarting ? 'Starting...' : 'Start Interview'}
-                                            </Button>
                                         </Paper>
                                     );
                                 })}

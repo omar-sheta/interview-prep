@@ -594,6 +594,7 @@ export default function InterviewView() {
         console.log('[TTS] Attempting playback, audio length:', nextAudio.length);
 
         let isMounted = true;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- Browser audio playback updates UI flags after async media APIs respond.
         playQuestionAudio(nextAudio).then((started) => {
             if (!isMounted) return;
             if (started) {
@@ -617,6 +618,7 @@ export default function InterviewView() {
         if (!nextChunk) return;
 
         let isMounted = true;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- Streaming audio playback updates UI flags after async media APIs respond.
         playQuestionStreamChunk(nextChunk).then((started) => {
             if (!isMounted) return;
             if (started) {
@@ -672,6 +674,7 @@ export default function InterviewView() {
 
     useEffect(() => {
         if (coachingEnabled) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect -- Coaching mode owns whether the tips panel is visible.
             setShowTipsPanel((prev) => prev || true);
             return;
         }
@@ -691,6 +694,7 @@ export default function InterviewView() {
     }, [coachingEnabled, questionNumber, requestHint, showTipsPanel]);
 
     useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- A new question invalidates queued audio/draft state from the previous question.
         setPendingQuestionAudio(null);
         setPendingQuestionStreamChunk(null);
         stopQuestionAudio();

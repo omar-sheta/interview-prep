@@ -42,6 +42,7 @@ export default function InterviewReadinessDialog({
         if (!open) return undefined;
 
         let active = true;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- Opening the dialog resets transient readiness checks.
         setAudioStatus('unknown');
         setMessage('');
 

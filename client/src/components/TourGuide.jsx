@@ -34,6 +34,7 @@ export default function TourGuide() {
         previousUserId.current = normalizedUserId;
         started.current = false;
         persistedForCurrentRun.current = false;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- A changed user must cancel any tour started for the previous account.
         setRun(false);
     }, [userId]);
 
@@ -43,6 +44,7 @@ export default function TourGuide() {
         console.log('[TourDebug] onboarding reset', { onboardingComplete });
         started.current = false;
         persistedForCurrentRun.current = false;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- Incomplete onboarding should not show the tour.
         setRun(false);
     }, [onboardingComplete]);
 
@@ -82,7 +84,7 @@ export default function TourGuide() {
         console.log('[TourDebug] starting tour', { userId });
         started.current = true;
         setTimeout(() => setRun(true), 500);
-    }, [onboardingComplete, skip, userId]);
+    }, [hasSeenTour, onboardingComplete, skip, userId]);
 
     const handleJoyrideCallback = (data) => {
         console.log('[TourDebug] joyride callback', data);
