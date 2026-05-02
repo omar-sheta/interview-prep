@@ -36,8 +36,6 @@ def register_rest_routes(fast_app, deps):
         return {
             "status": "ready" if langgraph_ok else "degraded",
             "agent_engine": "langgraph",
-            "mlx_gpu": deps.mx.metal.is_available() if deps.mx else False,
-            "qdrant_status": deps.check_qdrant_status(),
         }
 
     async def root():
