@@ -25,14 +25,7 @@ class Settings(BaseSettings):
     
     # Model paths
     MODEL_PATH: str = str(Path.home() / ".cache" / "huggingface")
-    
-    # Optional Qdrant configuration
-    QDRANT_ENABLED: bool = False
-    QDRANT_PATH: str = str(PROJECT_ROOT / "qdrant_data")
-    
-    # Embedding dimensions (optimized for nomic-embed-text)
-    EMBEDDING_DIM: int = 768
-    
+
     # LLM provider: lmstudio (OpenAI-compatible API) or ollama.
     LLM_PROVIDER: str = "lmstudio"
 

@@ -200,7 +200,7 @@ export async function playSoundCheckTone() {
         oscillator.stop(audioContext.currentTime + 0.42);
 
         return { ok: true };
-    } catch (error) {
+    } catch {
         return {
             ok: false,
             error: getNoSoundHelpText(),

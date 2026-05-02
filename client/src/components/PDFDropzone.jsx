@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { motion as Motion, AnimatePresence } from 'framer-motion';
 
-export default function PDFDropzone({ onUpload, isLoading = false, hasSavedResume = false, savedLabel = '' }) {
+export default function PDFDropzone({ onUpload, isLoading = false, hasSavedResume = false }) {
     const [isDragging, setIsDragging] = useState(false);
     const [fileName, setFileName] = useState(null);
     const [error, setError] = useState(null);

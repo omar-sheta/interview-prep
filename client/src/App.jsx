@@ -1,8 +1,3 @@
-/**
- * Interview Prep v0 - Main Application
- * Routes: Configuration -> Interviews -> Session -> Report
- */
-
 import { useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, useLocation } from 'react-router-dom';
 import useInterviewStore, { APP_STATES } from '@/store/useInterviewStore';
@@ -11,10 +6,9 @@ import SessionReport from '@/components/SessionReport';
 import HistoryView from '@/components/HistoryView';
 import ConfigurationView from '@/components/ConfigurationView';
 import AdminView from '@/components/AdminView';
-// import OnboardingFlow from '@/components/OnboardingFlow'; // Deprecated
 import LoginScreen from '@/components/LoginScreen';
 import SignupScreen from '@/components/SignupScreen';
-import V0Setup from '@/components/V0Setup';
+import InterviewsView from '@/components/InterviewsView';
 import TourGuide from '@/components/TourGuide';
 import './index.css';
 
@@ -91,7 +85,7 @@ function AppRouter() {
         showAuth ? <Navigate to="/login" replace /> : <Navigate to={defaultAuthedRoute} replace />
       } />
 
-      <Route path="/interviews" element={showAuth ? <Navigate to="/login" replace /> : <V0Setup />} />
+      <Route path="/interviews" element={showAuth ? <Navigate to="/login" replace /> : <InterviewsView />} />
       <Route path="/config" element={showAuth ? <Navigate to="/login" replace /> : <ConfigurationView />} />
       <Route path="/setup" element={<Navigate to="/interviews" replace />} />
       <Route path="/dashboard" element={<Navigate to="/interviews" replace />} />

@@ -14,9 +14,6 @@ __pycache__/
 venv/
 ENV/
 
-# Qdrant local data
-qdrant_data/
-
 # Model cache (optional, large files)
 # .cache/
 

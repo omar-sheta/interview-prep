@@ -1643,7 +1643,9 @@ const useInterviewStore = create(
                     setTimeout(() => {
                         try {
                             socket.disconnect();
-                        } catch (_) { }
+                        } catch {
+                            // Socket may already be closed.
+                        }
                     }, 120);
                 } else if (socket) {
                     socket.disconnect();

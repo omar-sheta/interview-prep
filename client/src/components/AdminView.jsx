@@ -31,7 +31,7 @@ function fmtTime(value) {
     if (!value) return 'N/A';
     try {
         return new Date(value).toLocaleString();
-    } catch (_) {
+    } catch {
         return 'N/A';
     }
 }

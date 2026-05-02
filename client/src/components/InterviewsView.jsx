@@ -113,7 +113,7 @@ async function primeInterviewQuestionAudio() {
     }
 }
 
-export default function V0Setup() {
+export default function InterviewsView() {
     const navigate = useNavigate();
     const {
         connect,

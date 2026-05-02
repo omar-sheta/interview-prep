@@ -50,7 +50,6 @@ from server.realtime.audio_events import register_audio_events
 from server.realtime.auth_events import register_auth_events
 from server.realtime.interview_events import register_interview_events
 from server.realtime.preferences_events import register_preferences_events
-from server.adapters.vector_store import init_vectors
 from server.adapters.audio import (
     get_audio_processor,
     get_streaming_audio_processor,
@@ -445,13 +444,6 @@ async def lifespan(app: FastAPI):
     print(f"🤖 LLM Model: {settings.LLM_MODEL_ID}")
     print(f"🧩 LLM Single Instance: {getattr(settings, 'LLM_SINGLE_INSTANCE', True)}")
     print(f"🌐 LLM Base URL: {settings.LLM_BASE_URL}")
-    if getattr(settings, "QDRANT_ENABLED", False):
-        print(f"💾 Qdrant path: {settings.QDRANT_PATH}")
-    else:
-        print("💾 Qdrant: disabled")
-
-    # Initialize vector database
-    init_vectors()
     
     try:
         streaming_stt = get_streaming_audio_processor()

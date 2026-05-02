@@ -219,7 +219,7 @@ export default function InterviewView() {
         }
     }, []);
 
-    const stopRecording = useCallback((flushTranscript = false) => {
+    const stopRecording = useCallback(() => {
         // Invalidate any in-flight start sequence immediately.
         recordingEpochRef.current += 1;
         isRecordingRef.current = false;
@@ -262,12 +262,12 @@ export default function InterviewView() {
             for (const source of ttsScheduledSourcesRef.current) {
                 try {
                     source.stop(0);
-                } catch (_) {
+                } catch {
                     // Source may already be stopped.
                 }
                 try {
                     source.disconnect();
-                } catch (_) {
+                } catch {
                     // Source may already be disconnected.
                 }
             }
@@ -470,12 +470,12 @@ export default function InterviewView() {
         for (const source of ttsScheduledSourcesRef.current) {
             try {
                 source.stop(0);
-            } catch (_) {
+            } catch {
                 // Source may already be finished; safe to ignore.
             }
             try {
                 source.disconnect();
-            } catch (_) {
+            } catch {
                 // Already disconnected.
             }
         }
@@ -506,7 +506,7 @@ export default function InterviewView() {
             source.onended = () => {
                 console.log('[TTS] Audio playback ended');
                 ttsScheduledSourcesRef.current = ttsScheduledSourcesRef.current.filter((s) => s !== source);
-                try { source.disconnect(); } catch (_) { /* already disconnected */ }
+                try { source.disconnect(); } catch { /* already disconnected */ }
                 setQuestionAudioPlaying(false);
                 setTimeout(() => { questionAudioPlayingRef.current = false; }, 250);
             };
@@ -565,7 +565,7 @@ export default function InterviewView() {
                 ttsScheduledSourcesRef.current = ttsScheduledSourcesRef.current.filter((item) => item !== source);
                 try {
                     source.disconnect();
-                } catch (_) {
+                } catch {
                     // Already disconnected.
                 }
             };
