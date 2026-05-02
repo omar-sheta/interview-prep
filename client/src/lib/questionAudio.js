@@ -15,6 +15,31 @@ export function ensurePlaybackAudioSession(type = 'playback') {
     }
 }
 
+export function ensureCaptureAudioSession() {
+    if (typeof navigator === 'undefined') return false;
+
+    const audioSession = navigator.audioSession;
+    if (!audioSession) return false;
+
+    const preferredTypes = ['play-and-record', 'auto'];
+    for (const type of preferredTypes) {
+        try {
+            if (audioSession.type !== type) {
+                audioSession.type = type;
+            }
+            console.log('[MicDebug] AudioSession capture type set', {
+                requestedType: type,
+                activeType: audioSession.type,
+            });
+            return true;
+        } catch (error) {
+            console.warn(`[MicDebug] AudioSession capture type ${type} failed:`, error);
+        }
+    }
+
+    return false;
+}
+
 function configurePlaybackAudioElement(audio) {
     audio.preload = 'auto';
     audio.volume = 1;

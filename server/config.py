@@ -141,6 +141,8 @@ class Settings(BaseSettings):
     
     # User database path
     USER_DB_PATH: str = str(PROJECT_ROOT / "user_data" / "interview_app.db")
+    SEED_DEMO_USER: bool = False
+    AUTH_SESSION_TTL_HOURS: int = 24
 
     # Feedback loop rollout flag
     FEEDBACK_LOOP_V2: bool = True

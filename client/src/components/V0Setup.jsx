@@ -30,6 +30,7 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
+import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
 import {
     PERSONA_OPTIONS,
     QUICK_INTERVIEW_TYPES,
@@ -99,6 +100,17 @@ function getSkillGapsForType(interviewType, missingSkills = []) {
     }
 
     return base;
+}
+
+async function primeInterviewQuestionAudio() {
+    try {
+        await Promise.race([
+            primeQuestionAudioPlayback(),
+            new Promise((resolve) => window.setTimeout(resolve, 450)),
+        ]);
+    } catch (error) {
+        console.warn('Question audio priming failed before interview start:', error);
+    }
 }
 
 export default function V0Setup() {
@@ -192,7 +204,7 @@ export default function V0Setup() {
         savePreferences({ interviewer_persona: normalized });
     };
 
-    const handleStart = (interviewType) => {
+    const handleStart = async (interviewType) => {
         if (!isConnected) {
             setError('Not connected to server yet. Please try again in a moment.');
             return;
@@ -206,6 +218,7 @@ export default function V0Setup() {
 
         const selectedSkillGaps = getSkillGapsForType(interviewType.id, skillMapping?.missing || []);
         setStartingType(interviewType.id);
+        await primeInterviewQuestionAudio();
         startInterview({
             job_title: String(targetRole || '').trim(),
             skill_gaps: selectedSkillGaps,
@@ -221,7 +234,7 @@ export default function V0Setup() {
         });
     };
 
-    const handleQuickStart = () => {
+    const handleQuickStart = async () => {
         const role = quickRole.trim();
         const jd = quickJD.trim();
         if (!role || !jd) return;
@@ -233,6 +246,7 @@ export default function V0Setup() {
 
         const qCount = normalizeQuestionCount(quickQuestionCount || 5);
         setQuickStarting(true);
+        await primeInterviewQuestionAudio();
         startInterview({
             job_title: role,
             skill_gaps: getQuickSkillGaps(quickType),
@@ -259,7 +273,7 @@ export default function V0Setup() {
                     onQuickAction={openQuickDialog}
                 />
 
-                <Container maxWidth="lg" sx={{ pt: { xs: 2.5, md: 4 } }}>
+                <Container maxWidth="lg" sx={{ pt: { xs: 3.5, sm: 3, md: 4 } }}>
                     <Stack spacing={2.2}>
                         <Paper sx={{ p: { xs: 2, md: 2.5 } }}>
                             <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={1.2}>

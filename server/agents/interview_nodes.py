@@ -113,6 +113,11 @@ EVAL_DIMENSIONS = ("relevance", "depth", "structure", "specificity", "communicat
 EVAL_WEIGHTS = {"relevance": 0.25, "depth": 0.25, "structure": 0.15, "specificity": 0.20, "communication": 0.15}
 
 
+def _normalize_interviewer_persona(persona: Any) -> str:
+    normalized = str(persona or "friendly").strip().lower()
+    return normalized if normalized in {"friendly", "strict"} else "friendly"
+
+
 def _compute_overall_breakdown(evaluations: list[dict]) -> dict:
     """
     Compute average score breakdown across all answered questions.
@@ -251,9 +256,7 @@ async def generate_interview_questions(
     job_title = state.get("job_title", "Software Engineer")
     readiness = state.get("readiness_score", 0.5)
     interview_type = str(state.get("interview_type", "mixed") or "mixed").strip().lower()
-    interviewer_persona = str(state.get("interviewer_persona", "friendly") or "friendly").strip().lower()
-    if interviewer_persona not in {"friendly", "strict"}:
-        interviewer_persona = "friendly"
+    interviewer_persona = _normalize_interviewer_persona(state.get("interviewer_persona", "friendly"))
     persona_profiles = {
         "friendly": {
             "label": "Friendly",
@@ -1269,10 +1272,12 @@ def _normalize_evaluation_payload(
     expected_points: list[str],
     question_text: str,
     answer_text: str,
-    thresholds: Optional[dict] = None
+    thresholds: Optional[dict] = None,
+    interviewer_persona: str = "strict",
 ) -> dict:
     """Normalize LLM evaluation into stable shape with deterministic guardrails."""
     t = resolve_feedback_thresholds(thresholds)
+    interviewer_persona = _normalize_interviewer_persona(interviewer_persona)
     breakdown = evaluation.get("score_breakdown") or {}
     fallback_score = evaluation.get("score", 5)
 
@@ -1306,9 +1311,11 @@ def _normalize_evaluation_payload(
         quality_signals.get("quality_flags", []) + [str(x).strip() for x in (evaluation.get("quality_flags") or []) if str(x).strip()]
     ))
 
+    has_partial_coverage = bool(auto_hits) or coverage >= max(0.2, t["expected_overlap_min"] / 2)
+
     # Deterministic guardrails: cap inflated scores when signals disagree
     if settings.FEEDBACK_LOOP_V2:
-        if keyword_relevance < t["low_relevance_threshold"]:
+        if keyword_relevance < t["low_relevance_threshold"] and not has_partial_coverage:
             relevance = min(relevance, t.get("accuracy_cap_low_relevance", 5.0))
             quality_flags.append("low_relevance")
         if quality_signals["repetition_ratio"] > t["repetition_ratio_cap"]:
@@ -1317,6 +1324,27 @@ def _normalize_evaluation_payload(
             depth = min(depth, t.get("completeness_cap_low_coverage", 6.0))
         if quality_signals["structure_markers_hit"] < t["structure_markers_min"] and quality_signals["sentence_count"] <= t["structure_sentence_cap"]:
             structure = min(structure, t.get("structure_cap_weak", 5.5))
+
+    is_relevant_attempt = (
+        (keyword_relevance >= t["low_relevance_threshold"] or has_partial_coverage)
+        and quality_signals["word_count"] >= 4
+        and "possible_gibberish" not in quality_flags
+        and "low_relevance" not in quality_flags
+    )
+
+    if interviewer_persona == "friendly" and is_relevant_attempt:
+        relevance = max(relevance, 5.0)
+        if has_partial_coverage:
+            depth = max(depth, 5.0)
+            specificity = max(specificity, 5.0)
+        if "weak_structure" in quality_flags:
+            structure = max(structure, 4.5)
+        else:
+            structure = max(structure, 5.0)
+        if "high_repetition" in quality_flags:
+            communication = max(communication, 4.5)
+        else:
+            communication = max(communication, 5.0)
 
     # Weighted score
     weighted = round(
@@ -1330,6 +1358,12 @@ def _normalize_evaluation_payload(
 
     if settings.FEEDBACK_LOOP_V2 and "low_transcript_quality" in quality_flags:
         weighted = max(0.0, round(weighted - t["low_transcript_penalty"], 1))
+
+    if interviewer_persona == "friendly" and is_relevant_attempt:
+        floor_score = 5.5 if has_partial_coverage else 5.0
+        if "low_transcript_quality" in quality_flags and not has_partial_coverage:
+            floor_score = 4.5
+        weighted = max(weighted, floor_score)
 
     # Evidence quotes
     evidence_quotes = _extract_evidence_quotes(answer_text, expected_points, max_quotes=2)
@@ -1391,6 +1425,7 @@ def _normalize_evaluation_payload(
 
     return {
         "evaluation_version": "v2",
+        "interviewer_persona": interviewer_persona,
         "score": weighted,
         "score_breakdown": score_breakdown,
         "strengths": strengths[:6],
@@ -1436,9 +1471,22 @@ async def evaluate_answer_stream(question, answer, callback, thresholds: Optiona
     expected_points = question.get('expected_points', [])
     category = question.get('category', 'General')
     skill = question.get('skill_tested', 'General knowledge')
+    interviewer_persona = _normalize_interviewer_persona(question.get("interviewer_persona", "friendly"))
+    persona_guidance = {
+        "friendly": """FRIENDLY CALIBRATION:
+- Use encouraging, fair scoring for relevant good-faith attempts.
+- If an answer is relevant and partially correct, default to the 5-7 range unless there is strong evidence it deserves higher.
+- Reserve scores below 5 for answers that are mostly unrelated, extremely shallow, incoherent, or effectively unanswered.
+- Keep the feedback supportive and specific about the next improvement.""",
+        "strict": """STRICT CALIBRATION:
+- Maintain a high bar and do not inflate partial answers.
+- Scores in the 5-7 range should reflect clearly competent answers, not just effort.
+- Be direct about missing rigor, specificity, or structure while staying professional.""",
+    }[interviewer_persona]
     
-    system_prompt = """You are an expert interview evaluator using structured rubric-based assessment.
+    system_prompt = f"""You are an expert interview evaluator using structured rubric-based assessment.
 This answer was captured via speech-to-text. IGNORE transcription artifacts (filler words, repeated words, missing punctuation). Evaluate SUBSTANCE only.
+Interviewer persona for calibration: {interviewer_persona}
 
 ## Evaluation Steps (think through each before assigning scores):
 1. Read the question and identify what a strong answer would cover
@@ -1484,23 +1532,25 @@ COMMUNICATION - Is the delivery clear and effective?
 - Score based on CONTENT quality, not vocabulary sophistication.
 - One excellent specific example beats five vague ones.
 
+{persona_guidance}
+
 IMPORTANT: Output ONLY valid JSON, no markdown code blocks, no extra text.
 
 JSON Schema:
-{
+{{
   "evaluation_reasoning": "<2-3 sentences: what the candidate did well and what they missed>",
-  "score_breakdown": {
+  "score_breakdown": {{
     "relevance": <0-10>,
     "depth": <0-10>,
     "structure": <0-10>,
     "specificity": <0-10>,
     "communication": <0-10>
-  },
+  }},
   "strengths": ["<specific strength from the answer>", "<another>"],
   "gaps": ["<specific concept or point they missed>", "<another>"],
   "coaching_tip": "<one actionable improvement suggestion>",
   "model_answer": "<2-3 sentence example of what a strong answer would include>"
-}"""
+}}"""
 
     user_prompt = f"""QUESTION: {question_text}
 CATEGORY: {category}
@@ -1525,6 +1575,7 @@ Evaluate this answer against the rubric. Output valid JSON only:"""
                 question_text=question_text,
                 answer_text=answer,
                 thresholds=resolved_thresholds,
+                interviewer_persona=interviewer_persona,
             )
             print(f"📝 Evaluation: Score {evaluation.get('score', 0)}/10 (structured)")
             print(
@@ -1581,6 +1632,7 @@ Evaluate this answer against the rubric. Output valid JSON only:"""
             question_text=question_text,
             answer_text=answer,
             thresholds=resolved_thresholds,
+            interviewer_persona=interviewer_persona,
         )
         print(f"📝 Evaluation: Score {evaluation.get('score', 0)}/10")
         print(
@@ -1609,4 +1661,5 @@ Evaluate this answer against the rubric. Output valid JSON only:"""
             question_text=question_text,
             answer_text=answer,
             thresholds=resolved_thresholds,
+            interviewer_persona=interviewer_persona,
         )

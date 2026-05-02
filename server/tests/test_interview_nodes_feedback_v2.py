@@ -5,6 +5,7 @@ import types
 import unittest
 import importlib
 import importlib.util
+from unittest.mock import AsyncMock, patch
 
 # Provide lightweight stubs so this test can run even when LLM/runtime deps are absent.
 try:
@@ -184,6 +185,81 @@ class FeedbackLoopV2EvaluationTests(unittest.TestCase):
             },
         )
         self.assertLessEqual(payload["score_breakdown"]["structure"], 2.5)
+
+    def test_friendly_persona_lifts_relevant_partial_answer(self):
+        answer = "I would use redundancy and load balancing so traffic can move away from unhealthy servers."
+        strict_payload = nodes._normalize_evaluation_payload(
+            evaluation=self._base_evaluation(4.0),
+            expected_points=["redundancy", "load balancing", "failover"],
+            question_text="How do you design high availability systems?",
+            answer_text=answer,
+            interviewer_persona="strict",
+        )
+        friendly_payload = nodes._normalize_evaluation_payload(
+            evaluation=self._base_evaluation(4.0),
+            expected_points=["redundancy", "load balancing", "failover"],
+            question_text="How do you design high availability systems?",
+            answer_text=answer,
+            interviewer_persona="friendly",
+        )
+
+        self.assertGreaterEqual(friendly_payload["score"], 5.5)
+        self.assertGreater(friendly_payload["score"], strict_payload["score"])
+        self.assertEqual(friendly_payload["interviewer_persona"], "friendly")
+
+    def test_friendly_persona_keeps_off_topic_answer_low(self):
+        payload = nodes._normalize_evaluation_payload(
+            evaluation=self._base_evaluation(4.0),
+            expected_points=["redundancy", "load balancing", "failover"],
+            question_text="How do you design high availability systems?",
+            answer_text="I like hiking, coffee, and weekend road trips with friends.",
+            interviewer_persona="friendly",
+        )
+
+        self.assertLess(payload["score"], 5.0)
+        self.assertIn("low_relevance", payload["quality_flags"])
+
+
+class EvaluateAnswerStreamRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_evaluate_answer_stream_handles_literal_json_schema_prompt(self):
+        question = {
+            "text": "How would you design high availability systems?",
+            "category": "Technical",
+            "skill_tested": "System Design",
+            "expected_points": ["redundancy", "load balancing", "failover"],
+            "interviewer_persona": "friendly",
+        }
+        structured_payload = {
+            "evaluation_reasoning": "The answer covered redundancy and load balancing clearly. It could be stronger with explicit failover details.",
+            "score_breakdown": {
+                "relevance": 8,
+                "depth": 7,
+                "structure": 7,
+                "specificity": 7,
+                "communication": 8,
+            },
+            "strengths": ["Clear explanation of redundancy", "Relevant example"],
+            "gaps": ["Explicit failover strategy"],
+            "coaching_tip": "Add failover mechanics and health-check behavior.",
+            "model_answer": "A strong answer would explain redundancy, load balancing, health checks, and automatic failover.",
+        }
+
+        async def callback(_msg_type, _content):
+            return None
+
+        with (
+            patch("server.services.llm_factory.get_chat_model", return_value=object()),
+            patch.object(nodes, "_invoke_structured_output", new=AsyncMock(return_value=structured_payload)),
+        ):
+            evaluation = await nodes.evaluate_answer_stream(
+                question,
+                "I would use redundancy and load balancing so traffic can move away from unhealthy servers.",
+                callback,
+            )
+
+        self.assertEqual(evaluation["evaluation_version"], "v2")
+        self.assertFalse(evaluation.get("error"))
+        self.assertGreater(evaluation["score"], 0)
 
 
 if __name__ == "__main__":

@@ -1206,8 +1206,6 @@ const useInterviewStore = create(
 
             // Start interview mode
             startInterview: (params) => {
-                const { socket } = get();
-                if (!socket?.connected) return;
                 set({
                     appState: APP_STATES.ANALYZING,
                     analysisProgress: 'Generating interview questions...',
@@ -1223,7 +1221,43 @@ const useInterviewStore = create(
                     ttsStreamQueue: [],
                 });
                 get().addThinking('⏳ Generating interview questions...');
-                socket.emit('start_interview', params);
+
+                const emitStart = () => {
+                    const s = get().socket;
+                    if (!s?.connected) return false;
+                    s.emit('start_interview', params);
+                    return true;
+                };
+
+                if (emitStart()) {
+                    console.log('✅ Socket connected, emitting start_interview');
+                    return;
+                }
+
+                console.log('⏳ Socket not connected for interview start, connecting and retrying...');
+                get().connect();
+                const startedAt = Date.now();
+                const maxWaitMs = 8000;
+
+                const waitForSocket = () => {
+                    if (emitStart()) {
+                        console.log('✅ Socket connected, emitting start_interview');
+                        return;
+                    }
+                    if (Date.now() - startedAt >= maxWaitMs) {
+                        console.error('❌ Failed to start interview: socket connection timeout');
+                        set({
+                            appState: APP_STATES.IDLE,
+                            analysisProgress: '',
+                            interviewError: 'Unable to connect to the server. Please try again.',
+                        });
+                        get().addThinking('❌ Failed to start interview: connection timeout');
+                        return;
+                    }
+                    setTimeout(waitForSocket, 250);
+                };
+
+                waitForSocket();
             },
 
             // Send audio chunk

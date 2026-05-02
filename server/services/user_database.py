@@ -25,8 +25,10 @@ class UserDatabase:
     def __init__(self, db_path: str = str(DB_PATH)):
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        print(f"🗄️ User database path: {Path(db_path).resolve()}")
         self._init_schema()
-        self._ensure_demo_user()
+        if settings.SEED_DEMO_USER:
+            self._ensure_demo_user()
     
     def _get_connection(self):
         """Get database connection."""
@@ -321,11 +323,12 @@ class UserDatabase:
             return None
         return hashlib.sha256(clean_token.encode()).hexdigest()[:16]
 
-    def create_session_token(self, user_id: str, ttl_days: int = 30) -> str:
+    def create_session_token(self, user_id: str, ttl_hours: Optional[int] = None) -> str:
         """Create and persist a new session token for a user."""
         token = secrets.token_urlsafe(48)
         now = self._utcnow()
-        expires_at = now + timedelta(days=ttl_days)
+        effective_ttl_hours = max(1, int(ttl_hours or settings.AUTH_SESSION_TTL_HOURS or 24))
+        expires_at = now + timedelta(hours=effective_ttl_hours)
         session_fingerprint = self.get_session_token_fingerprint(token)
 
         conn = self._get_connection()

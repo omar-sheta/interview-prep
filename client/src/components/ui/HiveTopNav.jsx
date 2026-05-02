@@ -107,22 +107,34 @@ export default function HiveTopNav({
         >
             <Container maxWidth="lg">
                 <Stack
-                    direction="row"
+                    direction={{ xs: 'column', md: 'row' }}
                     alignItems="center"
                     justifyContent="space-between"
                     sx={{
                         minHeight: 64,
-                        py: 0.5,
+                        py: { xs: 0.75, md: 0.5 },
+                        gap: { xs: 1, md: 0 },
                     }}
                 >
                     {/* LEFT SECTION: Brand & Nav Links */}
-                    <Stack direction="row" spacing={4} alignItems="center">
+                    <Stack
+                        direction="row"
+                        spacing={{ xs: 1.5, md: 4 }}
+                        alignItems="center"
+                        sx={{ minWidth: 0, width: { xs: '100%', md: 'auto' }, flex: { xs: '1 1 auto', md: '0 1 auto' } }}
+                    >
                         {/* Brand */}
-                        <Stack direction="row" spacing={1.2} alignItems="center" sx={{ cursor: 'pointer' }} onClick={() => navigateWithGuard('/interviews')}>
+                        <Stack
+                            direction="row"
+                            spacing={1.2}
+                            alignItems="center"
+                            sx={{ cursor: 'pointer', minWidth: 0, flexShrink: 1 }}
+                            onClick={() => navigateWithGuard('/interviews')}
+                        >
                             <Box
                                 sx={{
-                                    width: 32,
-                                    height: 32,
+                                    width: { xs: 30, md: 32 },
+                                    height: { xs: 30, md: 32 },
                                     borderRadius: '50%',
                                     display: 'grid',
                                     placeItems: 'center',
@@ -131,9 +143,19 @@ export default function HiveTopNav({
                                     boxShadow: '0 2px 8px rgba(249, 115, 22, 0.4)'
                                 }}
                             >
-                                <Hive sx={{ fontSize: 18 }} />
+                                <Hive sx={{ fontSize: { xs: 17, md: 18 } }} />
                             </Box>
-                            <Typography variant="h6" sx={{ lineHeight: 1, letterSpacing: '-0.02em', fontSize: '1.2rem', fontWeight: 800, color: 'text.primary' }}>
+                            <Typography
+                                variant="h6"
+                                sx={{
+                                    lineHeight: 1,
+                                    letterSpacing: '-0.02em',
+                                    fontSize: { xs: '1.02rem', sm: '1.1rem', md: '1.2rem' },
+                                    fontWeight: 800,
+                                    color: 'text.primary',
+                                    whiteSpace: 'nowrap',
+                                }}
+                            >
                                 BeePrepared
                             </Typography>
                         </Stack>
@@ -189,7 +211,13 @@ export default function HiveTopNav({
                     </Stack>
 
                     {/* RIGHT SECTION: Quick Action & Icons */}
-                    <Stack direction="row" spacing={2} alignItems="center">
+                    <Stack
+                        direction="row"
+                        spacing={{ xs: 0.75, sm: 1.25, md: 2 }}
+                        alignItems="center"
+                        justifyContent={{ xs: 'space-between', md: 'flex-end' }}
+                        sx={{ flexShrink: 0, width: { xs: '100%', md: 'auto' }, ml: { xs: 0, md: 'auto' } }}
+                    >
                         {quickActionLabel && typeof onQuickAction === 'function' && (
                             <Button
                                 id="btn-quick-action"
@@ -199,13 +227,19 @@ export default function HiveTopNav({
                                 onClick={onQuickAction}
                                 sx={{
                                     borderRadius: 999,
-                                    px: 2.5,
-                                    py: 0.8,
+                                    minWidth: 0,
+                                    px: { xs: 1.4, sm: 1.8, md: 2.5 },
+                                    py: { xs: 0.7, md: 0.8 },
                                     textTransform: 'none',
                                     fontWeight: 700,
                                     letterSpacing: '0.01em',
+                                    fontSize: { xs: '0.8rem', sm: '0.875rem' },
                                     boxShadow: darkMode ? '0 4px 14px rgba(249, 115, 22, 0.25)' : '0 4px 14px rgba(234, 88, 12, 0.3)',
                                     background: 'linear-gradient(135deg, #f97316 0%, #ea580c 100%)',
+                                    '& .MuiButton-startIcon': {
+                                        marginLeft: 0,
+                                        marginRight: 0.75,
+                                    },
                                     '&:hover': {
                                         background: 'linear-gradient(135deg, #ea580c 0%, #c2410c 100%)',
                                         boxShadow: darkMode ? '0 6px 20px rgba(249, 115, 22, 0.4)' : '0 6px 20px rgba(234, 88, 12, 0.4)',

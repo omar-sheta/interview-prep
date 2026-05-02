@@ -112,7 +112,7 @@ class _FakeDb:
 class MainRetrySocketEventTests(unittest.IsolatedAsyncioTestCase):
     async def test_submit_retry_answer_evaluates_persists_and_emits(self):
         fake_db = _FakeDb()
-        fake_session = main.SessionState(user_id="user_123", is_authenticated=True)
+        fake_session = main.SessionState(user_id="user_123", is_authenticated=True, sid="sid_1")
         evaluated_payload = {
             "score": 6.5,
             "score_breakdown": {
@@ -174,7 +174,7 @@ class MainRetrySocketEventTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_retry_attempts_returns_timeline(self):
         fake_db = _FakeDb()
-        fake_session = main.SessionState(user_id="user_123", is_authenticated=True)
+        fake_session = main.SessionState(user_id="user_123", is_authenticated=True, sid="sid_1")
 
         with (
             patch.object(main, "_require_socket_auth", new=AsyncMock(return_value=fake_session)),

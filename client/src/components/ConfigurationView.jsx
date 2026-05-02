@@ -47,6 +47,7 @@ import {
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
+import { primeQuestionAudioPlayback } from '@/lib/questionAudio';
 import {
     PERSONA_OPTIONS,
     QUICK_INTERVIEW_TYPES,
@@ -197,6 +198,17 @@ function summarizeCoverage(skillMapping, skillBoard) {
         requiredCount,
         candidateCount: candidateCountFallback || (matchedCount + partialCount),
     };
+}
+
+async function primeInterviewQuestionAudio() {
+    try {
+        await Promise.race([
+            primeQuestionAudioPlayback(),
+            new Promise((resolve) => window.setTimeout(resolve, 450)),
+        ]);
+    } catch (error) {
+        console.warn('Question audio priming failed before interview start:', error);
+    }
 }
 
 export default function ConfigurationView() {
@@ -494,7 +506,7 @@ export default function ConfigurationView() {
         setQuickJD(preset.jobDescription);
     };
 
-    const handleQuickStart = () => {
+    const handleQuickStart = async () => {
         const role = quickRole.trim();
         const jd = quickJD.trim();
         if (!role || !jd) return;
@@ -506,6 +518,7 @@ export default function ConfigurationView() {
 
         const qCount = clampQuestionCount(quickQuestionCount) || clampQuestionCount(questionCount) || 5;
         setQuickStarting(true);
+        await primeInterviewQuestionAudio();
         startInterview({
             job_title: role,
             skill_gaps: getQuickSkillGaps(quickType),

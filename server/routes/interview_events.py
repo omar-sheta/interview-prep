@@ -517,6 +517,16 @@ def register_interview_events(sio, deps):
             if requested_question_count and result.get("questions"):
                 result["questions"] = result["questions"][:requested_question_count]
 
+            if result.get("questions"):
+                result["questions"] = [
+                    {
+                        **question,
+                        "interviewer_persona": requested_persona,
+                    }
+                    for question in result["questions"]
+                    if isinstance(question, dict)
+                ]
+
             if suggestion_id and result.get("questions"):
                 try:
                     deps.get_user_db().set_latest_analysis_session_questions(

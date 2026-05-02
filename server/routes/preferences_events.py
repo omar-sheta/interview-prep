@@ -556,9 +556,19 @@ def register_preferences_events(sio, deps):
             "difficulty": original.get("question_difficulty", "medium"),
             "skill_tested": original.get("question_category", "General"),
             "expected_points": expected_points,
+            "interviewer_persona": str((original_eval or {}).get("interviewer_persona") or "").strip().lower(),
         }
 
         from server.agents.interview_nodes import evaluate_answer_stream
+
+        if question_payload["interviewer_persona"] not in {"friendly", "strict"}:
+            try:
+                prefs = deps.get_user_db().get_user_preferences(user_id) or {}
+                question_payload["interviewer_persona"] = str(
+                    prefs.get("interviewer_persona") or "friendly"
+                ).strip().lower()
+            except Exception:
+                question_payload["interviewer_persona"] = "friendly"
 
         user_thresholds = deps.get_user_feedback_thresholds(user_id)
 

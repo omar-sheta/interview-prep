@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useInterviewStore from '@/store/useInterviewStore';
-import InterviewReadinessDialog from '@/components/InterviewReadinessDialog';
 import {
     ThemeProvider,
     CssBaseline,
@@ -35,10 +34,10 @@ import {
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
 import {
+    ensureCaptureAudioSession,
     clearSharedPlaybackAudioSource,
     ensurePlaybackAudioSession,
     getQuestionAudioContext,
-    primeQuestionAudioPlayback,
 } from '@/lib/questionAudio';
 
 const DEFAULT_SILENCE_AUTO_STOP_SECONDS = 5.0;
@@ -96,6 +95,16 @@ function normalizeHintList(value, limit = 3) {
         .slice(0, limit);
 }
 
+async function getMicrophonePermissionState() {
+    if (!navigator.permissions?.query) return 'unsupported';
+    try {
+        const result = await navigator.permissions.query({ name: 'microphone' });
+        return result?.state || 'unknown';
+    } catch (err) {
+        return `unavailable:${err?.name || 'error'}`;
+    }
+}
+
 export default function InterviewView() {
     const {
         currentQuestion,
@@ -119,14 +128,12 @@ export default function InterviewView() {
         popAudio,
         popTtsStreamChunk,
         darkMode,
-        micPermissionGranted,
         recordingThresholds,
         interviewMode,
         interviewFeedbackTiming,
         coachingEnabled,
         interviewerPersona,
         generatingReport,
-        savePreferences,
     } = useInterviewStore();
 
     const [draft, setDraft] = useState('');
@@ -142,7 +149,6 @@ export default function InterviewView() {
     const [questionAudioPlaying, setQuestionAudioPlaying] = useState(false);
     const [pendingQuestionAudio, setPendingQuestionAudio] = useState(null);
     const [pendingQuestionStreamChunk, setPendingQuestionStreamChunk] = useState(null);
-    const [readinessOpen, setReadinessOpen] = useState(true);
 
     const isRecordingRef = useRef(false);
     const streamRef = useRef(null);
@@ -170,6 +176,19 @@ export default function InterviewView() {
     const silenceAutoStopMs = Math.round(silenceAutoStopSeconds * 1000);
     const isCoachSession = Boolean(coachingEnabled || interviewMode === 'coaching');
     const gradingModeLabel = interviewFeedbackTiming === 'live' ? 'Live score reveal' : 'Final report reveal';
+
+    const logMicDebug = useCallback(async (stage, details = {}) => {
+        const permissionState = await getMicrophonePermissionState();
+        console.log('[MicDebug]', stage, {
+            permissionState,
+            secureContext: window.isSecureContext,
+            visibilityState: document.visibilityState,
+            hasMediaDevices: Boolean(navigator.mediaDevices),
+            hasGetUserMedia: Boolean(navigator.mediaDevices?.getUserMedia),
+            userAgent: navigator.userAgent,
+            ...details,
+        });
+    }, []);
 
     useEffect(() => {
         const timer = setInterval(() => setElapsedTime((prev) => prev + 1), 1000);
@@ -213,30 +232,102 @@ export default function InterviewView() {
     const startRecording = useCallback(async () => {
         if (isRecordingRef.current || isMicStarting) return;
         if (!navigator.mediaDevices?.getUserMedia) {
+            void logMicDebug('getUserMedia missing');
             setMicError('Microphone access is not supported in this browser.');
             return;
         }
 
         const epoch = recordingEpochRef.current + 1;
         recordingEpochRef.current = epoch;
+        const preferredConstraints = {
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                channelCount: 1,
+            },
+        };
 
         try {
             clearInterviewError();
             setMicError('');
             setIsMicStarting(true);
+            await logMicDebug('start requested', { epoch, constraints: preferredConstraints });
 
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    channelCount: 1,
-                },
+            clearSharedPlaybackAudioSource();
+            if (ttsPlaybackEndTimerRef.current) {
+                window.clearTimeout(ttsPlaybackEndTimerRef.current);
+                ttsPlaybackEndTimerRef.current = null;
+            }
+            for (const source of ttsScheduledSourcesRef.current) {
+                try {
+                    source.stop(0);
+                } catch (_) {
+                    // Source may already be stopped.
+                }
+                try {
+                    source.disconnect();
+                } catch (_) {
+                    // Source may already be disconnected.
+                }
+            }
+            ttsScheduledSourcesRef.current = [];
+            ttsNextPlaybackTimeRef.current = 0;
+            ttsPlaybackQuestionRef.current = null;
+            setQuestionAudioPlaying(false);
+            questionAudioPlayingRef.current = false;
+
+            try {
+                const playbackContext = ttsPlaybackContextRef.current || getQuestionAudioContext();
+                if (playbackContext && typeof playbackContext.suspend === 'function' && playbackContext.state === 'running') {
+                    await playbackContext.suspend();
+                }
+            } catch (suspendErr) {
+                console.warn('[MicDebug] Failed to suspend playback context before capture:', suspendErr);
+            }
+
+            const captureSessionConfigured = ensureCaptureAudioSession();
+            await logMicDebug('prepared audio session for capture', {
+                epoch,
+                captureSessionConfigured,
             });
+
+            let stream;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia(preferredConstraints);
+                await logMicDebug('preferred getUserMedia success', {
+                    epoch,
+                    trackCount: stream.getAudioTracks().length,
+                });
+            } catch (preferredErr) {
+                await logMicDebug('preferred getUserMedia failed', {
+                    epoch,
+                    errorName: preferredErr?.name || 'UnknownError',
+                    errorMessage: preferredErr?.message || String(preferredErr || ''),
+                });
+                if (preferredErr?.name === 'InvalidStateError') {
+                    const retriedCaptureSessionConfigured = ensureCaptureAudioSession();
+                    await logMicDebug('reconfigured audio session after InvalidStateError', {
+                        epoch,
+                        retriedCaptureSessionConfigured,
+                    });
+                    await new Promise((resolve) => setTimeout(resolve, 120));
+                }
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                await logMicDebug('fallback getUserMedia success', {
+                    epoch,
+                    trackCount: stream.getAudioTracks().length,
+                });
+            }
 
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
             const audioContext = new AudioCtx();
             await audioContext.resume();
+            await logMicDebug('audio context ready', {
+                epoch,
+                sampleRate: audioContext.sampleRate,
+                state: audioContext.state,
+            });
 
             // If user already stopped before startup completed, abort this start cleanly.
             if (recordingEpochRef.current !== epoch) {
@@ -291,14 +382,42 @@ export default function InterviewView() {
             setIsMicRecording(true);
             setRecording(true);
             setIsMicStarting(false);
+            void logMicDebug('recording started', { epoch });
         } catch (err) {
-            console.error('Microphone start error:', err);
-            setMicError('Could not access microphone. Check browser permission and device input.');
+            let devices = [];
+            try {
+                devices = await navigator.mediaDevices.enumerateDevices();
+            } catch (deviceErr) {
+                devices = [{ kind: 'enumerateDevices_failed', label: deviceErr?.name || 'unknown' }];
+            }
+
+            console.error('[MicDebug] Microphone start error', {
+                errorName: err?.name || 'UnknownError',
+                errorMessage: err?.message || String(err || ''),
+                secureContext: window.isSecureContext,
+                hasMediaDevices: Boolean(navigator.mediaDevices),
+                hasGetUserMedia: Boolean(navigator.mediaDevices?.getUserMedia),
+                devices: devices.map((device) => ({
+                    kind: device.kind,
+                    label: device.label || '',
+                    deviceId: device.deviceId ? `${String(device.deviceId).slice(0, 8)}...` : '',
+                })),
+            });
+            await logMicDebug('recording start failed', {
+                epoch,
+                errorName: err?.name || 'UnknownError',
+                errorMessage: err?.message || String(err || ''),
+            });
+            setMicError(
+                err?.name === 'NotAllowedError'
+                    ? 'Microphone blocked. Allow browser microphone access and try again.'
+                    : `Could not access microphone (${err?.name || 'unknown error'}). Check browser permission and device input.`
+            );
             if (recordingEpochRef.current === epoch) {
                 stopRecording(false);
             }
         }
-    }, [clearInterviewError, isMicStarting, sendAudioChunk, setRecording, silenceAutoStopMs, silenceRmsThreshold, stopRecording]);
+    }, [clearInterviewError, isMicStarting, logMicDebug, sendAudioChunk, setRecording, silenceAutoStopMs, silenceRmsThreshold, stopRecording]);
 
     const ensureQuestionPlaybackContext = useCallback(async () => {
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -468,7 +587,7 @@ export default function InterviewView() {
 
     useEffect(() => {
         console.log('[TTS] Playback effect: enabled=', questionAudioEnabled, 'playing=', questionAudioPlaying, 'queueLen=', ttsAudioQueue.length, 'pending=', !!pendingQuestionAudio);
-        if (readinessOpen || !questionAudioEnabled || questionAudioPlaying) return;
+        if (!questionAudioEnabled || questionAudioPlaying) return;
 
         const nextAudio = pendingQuestionAudio || popAudio();
         if (!nextAudio) return;
@@ -489,10 +608,10 @@ export default function InterviewView() {
         return () => {
             isMounted = false;
         };
-    }, [pendingQuestionAudio, playQuestionAudio, popAudio, questionAudioEnabled, questionAudioPlaying, readinessOpen, ttsAudioQueue]);
+    }, [pendingQuestionAudio, playQuestionAudio, popAudio, questionAudioEnabled, questionAudioPlaying, ttsAudioQueue]);
 
     useEffect(() => {
-        if (readinessOpen || !questionAudioEnabled) return;
+        if (!questionAudioEnabled) return;
 
         const nextChunk = pendingQuestionStreamChunk || popTtsStreamChunk();
         if (!nextChunk) return;
@@ -512,10 +631,10 @@ export default function InterviewView() {
         return () => {
             isMounted = false;
         };
-    }, [pendingQuestionStreamChunk, playQuestionStreamChunk, popTtsStreamChunk, questionAudioEnabled, readinessOpen, ttsStreamQueue]);
+    }, [pendingQuestionStreamChunk, playQuestionStreamChunk, popTtsStreamChunk, questionAudioEnabled, ttsStreamQueue]);
 
     useEffect(() => {
-        if (readinessOpen || !questionAudioBlocked || !questionAudioEnabled || (!pendingQuestionAudio && !pendingQuestionStreamChunk)) return;
+        if (!questionAudioBlocked || !questionAudioEnabled || (!pendingQuestionAudio && !pendingQuestionStreamChunk)) return;
 
         let cancelled = false;
         const tryPlay = async () => {
@@ -549,13 +668,7 @@ export default function InterviewView() {
         playQuestionStreamChunk,
         questionAudioBlocked,
         questionAudioEnabled,
-        readinessOpen,
     ]);
-
-    useEffect(() => {
-        if (!readinessOpen) return;
-        stopQuestionAudio();
-    }, [readinessOpen, stopQuestionAudio]);
 
     useEffect(() => {
         if (coachingEnabled) {
@@ -601,11 +714,6 @@ export default function InterviewView() {
         toggleCoaching(true);
         requestHint();
     };
-
-    const handleReadinessClose = useCallback(() => {
-        void primeQuestionAudioPlayback();
-        setReadinessOpen(false);
-    }, []);
 
     const handleSubmit = () => {
         if (answerSubmitPending) return;
@@ -1012,16 +1120,6 @@ export default function InterviewView() {
                             </Paper></>)}
                     </Stack>
                 </Container>
-                <InterviewReadinessDialog
-                    open={readinessOpen}
-                    onClose={handleReadinessClose}
-                    onConfirm={handleReadinessClose}
-                    micPermissionGranted={micPermissionGranted}
-                    onMicPermissionChange={(granted) => savePreferences({ mic_permission_granted: granted })}
-                    title="Mic & Sound Check"
-                    subtitle="Check your mic and speaker on this device."
-                    actionLabel="Continue"
-                />
             </Box>
         </ThemeProvider>
     );
