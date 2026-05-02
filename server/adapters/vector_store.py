@@ -67,22 +67,3 @@ def init_vectors() -> None:
     else:
         print(f"ℹ️  Collection '{collection_name}' already exists")
 
-
-def check_qdrant_status() -> str:
-    """
-    Quick health check for Qdrant.
-    Returns 'disabled', 'missing', 'active', or 'error'.
-    """
-    if not qdrant_enabled():
-        return "disabled"
-
-    if QdrantClient is None:
-        return "missing"
-
-    try:
-        qdrant_client = get_qdrant_client()
-        qdrant_client.get_collections()
-        return "active"
-    except Exception as e:
-        print(f"⚠️ Qdrant health check failed: {e}")
-        return "error"

@@ -10,14 +10,9 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Optional, TypedDict
 
-try:
-    import mlx.core as mx
-except ImportError:
-    mx = None  # MLX not available (non-Apple Silicon)
 import socketio
 import os
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.graph import END, START, StateGraph
 
@@ -55,7 +50,7 @@ from server.realtime.audio_events import register_audio_events
 from server.realtime.auth_events import register_auth_events
 from server.realtime.interview_events import register_interview_events
 from server.realtime.preferences_events import register_preferences_events
-from server.adapters.vector_store import check_qdrant_status, init_vectors
+from server.adapters.vector_store import init_vectors
 from server.adapters.audio import (
     get_audio_processor,
     get_streaming_audio_processor,
@@ -458,13 +453,6 @@ async def lifespan(app: FastAPI):
     # Initialize vector database
     init_vectors()
     
-    # Check MLX Metal availability
-    metal_available = mx.metal.is_available() if mx else False
-    print(f"🍎 MLX Metal GPU: {metal_available}")
-    
-    if not metal_available:
-        print("⚠️  Warning: Metal acceleration is not available!")
-
     try:
         streaming_stt = get_streaming_audio_processor()
         print(f"🎙️ Streaming STT: {streaming_stt.__class__.__name__}")
@@ -530,9 +518,7 @@ app = socketio.ASGIApp(sio, fast_app)
 _rest_routes = register_rest_routes(
     fast_app,
     SimpleNamespace(
-        mx=mx,
         build_sanity_check_graph=lambda: build_sanity_check_graph(),
-        check_qdrant_status=lambda: check_qdrant_status(),
         get_authenticated_rest_user_id=_get_authenticated_rest_user_id,
         require_admin_rest_user=_require_admin_rest_user,
         get_user_db=lambda: get_user_db(),
@@ -622,7 +608,7 @@ def _normalize_recording_thresholds(overrides):
 
 
 ALLOWED_PIPER_STYLES = {"interviewer", "balanced", "fast"}
-ALLOWED_TTS_PROVIDERS = {"piper", "neutts", "kokoro", "qwen3_tts"}
+ALLOWED_TTS_PROVIDERS = {"piper", "qwen3_tts"}
 
 
 def _normalize_piper_style(style_value, fallback: str = "interviewer") -> str:

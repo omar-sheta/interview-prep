@@ -1501,7 +1501,7 @@ class UserDatabase:
         tts_provider = str(preferences.get("tts_provider") or "piper").strip().lower()
         if tts_provider == "qwen3_tts_mlx":
             tts_provider = "qwen3_tts"
-        if tts_provider not in ["piper", "neutts", "kokoro", "qwen3_tts"]:
+        if tts_provider not in ["piper", "qwen3_tts"]:
             tts_provider = "piper"
         
         cursor.execute("""

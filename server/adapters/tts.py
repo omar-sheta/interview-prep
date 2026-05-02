@@ -4,8 +4,6 @@ TTS Service for BeePrepared.
 Supported user-selectable providers:
 - Piper (CLI, ONNX voices including high-quality models)
 - Qwen3-TTS CUDA (official qwen-tts or faster-qwen3-tts acceleration on NVIDIA GPUs)
-
-Fallback backends: NeuTTS Air (Neuphonic), Kokoro-82M via PyTorch (optional)
 """
 
 import asyncio
@@ -21,7 +19,6 @@ from pathlib import Path
 import numpy as np
 import warnings
 import os
-import logging
 import threading
 
 # Hide non-critical hardware/tokenizer warnings from libraries
@@ -35,9 +32,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 _tts_model = None
 _tts_backend_kind: Optional[str] = None
 _tts_sample_rate = 24000
-_neutts_speaker_codes = None
-_neutts_ref_audio_path = ""
-_neutts_ref_text = ""
 _piper_model_path = ""
 _piper_config_path = ""
 _piper_binary = ""
@@ -66,20 +60,6 @@ PIPER_CMD_TIMEOUT_SEC = float(os.getenv("PIPER_CMD_TIMEOUT_SEC", "180"))
 PIPER_AUTO_DISCOVER = os.getenv("PIPER_AUTO_DISCOVER", "1").lower() in {"1", "true", "yes", "on"}
 PIPER_APPEND_TERMINAL_PUNCT = os.getenv("PIPER_APPEND_TERMINAL_PUNCT", "1").lower() in {"1", "true", "yes", "on"}
 PIPER_COLLAPSE_WHITESPACE = os.getenv("PIPER_COLLAPSE_WHITESPACE", "1").lower() in {"1", "true", "yes", "on"}
-
-# NeuTTS configuration
-NEUTTS_MODEL_ID = os.getenv("NEUTTS_MODEL_ID", "neuphonic/neutts-air")
-NEUTTS_DEFAULT_SPEAKER = os.getenv("NEUTTS_SPEAKER", "").strip() or None
-NEUTTS_REF_AUDIO_PATH = os.getenv("NEUTTS_REF_AUDIO_PATH", "").strip()
-NEUTTS_REF_TEXT = os.getenv("NEUTTS_REF_TEXT", "").strip()
-NEUTTS_SAMPLE_RATE = int(os.getenv("NEUTTS_SAMPLE_RATE", "24000"))
-NEUTTS_DYNAMIC_REF_TEXT = os.getenv("NEUTTS_DYNAMIC_REF_TEXT", "1").lower() in {"1", "true", "yes", "on"}
-
-# Kokoro fallback configuration
-KOKORO_MODEL_ID = os.getenv("KOKORO_MODEL_ID", "hexgrad/Kokoro-82M")
-KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")  # Warm, professional female voice
-KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "0.9"))  # Slightly slower for clearer articulation
-KOKORO_LANG = os.getenv("KOKORO_LANG", "a")  # "a" = American English
 
 # Qwen3-TTS CUDA configuration
 QWEN3_TTS_MODEL_ID = os.getenv("QWEN3_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice").strip()
@@ -452,104 +432,6 @@ def _load_piper():
     )
 
 
-def _load_neutts():
-    """Load NeuTTS Air and encode reference speaker codes (required for v1.1.0+)."""
-    global _tts_model
-    global _tts_backend_kind
-    global _tts_sample_rate
-    global _neutts_speaker_codes
-    global _neutts_ref_audio_path
-    global _neutts_ref_text
-
-    print(f"🔄 Loading TTS backend (NeuTTS): {NEUTTS_MODEL_ID}...")
-    from neutts import NeuTTS
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"🎯 NeuTTS device: {device}")
-    model = NeuTTS(backbone_repo=NEUTTS_MODEL_ID, backbone_device=device, codec_device=device)
-
-    # NeuTTS v1.1.0 API: infer(text, ref_codes, ref_text) ALWAYS requires
-    # reference audio codes.  Find a reference WAV to encode.
-    ref_audio_path = NEUTTS_REF_AUDIO_PATH
-    if not ref_audio_path:
-        # Auto-discover a default reference WAV from the project root.
-        _project_root = Path(__file__).resolve().parent.parent.parent
-        for candidate in ("pro.wav", "happy.wav", "whisper.wav"):
-            candidate_path = _project_root / candidate
-            if candidate_path.exists():
-                ref_audio_path = str(candidate_path)
-                print(f"ℹ️  No NEUTTS_REF_AUDIO_PATH set, using default: {candidate}")
-                break
-
-    if not ref_audio_path:
-        raise FileNotFoundError(
-            "NeuTTS v1.1.0 requires a reference audio file. "
-            "Set NEUTTS_REF_AUDIO_PATH or place a .wav file in the project root."
-        )
-
-    ref_audio = Path(ref_audio_path).expanduser().resolve()
-    if not ref_audio.exists():
-        raise FileNotFoundError(f"NEUTTS_REF_AUDIO_PATH not found: {ref_audio}")
-
-    # Encode the reference audio into speaker codes.
-    _neutts_speaker_codes = model.encode_reference(str(ref_audio))
-
-    # Reference text (for the infer call).
-    ref_text = NEUTTS_REF_TEXT.strip()
-    if not ref_text:
-        sidecar = ref_audio.with_suffix(".txt")
-        if sidecar.exists():
-            ref_text = sidecar.read_text(encoding="utf-8").strip()
-    if not ref_text:
-        ref_text = ""
-        if NEUTTS_DYNAMIC_REF_TEXT:
-            print("ℹ️  No NEUTTS_REF_TEXT/pro.txt found; using dynamic ref_text from request text.")
-        else:
-            print("ℹ️  No NEUTTS_REF_TEXT/pro.txt found; using empty ref_text.")
-
-    _neutts_ref_audio_path = str(ref_audio)
-    _neutts_ref_text = ref_text
-    print(f"✅ NeuTTS speaker reference loaded from {ref_audio.name}")
-
-    _tts_model = model
-    _tts_backend_kind = "neutts"
-    _tts_sample_rate = int(getattr(model, "sample_rate", NEUTTS_SAMPLE_RATE))
-    print(f"✅ NeuTTS READY (device={device}, sample_rate={_tts_sample_rate})")
-
-
-def _load_kokoro():
-    """Load Kokoro PyTorch as compatibility fallback."""
-    global _tts_model
-    global _tts_backend_kind
-    global _tts_sample_rate
-
-    # Silence library-level logging during load
-    lib_logger = logging.getLogger("transformers")
-    old_level = lib_logger.level
-    lib_logger.setLevel(logging.ERROR)
-
-    print(f"🔄 Loading TTS fallback (Kokoro PyTorch)...")
-    try:
-        from kokoro import KPipeline
-        import torch
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = KPipeline(lang_code=KOKORO_LANG, device=device)
-
-        # Warm up the pipeline
-        for _ in model(
-            "ready", voice=KOKORO_VOICE, speed=KOKORO_SPEED, split_pattern=r'\n+'
-        ):
-            break
-
-        _tts_model = model
-        _tts_backend_kind = "kokoro"
-        _tts_sample_rate = 24000
-        print(f"✅ Kokoro READY (sample_rate={_tts_sample_rate}, device={device})")
-    finally:
-        lib_logger.setLevel(old_level)
-
-
 def _load_qwen3_tts_cuda():
     """Load Qwen3-TTS model via qwen-tts on CUDA."""
     global _qwen3_tts_model
@@ -679,53 +561,6 @@ def _ensure_piper_loaded():
     return _tts_model
 
 
-def _ensure_tts_loaded():
-    """
-    Lazy-load TTS backend.
-    Default backend is Piper, with optional NeuTTS/Kokoro fallback.
-    """
-    global _tts_model
-    if _tts_model is None:
-        try:
-            if TTS_BACKEND in {"piper"}:
-                _load_piper()
-            elif TTS_BACKEND in {"neutts", "neutts-air", "neuphonic"}:
-                _load_neutts()
-            elif TTS_BACKEND in {"kokoro"}:
-                _load_kokoro()
-            else:
-                raise ValueError(f"Unsupported TTS_BACKEND='{TTS_BACKEND}'")
-        except Exception as primary_err:
-            if not TTS_ALLOW_FALLBACK:
-                raise
-
-            if TTS_BACKEND in {"piper"}:
-                print(f"⚠️ Piper load failed ({primary_err}). Falling back to NeuTTS/Kokoro.")
-                try:
-                    _load_neutts()
-                except Exception as neutts_err:
-                    print(f"⚠️ NeuTTS fallback failed ({neutts_err}). Falling back to Kokoro.")
-                    _load_kokoro()
-            elif TTS_BACKEND in {"neutts", "neutts-air", "neuphonic"}:
-                print(f"⚠️ NeuTTS load failed ({primary_err}). Falling back to Piper/Kokoro.")
-                try:
-                    _load_piper()
-                except Exception as piper_err:
-                    print(f"⚠️ Piper fallback failed ({piper_err}). Falling back to Kokoro.")
-                    _load_kokoro()
-            elif TTS_BACKEND in {"kokoro"}:
-                print(f"⚠️ Kokoro load failed ({primary_err}). Falling back to Piper/NeuTTS.")
-                try:
-                    _load_piper()
-                except Exception as piper_err:
-                    print(f"⚠️ Piper fallback failed ({piper_err}). Falling back to NeuTTS.")
-                    _load_neutts()
-            else:
-                raise
-
-    return _tts_model
-
-
 def _generate_piper_audio(text: str, voice: Optional[str] = None, style: Optional[str] = None) -> np.ndarray:
     """Generate audio with Piper CLI backend."""
     model_info = _ensure_piper_loaded()
@@ -791,41 +626,6 @@ def _generate_piper_audio(text: str, voice: Optional[str] = None, style: Optiona
             out_path.unlink(missing_ok=True)
         except Exception:
             pass
-
-
-def _generate_neutts_audio(text: str, voice: Optional[str] = None) -> np.ndarray:
-    """Generate audio with NeuTTS v1.1.0 API: infer(text, ref_codes, ref_text)."""
-    model = _ensure_tts_loaded()
-
-    if _neutts_speaker_codes is None:
-        raise RuntimeError("NeuTTS requires reference speaker codes but none were loaded.")
-
-    effective_ref_text = _neutts_ref_text
-    if not effective_ref_text and NEUTTS_DYNAMIC_REF_TEXT:
-        effective_ref_text = text
-
-    return _to_float_audio(model.infer(
-        text=text,
-        ref_codes=_neutts_speaker_codes,
-        ref_text=effective_ref_text,
-    ))
-
-
-def _generate_kokoro_audio(text: str, voice: Optional[str] = None) -> np.ndarray:
-    """Generate audio with Kokoro fallback backend."""
-    model = _ensure_tts_loaded()
-    audio_array = None
-    for result in model(
-        text=text,
-        voice=voice or KOKORO_VOICE,
-        speed=KOKORO_SPEED,
-        split_pattern=r'\n+',
-    ):
-        audio_array = result.audio if hasattr(result, 'audio') else result
-        break
-    if audio_array is None:
-        raise RuntimeError("Kokoro failed to generate audio")
-    return _to_float_audio(audio_array)
 
 
 def _generate_qwen3_tts_audio(text: str, voice: Optional[str] = None) -> np.ndarray:

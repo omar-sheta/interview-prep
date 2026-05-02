@@ -63,9 +63,7 @@ def _build_client(allow_admin=True):
     register_rest_routes(
         app,
         SimpleNamespace(
-            mx=None,
             build_sanity_check_graph=lambda: SimpleNamespace(invoke=lambda payload: {"value": payload["value"] + " processed by Node A"}),
-            check_qdrant_status=lambda: {"status": "disabled"},
             get_authenticated_rest_user_id=get_authenticated_rest_user_id,
             require_admin_rest_user=require_admin_rest_user,
             get_user_db=lambda: user_db,
