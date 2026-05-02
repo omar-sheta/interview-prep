@@ -13,10 +13,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from server.agents.state import InterviewState
 from server.config import settings
-from server.services.llm_factory import get_chat_model
+from server.adapters.llm import get_chat_model
 # CHANGED: Updated imports to match the new resume_tool function names
-from server.tools.resume_tool import get_all_skills, parse_resume_node, extract_text_from_pdf_bytes, parse_json_safely
-from server.tools.job_tool import get_bridge_role_suggestions, estimate_role_level
+from server.tools.resume import get_all_skills, parse_resume_node, extract_text_from_pdf_bytes, parse_json_safely
+from server.tools.job import get_bridge_role_suggestions, estimate_role_level
 
 
 # ============== Career Analysis State ==============
@@ -1240,7 +1240,7 @@ async def generate_interview_loop_node(state: CareerAnalysisState) -> CareerAnal
     user_msg = f"ROLE: {target_role} at {company}\nCANDIDATE GAPS: {gaps_text}"
 
     try:
-        from server.services.llm_factory import get_chat_model
+        from server.adapters.llm import get_chat_model
         chat_model = get_chat_model()
         response = await chat_model.ainvoke(
             [
@@ -1317,7 +1317,7 @@ def trigger_background_generation(
     Includes deduplication and time-based cooldown.
     """
     import time
-    from server.services.cache import get_question_cache
+    from server.adapters.cache import get_question_cache
 
     # Cooldown check (skip on force refresh)
     now = time.time()
@@ -1342,7 +1342,7 @@ def trigger_background_generation(
     cache = get_question_cache()
     persona_for_generation = "friendly"
     try:
-        from server.services.user_database import get_user_db
+        from server.persistence.user_database import get_user_db
         prefs = get_user_db().get_user_preferences(user_id) or {}
         incoming_persona = str(prefs.get("interviewer_persona") or "friendly").strip().lower()
         if incoming_persona in {"friendly", "strict"}:
@@ -1401,7 +1401,7 @@ def trigger_background_generation(
     _generation_cooldowns[user_id] = now
 
     async def _generate_task():
-        from server.agents.interview_nodes import generate_interview_questions
+        from server.agents.interview import generate_interview_questions
 
         try:
             print(f"🚀 Generating questions for {len(uncached_sessions)} session(s)...")
@@ -1462,7 +1462,7 @@ def trigger_background_generation(
 
                         # Persist to DB plan if applicable
                         try:
-                            from server.services.user_database import get_user_db
+                            from server.persistence.user_database import get_user_db
                             user_db = get_user_db()
                             if practice_plan and "rounds" in practice_plan:
                                 for round_ in practice_plan["rounds"]:
@@ -1625,7 +1625,7 @@ async def analyze_career_path(
     5. Deterministic: Build interview loop (template-based)
     6. Deterministic: Suggest bridge roles
     """
-    from server.tools.resume_tool import (
+    from server.tools.resume import (
         _run_resume_analysis_pipeline,
         extract_text_from_pdf_bytes,
     )
@@ -1937,7 +1937,7 @@ async def regenerate_suggestions(
     """
     
     try:
-        from server.services.llm_factory import get_chat_model
+        from server.adapters.llm import get_chat_model
         chat_model = get_chat_model()
         
         response = await chat_model.ainvoke(
@@ -1949,7 +1949,7 @@ async def regenerate_suggestions(
             max_tokens=getattr(settings, "LLM_JSON_MAX_TOKENS", 500),
         )
         
-        from server.tools.resume_tool import parse_json_safely
+        from server.tools.resume import parse_json_safely
         new_suggestions = parse_json_safely(response.content)
         
         if not new_suggestions or not isinstance(new_suggestions, list):

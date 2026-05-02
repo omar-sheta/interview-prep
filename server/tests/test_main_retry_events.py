@@ -148,7 +148,7 @@ class MainRetrySocketEventTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "_get_uid", return_value="user_123"),
             patch.object(main, "get_user_db", return_value=fake_db),
             patch.object(main.sio, "emit", new=AsyncMock()) as emit_mock,
-            patch("server.agents.interview_nodes.evaluate_answer_stream", new=AsyncMock(return_value=evaluated_payload)),
+            patch("server.agents.interview.evaluate_answer_stream", new=AsyncMock(return_value=evaluated_payload)),
         ):
             await main.submit_retry_answer(
                 "sid_1",

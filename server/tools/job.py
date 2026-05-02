@@ -10,7 +10,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from server.services.llm_factory import get_chat_model
+from server.adapters.llm import get_chat_model
 from server.config import settings
 
 
@@ -101,7 +101,7 @@ async def analyze_job_description(
     )
     response_text = result.content
 
-    from server.tools.resume_tool import parse_json_safely
+    from server.tools.resume import parse_json_safely
 
     parsed = parse_json_safely(response_text)
     if not parsed or not isinstance(parsed, dict):

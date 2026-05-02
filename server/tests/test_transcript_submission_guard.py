@@ -1,6 +1,6 @@
 import unittest
 
-from server.transcript import assess_submitted_transcript
+from server.domain.interview.transcript import assess_submitted_transcript
 
 
 class TranscriptSubmissionGuardTests(unittest.TestCase):

@@ -23,7 +23,7 @@ class QuestionCache:
     
     def _get_db(self):
         """Get UserDatabase instance."""
-        from server.services.user_database import get_user_db
+        from server.persistence.user_database import get_user_db
         return get_user_db()
     
     def set(self, key: str, value: Any, user_id: str = None, job_title: str = None, session_id: str = None):

@@ -67,7 +67,7 @@ def register_interview_events(sio, deps):
 
         async def send_hint():
             try:
-                from server.services.coaching_service import generate_coaching_hint
+                from server.agents.coaching import generate_coaching_hint
 
                 current_q = (
                     session.interview_questions[session.current_question_index]
@@ -359,8 +359,8 @@ def register_interview_events(sio, deps):
         await sio.emit("status", {"stage": "generating_questions", "user_id": session.user_id}, room=session.sid)
 
         try:
-            from server.agents.interview_nodes import generate_interview_questions
-            from server.services.cache import get_question_cache
+            from server.agents.interview import generate_interview_questions
+            from server.adapters.cache import get_question_cache
 
             if requested_question_count is None:
                 try:
@@ -626,7 +626,7 @@ def register_interview_events(sio, deps):
 
             async def send_initial_tip():
                 try:
-                    from server.services.coaching_service import generate_coaching_hint
+                    from server.agents.coaching import generate_coaching_hint
 
                     hint = await generate_coaching_hint(
                         transcript="",
@@ -765,7 +765,7 @@ def register_interview_events(sio, deps):
                 session._pending_eval_tasks = []
 
             async def _bg_evaluate(entry, q_idx):
-                from server.agents.interview_nodes import evaluate_answer_stream
+                from server.agents.interview import evaluate_answer_stream
 
                 try:
                     user_thresholds = deps.get_user_feedback_thresholds(session.user_id)
@@ -875,7 +875,7 @@ def register_interview_events(sio, deps):
 
     async def finish_interview(sid: str, session):
         """Complete interview and generate summary report."""
-        from server.agents.interview_nodes import generate_interview_summary
+        from server.agents.interview import generate_interview_summary
 
         session.accept_audio_chunks = False
         session.end_requested = False
@@ -1021,7 +1021,7 @@ def register_interview_events(sio, deps):
             return
 
         try:
-            from server.agents.interview_nodes import detect_struggle_and_coach
+            from server.agents.interview import detect_struggle_and_coach
 
             current_q = session.interview_questions[session.current_question_index]
             hint = await detect_struggle_and_coach(

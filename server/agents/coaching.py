@@ -7,7 +7,7 @@ Uses fast lightweight model (gemma3:4b) for quick responses.
 import json
 import re
 
-from server.services.llm_factory import get_fast_chat_model
+from server.adapters.llm import get_fast_chat_model
 from langchain_core.messages import SystemMessage, HumanMessage
 
 

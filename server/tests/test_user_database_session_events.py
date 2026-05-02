@@ -3,7 +3,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from server.services.user_database import UserDatabase
+from server.persistence.user_database import UserDatabase
 
 
 class UserDatabaseSessionEventTests(unittest.TestCase):

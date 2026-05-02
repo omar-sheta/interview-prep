@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from server.routes.preferences_events import register_preferences_events
+from server.realtime.preferences_events import register_preferences_events
 
 
 class _FakeSio:
@@ -59,10 +59,10 @@ class PreferencesEventsResumeTests(unittest.TestCase):
         )
         events = register_preferences_events(sio, deps)
 
-        fake_resume_tool = types.ModuleType("server.tools.resume_tool")
+        fake_resume_tool = types.ModuleType("server.tools.resume")
         fake_resume_tool.extract_text_from_pdf_bytes = lambda _bytes: "parsed resume text"
 
-        with patch.dict(sys.modules, {"server.tools.resume_tool": fake_resume_tool}):
+        with patch.dict(sys.modules, {"server.tools.resume": fake_resume_tool}):
             asyncio.run(
                 events.save_preferences(
                     "sid-1",

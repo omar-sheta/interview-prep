@@ -26,8 +26,8 @@ except Exception:
         return default
 
 from server.config import settings
-from server.services.llm_factory import get_chat_model
-from server.tools.resume_tool import parse_json_safely
+from server.adapters.llm import get_chat_model
+from server.tools.resume import parse_json_safely
 
 
 # ============== Interview State Schema ==============
@@ -1461,7 +1461,7 @@ async def evaluate_answer_stream(question, answer, callback, thresholds: Optiona
     """
     await callback("status", "Analyzing your answer...")
     
-    from server.services.llm_factory import get_chat_model
+    from server.adapters.llm import get_chat_model
     from langchain_core.messages import SystemMessage, HumanMessage
     
     llm = get_chat_model()

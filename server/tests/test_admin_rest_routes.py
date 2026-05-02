@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from server.routes.rest import register_rest_routes
+from server.api.rest import register_rest_routes
 
 
 class _FakeTask:

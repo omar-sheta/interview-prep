@@ -1,6 +1,6 @@
 import unittest
 
-from server.services.audio_service import WhisperCppStreamingProcessor
+from server.adapters.audio import WhisperCppStreamingProcessor
 
 
 class WhisperCppGpuDetectionTests(unittest.TestCase):

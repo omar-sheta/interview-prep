@@ -3,10 +3,10 @@ import io
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from server.agents import nodes
-from server.services import vector_service
-from server.services.vector_service import match_skills_semantically
-from server.tools import resume_tool
+from server.agents import career as nodes
+from server.adapters import vector_search as vector_service
+from server.adapters.vector_search import match_skills_semantically
+from server.tools import resume as resume_tool
 
 
 class ResumeAnalysisPipelineTests(unittest.TestCase):
@@ -98,7 +98,7 @@ class ResumeAnalysisPipelineTests(unittest.TestCase):
             "top_gaps": [],
         }
 
-        with patch("server.tools.resume_tool._run_resume_analysis_pipeline", new=AsyncMock(return_value=(expected, {"skill_mapping": {}}))):
+        with patch("server.tools.resume._run_resume_analysis_pipeline", new=AsyncMock(return_value=(expected, {"skill_mapping": {}}))):
             result = asyncio.run(
                 resume_tool.analyze_resume_and_job(
                     resume_text="Ada resume text",
@@ -157,7 +157,7 @@ class ResumeAnalysisPipelineTests(unittest.TestCase):
         }
 
         with patch.object(resume_tool.settings, "RESUME_ANALYSIS_SINGLE_LLM_TRIAL", True), \
-             patch("server.tools.resume_tool._run_holistic_resume_analysis_trial", new=AsyncMock(return_value=(trial_result, resume_tool._details_from_single_call_result(trial_result, "AI Security Researcher", "Microsoft")))):
+             patch("server.tools.resume._run_holistic_resume_analysis_trial", new=AsyncMock(return_value=(trial_result, resume_tool._details_from_single_call_result(trial_result, "AI Security Researcher", "Microsoft")))):
             result, details = asyncio.run(
                 resume_tool._run_resume_analysis_pipeline(
                     resume_text="resume",
@@ -187,7 +187,7 @@ class ResumeAnalysisPipelineTests(unittest.TestCase):
 
         fake_model = type("FakeModel", (), {"ainvoke": AsyncMock(return_value=fake_response)})()
 
-        with patch("server.tools.resume_tool.get_chat_model", return_value=fake_model):
+        with patch("server.tools.resume.get_chat_model", return_value=fake_model):
             result, details = asyncio.run(
                 resume_tool._run_holistic_resume_analysis_trial(
                     resume_text="resume",
@@ -298,8 +298,8 @@ class ResumeAnalysisPipelineTests(unittest.TestCase):
         async def fake_generate_mindmap_node(state):
             return {**state, "mindmap": "flowchart TD"}
 
-        with patch("server.tools.resume_tool._run_resume_analysis_pipeline", new=AsyncMock(return_value=(result_payload, details))), \
-             patch("server.agents.nodes.generate_mindmap_node", new=AsyncMock(side_effect=fake_generate_mindmap_node)):
+        with patch("server.tools.resume._run_resume_analysis_pipeline", new=AsyncMock(return_value=(result_payload, details))), \
+             patch("server.agents.career.generate_mindmap_node", new=AsyncMock(side_effect=fake_generate_mindmap_node)):
             state = asyncio.run(
                 nodes.analyze_career_path(
                     resume_text="Grace Hopper\nPython\nDocker",

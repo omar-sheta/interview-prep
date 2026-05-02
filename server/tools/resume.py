@@ -17,8 +17,8 @@ except Exception:
 
 from pypdf import PdfReader
 
-from server.services.llm_factory import get_chat_model
-from server.services.vector_service import match_skills_semantically
+from server.adapters.llm import get_chat_model
+from server.adapters.vector_search import match_skills_semantically
 from server.config import settings
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -634,7 +634,7 @@ def _learning_tip_for_skill(skill_name: str) -> str:
 
 
 def _details_from_single_call_result(result: dict[str, Any], job_title: str, company: str) -> dict[str, Any]:
-    from server.agents.nodes import _default_followup_questions
+    from server.agents.career import _default_followup_questions
 
     resume_data = {
         "personal_info": dict(result.get("personal_info", {}) or {}),
@@ -818,8 +818,8 @@ async def _run_resume_analysis_pipeline(
         except Exception as e:
             print(f"⚠️ Holistic resume analysis trial failed, falling back to structured pipeline: {e}")
 
-    from server.tools.job_tool import analyze_job_description
-    from server.agents.nodes import (
+    from server.tools.job import analyze_job_description
+    from server.agents.career import (
         _build_skill_coverage_board,
         _derive_followup_targets,
         _extract_candidate_skill_seed,

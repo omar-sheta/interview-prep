@@ -1,126 +1,56 @@
-# BeePrepared - Spark / Cloudflare Deployment
+# BeePrepared
 
-This project can run with a plain HTTP origin behind an upstream HTTPS proxy.
-The recommended deployment for the lab is:
-- public site: `https://beeprepared.cyber-hive.org`
-- DGX origin: `http://<dgx-host>:8443`
+BeePrepared is an AI interview coaching app with a Vite/React frontend and a
+FastAPI + Socket.IO backend. The backend is organized around an agent core:
+transport layers receive requests, agents orchestrate interview/career
+workflows, domain modules hold pure rules, and adapters own concrete runtime
+integrations such as LLM, TTS, STT, persistence, and vector search.
 
-## 1. Prerequisites on DGX
+## Project Map
 
-- Conda env `interview` with backend deps installed.
-- Node modules installed in `client/`:
-  - `cd client && npm install`
-- TLS cert/key in:
-  - `certs/cert.pem`
-  - `certs/key.pem`
+- `client/` - React UI, route screens, shared UI components, browser audio helpers, and Zustand state.
+- `server/app/` - FastAPI/Socket.IO application bootstrap, lifecycle, session state, and runtime entrypoint wiring.
+- `server/api/` - REST transport endpoints only.
+- `server/realtime/` - Socket.IO transport event handlers only.
+- `server/agents/` - Interview, career-analysis, and coaching orchestration.
+- `server/domain/` - Pure business rules such as transcript handling and interview-domain logic.
+- `server/adapters/` - Concrete integrations for LLMs, audio/STT, TTS, vector search, cache, and Qdrant.
+- `server/persistence/` - SQLite/user data storage.
+- `server/tools/` - Internal tools and tool registry seams for future MCP adapters.
+- `docs/` - Architecture, development, and deployment guides.
 
-If you do not have a company-trusted certificate yet, create a temporary self-signed cert (users will need to trust it manually):
+`server.main:app` remains the compatibility entrypoint used by `start.sh`,
+Uvicorn, and existing operational scripts.
 
-```bash
-openssl req -x509 -nodes -newkey rsa:4096 -days 365 \
-  -keyout certs/key.pem \
-  -out certs/cert.pem
-```
+## Common Commands
 
-## 2. Start the app
-
-From repo root:
-
-```bash
-cp .env.example .env
-chmod +x start.sh
-ORIGIN_SCHEME=http ORIGIN_PORT=8443 PUBLIC_SCHEME=https PUBLIC_HOST=beeprepared.cyber-hive.org PUBLIC_PORT=443 ./start.sh
-```
-
-If frontend is already built and `npm` is unavailable in your runtime shell:
+From the repo root:
 
 ```bash
-BUILD_CLIENT=0 ORIGIN_SCHEME=http ORIGIN_PORT=8443 PUBLIC_SCHEME=https PUBLIC_HOST=beeprepared.cyber-hive.org PUBLIC_PORT=443 ./start.sh
+make backend-test
+make frontend-build
+make check
 ```
 
-What `start.sh` does:
-- Builds frontend (`client/dist`)
-- Loads `.env` if present
-- Checks the configured LLM endpoint
-- Starts/reloads Caddy with `Caddyfile` or `Caddyfile.http` depending on `ORIGIN_SCHEME`
-- Runs backend on `${HOST:-0.0.0.0}:${PORT:-8000}`
-
-## 3. Share with company users
-
-Share this URL:
-
-`https://beeprepared.cyber-hive.org`
-
-If your users access via IP instead, set `PUBLIC_HOST` accordingly and ensure origin is allowed:
+Direct commands:
 
 ```bash
-CORS_ORIGINS="https://beeprepared.cyber-hive.org,https://beeprepared.cyber-hive.org:443,https://192.168.1.48:8443" ./start.sh
+/home/omar/miniforge3/envs/interview/bin/python -m pytest server/tests
+cd client && npm run build
+cd client && npm run lint
 ```
 
-`CORS_ORIGINS` accepts either:
-- comma-separated string, or
-- JSON list
+## Feature Workflow
 
-## 4. Runtime Config
+1. Add request/response handling in `server/api` or `server/realtime`.
+2. Put orchestration in `server/agents`.
+3. Put pure rules and parsing in `server/domain`.
+4. Put concrete external/runtime calls in `server/adapters` or `server/persistence`.
+5. Register reusable internal capabilities through `server/tools` when agents should call them as tools.
+6. Preserve public REST paths, Socket.IO event names, payload shapes, env vars, and database behavior unless a feature explicitly changes them.
 
-Use `.env` for DGX hostnames/IPs and model endpoints. `LLM_PROVIDER=lmstudio` is the correct setting for any OpenAI-compatible `/v1` server, even if you are not using the LM Studio desktop app.
+## Deployment
 
-Key settings:
-- `LLM_BASE_URL`
-- `LLM_API_KEY`
-- `CORS_ORIGINS`
-- `PUBLIC_HOST`
-- `PIPER_MODEL_PATH`
-- `WHISPER_MODEL_ID`
-
-## 4.1 Cloudflare Notes
-
-If `cyber-hive.org` is already serving the lab website on port `443`, the cleanest BeePrepared deployment is:
-
-- keep the main website on `https://cyber-hive.org`
-- expose BeePrepared separately on `https://beeprepared.cyber-hive.org`
-
-Recommended setup:
-
-1. Point Cloudflare DNS for `beeprepared.cyber-hive.org` to the DGX/Spark host and keep it proxied.
-2. Open inbound `8443/tcp` from the upstream proxy or gateway to the DGX host if the tunnel/gateway is not on the same machine.
-3. Either:
-   - terminate HTTPS upstream and forward to BeePrepared over HTTP on `8443`, or
-   - use a real origin certificate in `certs/cert.pem` and `certs/key.pem` for direct HTTPS at the origin instead.
-4. Start BeePrepared with `ORIGIN_SCHEME=http ORIGIN_PORT=8443 PUBLIC_SCHEME=https PUBLIC_HOST=beeprepared.cyber-hive.org PUBLIC_PORT=443`.
-
-Because this app already serves the frontend and Socket.IO from the same origin, no separate `VITE_SOCKET_URL` is required for this deployment.
-
-## 5. Performance (DGX Spark)
-
-DGX Spark is ARM64 + NVIDIA GB10. The Spark path here uses OpenAI-compatible LLM endpoints, faster-whisper on CUDA, and Piper by default.
-
-Fast profile is enabled by default in `start.sh` (`SPARK_FAST_PRESET=1`), which sets:
-- lower-latency LLM context/stream batching
-- faster-whisper decode defaults (`beam_size=1`, `best_of=1`)
-- Piper fast style for snappier question audio
-
-Check GPU contention before testing:
-
-```bash
-nvidia-smi
-```
-
-If non-Ollama jobs (for example LM Studio/Jupyter training jobs) are using most VRAM, latency will spike.
-Stop those jobs or run this app on a less-busy GPU.
-
-Optional overrides:
-
-```bash
-SPARK_FAST_PRESET=1 \
-LLM_MODEL_ID=qwen3:8b \
-LLM_NUM_CTX=4096 \
-WHISPER_MODEL_ID=large-v3 \
-./start.sh
-```
-
-## 6. Stop services
-
-- Stop backend with `Ctrl+C`
-- Stop Caddy:
-  - `./caddy stop`
+Spark/systemd/Caddy deployment notes live in
+[`docs/deployment/spark.md`](docs/deployment/spark.md). Cleanup branches should
+not restart or deploy the live service.

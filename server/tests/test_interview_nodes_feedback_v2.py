@@ -25,9 +25,9 @@ except Exception:
     sys.modules["langchain_core.messages"] = messages_mod
 
 try:
-    importlib.import_module("server.services.llm_factory")
+    importlib.import_module("server.adapters.llm")
 except Exception:
-    llm_factory_mod = types.ModuleType("server.services.llm_factory")
+    llm_factory_mod = types.ModuleType("server.adapters.llm")
 
     class _NoopModel:
         async def astream(self, _messages):
@@ -35,22 +35,22 @@ except Exception:
                 yield None
 
     llm_factory_mod.get_chat_model = lambda: _NoopModel()
-    sys.modules["server.services.llm_factory"] = llm_factory_mod
+    sys.modules["server.adapters.llm"] = llm_factory_mod
 
 try:
-    importlib.import_module("server.tools.resume_tool")
+    importlib.import_module("server.tools.resume")
 except Exception:
-    resume_tool_mod = types.ModuleType("server.tools.resume_tool")
+    resume_tool_mod = types.ModuleType("server.tools.resume")
     resume_tool_mod.parse_json_safely = lambda text: json.loads(text) if isinstance(text, str) and text.strip().startswith("{") else {"questions": []}
     resume_tool_mod.re = re
-    sys.modules["server.tools.resume_tool"] = resume_tool_mod
+    sys.modules["server.tools.resume"] = resume_tool_mod
 
 if importlib.util.find_spec("pydantic_settings") is None and "server.config" not in sys.modules:
     config_mod = types.ModuleType("server.config")
     config_mod.settings = types.SimpleNamespace(FEEDBACK_LOOP_V2=True)
     sys.modules["server.config"] = config_mod
 
-from server.agents import interview_nodes as nodes
+from server.agents import interview as nodes
 
 
 class FeedbackLoopV2EvaluationTests(unittest.TestCase):
@@ -248,7 +248,7 @@ class EvaluateAnswerStreamRegressionTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         with (
-            patch("server.services.llm_factory.get_chat_model", return_value=object()),
+            patch("server.adapters.llm.get_chat_model", return_value=object()),
             patch.object(nodes, "_invoke_structured_output", new=AsyncMock(return_value=structured_payload)),
         ):
             evaluation = await nodes.evaluate_answer_stream(

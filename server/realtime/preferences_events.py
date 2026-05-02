@@ -11,7 +11,7 @@ def register_preferences_events(sio, deps):
     def extract_resume_text_from_payload(resume_payload):
         """Decode a base64 PDF payload into extracted resume text."""
         import base64
-        from server.tools.resume_tool import extract_text_from_pdf_bytes
+        from server.tools.resume import extract_text_from_pdf_bytes
 
         payload = str(resume_payload or "").strip()
         if not payload:
@@ -177,7 +177,7 @@ def register_preferences_events(sio, deps):
 
         if force_refresh:
             try:
-                from server.services.cache import get_question_cache
+                from server.adapters.cache import get_question_cache
 
                 get_question_cache().delete_user_keys(user_id)
             except Exception as exc:
@@ -290,7 +290,7 @@ def register_preferences_events(sio, deps):
         async def run_analysis():
             try:
                 import json
-                from server.agents.nodes import (
+                from server.agents.career import (
                     analyze_career_path,
                     normalize_practice_plan_titles,
                     trigger_background_generation,
@@ -559,7 +559,7 @@ def register_preferences_events(sio, deps):
             "interviewer_persona": str((original_eval or {}).get("interviewer_persona") or "").strip().lower(),
         }
 
-        from server.agents.interview_nodes import evaluate_answer_stream
+        from server.agents.interview import evaluate_answer_stream
 
         if question_payload["interviewer_persona"] not in {"friendly", "strict"}:
             try:
@@ -644,7 +644,7 @@ def register_preferences_events(sio, deps):
         user_db = deps.get_user_db()
         user_db.reset_analysis_workspace(user_id)
         try:
-            from server.services.cache import get_question_cache
+            from server.adapters.cache import get_question_cache
 
             get_question_cache().delete_user_keys(user_id)
         except Exception as exc:
@@ -666,7 +666,7 @@ def register_preferences_events(sio, deps):
         user_db = deps.get_user_db()
         user_db.clear_user_configuration(user_id)
         try:
-            from server.services.cache import get_question_cache
+            from server.adapters.cache import get_question_cache
 
             get_question_cache().delete_user_keys(user_id)
         except Exception as exc:
@@ -725,7 +725,7 @@ def register_preferences_events(sio, deps):
         user_db = deps.get_user_db()
         user_db.reset_all_user_data(user_id)
         try:
-            from server.services.cache import get_question_cache
+            from server.adapters.cache import get_question_cache
 
             get_question_cache().delete_user_keys(user_id)
         except Exception as exc:
@@ -813,8 +813,8 @@ def register_preferences_events(sio, deps):
 
         try:
             import traceback
-            from server.agents.nodes import regenerate_suggestions as regenerate_suggestions_impl
-            from server.agents.nodes import trigger_background_generation
+            from server.agents.career import regenerate_suggestions as regenerate_suggestions_impl
+            from server.agents.career import trigger_background_generation
 
             new_suggestions = await regenerate_suggestions_impl(state, user_prompt)
             new_state = {**state, "suggested_sessions": new_suggestions}

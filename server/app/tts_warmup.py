@@ -6,7 +6,7 @@ import asyncio
 import os
 from typing import Optional
 
-from server.services.tts_service import get_tts_service, preload_tts
+from server.adapters.tts import get_tts_service, preload_tts
 
 TTS_RESPONSE_TIMEOUT_SEC = float(os.getenv("TTS_RESPONSE_TIMEOUT_SEC", "90"))
 TTS_TIMEOUT_PER_CHAR_SEC = float(os.getenv("TTS_TIMEOUT_PER_CHAR_SEC", "0.08"))
