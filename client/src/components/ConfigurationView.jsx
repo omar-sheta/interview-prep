@@ -545,28 +545,43 @@ export default function ConfigurationView() {
                     quickActionIcon={<BoltOutlined />}
                     onQuickAction={() => openQuickDialog('mixed')}
                 />
-                <Container maxWidth="lg" sx={{ pt: { xs: 2.5, md: 4 } }}>
+                <Container maxWidth="xl" sx={{ pt: { xs: 2.5, md: 4 } }}>
                     <Stack spacing={{ xs: 2.4, md: 3 }}>
                         <SectionCard
                             eyebrow="Profile"
-                            title="Your Interview Workspace"
-                            description="Keep the essentials visible: target role, job description, resume, and interview defaults. Advanced audio controls stay tucked away until you need them."
+                            title="Build the interview brief."
+                            description="One clean workspace for the role, company context, resume signal, and session defaults."
+                            sx={{
+                                background: darkMode
+                                    ? 'linear-gradient(145deg, rgba(18,21,27,0.95), rgba(28,20,15,0.86))'
+                                    : 'linear-gradient(145deg, rgba(255,253,248,0.96), rgba(255,255,255,0.82))',
+                            }}
                             action={(
-                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', md: 'auto' } }}>
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.1} sx={{ width: { xs: '100%', md: 'auto' } }}>
                                     <Chip
                                         size="small"
                                         label={`Readiness ${readinessPercent}%`}
                                         sx={{
-                                            fontWeight: 700,
+                                            fontWeight: 800,
                                             alignSelf: { xs: 'stretch', sm: 'center' },
                                             justifyContent: 'center',
-                                            background: 'linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15))',
-                                            color: '#a78bfa',
-                                            borderColor: 'rgba(139,92,246,0.3)',
+                                            minHeight: 42,
+                                            px: 0.8,
+                                            background: darkMode
+                                                ? 'rgba(255,255,255,0.06)'
+                                                : 'rgba(24,32,44,0.06)',
+                                            color: 'text.primary',
+                                            borderColor: darkMode ? 'rgba(255,255,255,0.12)' : 'rgba(24,32,44,0.12)',
                                             border: '1px solid',
                                         }}
                                     />
-                                    <Button variant="outlined" startIcon={<Save />} onClick={saveConfig} disabled={isAnalyzing}>
+                                    <Button
+                                        variant="outlined"
+                                        startIcon={<Save />}
+                                        onClick={saveConfig}
+                                        disabled={isAnalyzing}
+                                        sx={{ minHeight: 46, minWidth: { sm: 112 } }}
+                                    >
                                         Save
                                     </Button>
                                     <Button
@@ -574,11 +589,7 @@ export default function ConfigurationView() {
                                         startIcon={isAnalyzing ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
                                         onClick={runAnalysis}
                                         disabled={isAnalyzing}
-                                        sx={{
-                                            background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
-                                            '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
-                                            boxShadow: '0 4px 14px 0 rgba(99, 102, 241, 0.28)',
-                                        }}
+                                        sx={{ minHeight: 46, minWidth: { sm: 148 } }}
                                     >
                                         {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
                                     </Button>
