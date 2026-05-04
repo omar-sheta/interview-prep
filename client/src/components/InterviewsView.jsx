@@ -275,43 +275,88 @@ export default function InterviewsView() {
                     onQuickAction={openQuickDialog}
                 />
 
-                <Container maxWidth="lg" sx={{ pt: { xs: 3.5, sm: 3, md: 4 } }}>
+                <Container maxWidth="lg" sx={{ pt: { xs: 2.4, sm: 2.6, md: 3 } }}>
                     <Stack spacing={{ xs: 2.4, md: 3 }}>
-                        <SectionCard
-                            eyebrow="Practice Console"
-                            title="Choose a session and start talking."
-                            description="Keep the setup light: use your analyzed profile for targeted practice, or launch a quick mock interview when you just want reps."
+                        <Paper
                             sx={{
+                                p: { xs: 2, md: 2.35 },
+                                borderRadius: 3,
                                 background: darkMode
-                                    ? 'linear-gradient(135deg, rgba(245,158,11,0.10), rgba(23,23,23,0.96) 56%, rgba(255,255,255,0.04))'
-                                    : 'linear-gradient(135deg, rgba(255,255,255,0.98), rgba(255,250,243,0.94))',
+                                    ? 'linear-gradient(135deg, rgba(255,255,255,0.05), rgba(23,23,23,0.96))'
+                                    : 'linear-gradient(135deg, rgba(255,255,255,0.98), rgba(255,252,247,0.94))',
+                                boxShadow: darkMode
+                                    ? '0 14px 34px rgba(0,0,0,0.28)'
+                                    : '0 12px 30px rgba(31,41,55,0.055)',
                             }}
-                            action={(
-                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', md: 'auto' } }}>
+                        >
+                            <Stack
+                                direction={{ xs: 'column', md: 'row' }}
+                                spacing={{ xs: 1.6, md: 2 }}
+                                alignItems={{ xs: 'stretch', md: 'center' }}
+                                justifyContent="space-between"
+                            >
+                                <Box sx={{ minWidth: 0, flex: 1 }}>
+                                    <Typography
+                                        variant="overline"
+                                        sx={{
+                                            color: 'text.secondary',
+                                            letterSpacing: '0.14em',
+                                            fontWeight: 800,
+                                        }}
+                                    >
+                                        Practice Console
+                                    </Typography>
+                                    <Typography variant="h5" sx={{ mt: -0.35, maxWidth: 720 }}>
+                                        Choose a session and start talking.
+                                    </Typography>
+                                    <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5, maxWidth: 760 }}>
+                                        Use your analyzed profile for targeted practice, or launch a quick mock interview when you just want reps.
+                                    </Typography>
+                                </Box>
+                                <Stack
+                                    direction={{ xs: 'column', sm: 'row' }}
+                                    spacing={1}
+                                    sx={{ width: { xs: '100%', md: 'auto' }, flexShrink: 0 }}
+                                >
                                     <Button
                                         variant="contained"
+                                        size="medium"
                                         startIcon={<PlayArrow />}
                                         onClick={() => hasConfiguration ? handleStart(recommendedType) : openQuickDialog('mixed')}
                                         disabled={isAnalyzing || startingType === recommendedType.id}
                                         fullWidth
+                                        sx={{ minHeight: 42, minWidth: { md: 172 } }}
                                     >
                                         {hasConfiguration ? 'Start Recommended' : 'Start Quick Mock'}
                                     </Button>
-                                    <Button variant="outlined" onClick={() => navigate('/config')} fullWidth>
+                                    <Button
+                                        variant="outlined"
+                                        size="medium"
+                                        onClick={() => navigate('/config')}
+                                        fullWidth
+                                        sx={{ minHeight: 42, minWidth: { md: 132 } }}
+                                    >
                                         Edit Profile
                                     </Button>
                                 </Stack>
-                            )}
-                        >
-                            <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={2}>
-                                <Box>
-                                    <Typography variant="subtitle2" sx={{ color: 'text.secondary', mb: 0.7 }}>
+                            </Stack>
+
+                            <Divider sx={{ my: { xs: 1.5, md: 1.7 } }} />
+
+                            <Stack
+                                direction={{ xs: 'column', md: 'row' }}
+                                justifyContent="space-between"
+                                alignItems={{ xs: 'flex-start', md: 'center' }}
+                                spacing={1.3}
+                            >
+                                <Box sx={{ minWidth: 0 }}>
+                                    <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.3 }}>
                                         Current profile
                                     </Typography>
-                                    <Typography variant="h6">
+                                    <Typography variant="subtitle1" sx={{ fontWeight: 800 }}>
                                         {targetRole || 'No target role yet'} {targetCompany ? `at ${targetCompany}` : ''}
                                     </Typography>
-                                    <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5, maxWidth: 620 }}>
+                                    <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.25 }}>
                                         {hasConfiguration
                                             ? `${questionCount} questions with the ${activePersona.label.toLowerCase()} persona.`
                                             : 'You can still launch a quick mock interview, then come back to add resume-based analysis.'}
@@ -320,16 +365,15 @@ export default function InterviewsView() {
                                 <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                                     <Chip size="small" label={isConnected ? 'Connected' : 'Connecting'} color={isConnected ? 'success' : 'default'} variant="outlined" />
                                     <Chip size="small" label={readinessPercent > 0 ? `Readiness ${readinessPercent}%` : 'Quick Start'} color={readinessPercent > 0 ? 'default' : 'info'} variant="outlined" />
-                                    <Chip size="small" label={`${questionCount} questions`} variant="outlined" />
                                     <Chip size="small" label={activePersona.label} variant="outlined" />
                                 </Stack>
                             </Stack>
                             {analysisProgress && (
-                                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 1.6 }}>
+                                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 1 }}>
                                     {analysisProgress}
                                 </Typography>
                             )}
-                        </SectionCard>
+                        </Paper>
 
                         <SectionCard
                             title="Interviewer Style"
