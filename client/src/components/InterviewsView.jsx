@@ -27,7 +27,6 @@ import {
     PlayArrow,
     BoltOutlined,
     Close,
-    AutoAwesome,
 } from '@mui/icons-material';
 import { createHiveTheme } from '@/theme/hiveTheme';
 import HiveTopNav from '@/components/ui/HiveTopNav';
@@ -276,152 +275,68 @@ export default function InterviewsView() {
                     onQuickAction={openQuickDialog}
                 />
 
-                <Container maxWidth="xl" sx={{ pt: { xs: 3.5, sm: 3, md: 4 } }}>
+                <Container maxWidth="lg" sx={{ pt: { xs: 3.5, sm: 3, md: 4 } }}>
                     <Stack spacing={{ xs: 2.4, md: 3 }}>
-                        <Paper
+                        <SectionCard
+                            eyebrow="Practice Console"
+                            title="Choose a session and start talking."
+                            description="Keep the setup light: use your analyzed profile for targeted practice, or launch a quick mock interview when you just want reps."
                             sx={{
-                                position: 'relative',
-                                overflow: 'hidden',
-                                borderRadius: { xs: 4, md: 6 },
-                                p: { xs: 2.6, md: 4.5 },
-                                minHeight: { md: 360 },
-                                color: '#FFF8ED',
-                                border: '1px solid rgba(255,255,255,0.12)',
-                                background:
-                                    'radial-gradient(circle at 78% 18%, rgba(255,154,77,0.36), transparent 28%), radial-gradient(circle at 16% 92%, rgba(246,161,0,0.2), transparent 26%), linear-gradient(135deg, #111827 0%, #1D2430 42%, #3A1D12 100%)',
-                                boxShadow: darkMode
-                                    ? '0 34px 90px rgba(0,0,0,0.55)'
-                                    : '0 34px 90px rgba(80,52,22,0.22)',
-                                '&::before': {
-                                    content: '""',
-                                    position: 'absolute',
-                                    inset: 0,
-                                    backgroundImage:
-                                        'linear-gradient(rgba(255,255,255,0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px)',
-                                    backgroundSize: '42px 42px',
-                                    maskImage: 'linear-gradient(90deg, black, transparent 78%)',
-                                    pointerEvents: 'none',
-                                },
+                                background: darkMode
+                                    ? 'linear-gradient(135deg, rgba(245,158,11,0.10), rgba(23,23,23,0.96) 56%, rgba(255,255,255,0.04))'
+                                    : 'linear-gradient(135deg, rgba(255,255,255,0.98), rgba(255,250,243,0.94))',
                             }}
-                        >
-                            <Stack
-                                direction={{ xs: 'column', md: 'row' }}
-                                justifyContent="space-between"
-                                alignItems={{ xs: 'stretch', md: 'center' }}
-                                spacing={{ xs: 3, md: 5 }}
-                                sx={{ position: 'relative', zIndex: 1 }}
-                            >
-                                <Box sx={{ maxWidth: 760 }}>
-                                    <Chip
-                                        icon={<AutoAwesome />}
-                                        label={isConnected ? 'Live AI interview console' : 'Connecting interview engine'}
-                                        sx={{
-                                            mb: 2.2,
-                                            color: '#FFF8ED',
-                                            bgcolor: 'rgba(255,255,255,0.1)',
-                                            border: '1px solid rgba(255,255,255,0.16)',
-                                            '& .MuiChip-icon': { color: '#FFD36A' },
-                                        }}
-                                    />
-                                    <Typography variant="h3" sx={{ maxWidth: 690 }}>
-                                        Practice like the interview is already real.
-                                    </Typography>
-                                    <Typography
-                                        variant="body1"
-                                        sx={{ color: 'rgba(255,248,237,0.76)', mt: 2, maxWidth: 650, fontSize: { md: '1.06rem' } }}
+                            action={(
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', md: 'auto' } }}>
+                                    <Button
+                                        variant="contained"
+                                        startIcon={<PlayArrow />}
+                                        onClick={() => hasConfiguration ? handleStart(recommendedType) : openQuickDialog('mixed')}
+                                        disabled={isAnalyzing || startingType === recommendedType.id}
+                                        fullWidth
                                     >
+                                        {hasConfiguration ? 'Start Recommended' : 'Start Quick Mock'}
+                                    </Button>
+                                    <Button variant="outlined" onClick={() => navigate('/config')} fullWidth>
+                                        Edit Profile
+                                    </Button>
+                                </Stack>
+                            )}
+                        >
+                            <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" spacing={2}>
+                                <Box>
+                                    <Typography variant="subtitle2" sx={{ color: 'text.secondary', mb: 0.7 }}>
+                                        Current profile
+                                    </Typography>
+                                    <Typography variant="h6">
+                                        {targetRole || 'No target role yet'} {targetCompany ? `at ${targetCompany}` : ''}
+                                    </Typography>
+                                    <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5, maxWidth: 620 }}>
                                         {hasConfiguration
-                                            ? `${targetRole}${targetCompany ? ` at ${targetCompany}` : ''}. ${questionCount} focused questions with the ${activePersona.label.toLowerCase()} interviewer.`
-                                            : 'Launch a polished quick mock now, or add your profile once for sharper, resume-aware practice.'}
+                                            ? `${questionCount} questions with the ${activePersona.label.toLowerCase()} persona.`
+                                            : 'You can still launch a quick mock interview, then come back to add resume-based analysis.'}
                                     </Typography>
-                                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.2} sx={{ mt: 3, maxWidth: { xs: '100%', sm: 560 } }}>
-                                        <Button
-                                            variant="contained"
-                                            size="large"
-                                            startIcon={isAnalyzing || startingType === recommendedType.id ? <CircularProgress size={16} color="inherit" /> : <PlayArrow />}
-                                            onClick={() => hasConfiguration ? handleStart(recommendedType) : openQuickDialog('mixed')}
-                                            disabled={isAnalyzing || startingType === recommendedType.id}
-                                            fullWidth
-                                            sx={{
-                                                minHeight: 54,
-                                                background: 'linear-gradient(135deg, #FFD36A 0%, #FF6A1A 62%, #E1420B 100%)',
-                                                color: '#17110D',
-                                                boxShadow: '0 18px 42px rgba(255,106,26,0.32)',
-                                                '&:hover': {
-                                                    background: 'linear-gradient(135deg, #FFE19A 0%, #FF6A1A 62%, #C93407 100%)',
-                                                },
-                                            }}
-                                        >
-                                            {hasConfiguration ? 'Start Mock Interview' : 'Start Quick Mock'}
-                                        </Button>
-                                        <Button
-                                            variant="outlined"
-                                            size="large"
-                                            onClick={() => navigate('/config')}
-                                            fullWidth
-                                            sx={{
-                                                minHeight: 54,
-                                                color: '#FFF8ED',
-                                                borderColor: 'rgba(255,255,255,0.28)',
-                                                bgcolor: 'rgba(255,255,255,0.06)',
-                                                '&:hover': {
-                                                    borderColor: '#FFD36A',
-                                                    bgcolor: 'rgba(255,255,255,0.11)',
-                                                },
-                                            }}
-                                        >
-                                            Refine Profile
-                                        </Button>
-                                    </Stack>
                                 </Box>
-
-                                <Paper
-                                    sx={{
-                                        width: { xs: '100%', md: 310 },
-                                        p: 2.2,
-                                        borderRadius: 5,
-                                        color: '#FFF8ED',
-                                        bgcolor: 'rgba(255,255,255,0.08)',
-                                        border: '1px solid rgba(255,255,255,0.16)',
-                                        backdropFilter: 'blur(20px)',
-                                        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.1)',
-                                    }}
-                                >
-                                    <Typography variant="caption" sx={{ color: 'rgba(255,248,237,0.62)', fontWeight: 800, letterSpacing: '0.16em' }}>
-                                        SESSION READINESS
-                                    </Typography>
-                                    <Stack direction="row" alignItems="flex-end" spacing={1} sx={{ mt: 1 }}>
-                                        <Typography variant="h3">{readinessPercent || '--'}</Typography>
-                                        <Typography variant="h6" sx={{ color: 'rgba(255,248,237,0.62)', mb: 0.8 }}>%</Typography>
-                                    </Stack>
-                                    <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.12)' }} />
-                                    <Stack spacing={1.2}>
-                                        {[
-                                            ['Questions', questionCount],
-                                            ['Style', activePersona.label],
-                                            ['Status', isConnected ? 'Connected' : 'Connecting'],
-                                        ].map(([label, value]) => (
-                                            <Stack key={label} direction="row" justifyContent="space-between" spacing={2}>
-                                                <Typography variant="body2" sx={{ color: 'rgba(255,248,237,0.62)' }}>{label}</Typography>
-                                                <Typography variant="body2" sx={{ fontWeight: 800 }}>{value}</Typography>
-                                            </Stack>
-                                        ))}
-                                    </Stack>
-                                </Paper>
+                                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                                    <Chip size="small" label={isConnected ? 'Connected' : 'Connecting'} color={isConnected ? 'success' : 'default'} variant="outlined" />
+                                    <Chip size="small" label={readinessPercent > 0 ? `Readiness ${readinessPercent}%` : 'Quick Start'} color={readinessPercent > 0 ? 'default' : 'info'} variant="outlined" />
+                                    <Chip size="small" label={`${questionCount} questions`} variant="outlined" />
+                                    <Chip size="small" label={activePersona.label} variant="outlined" />
+                                </Stack>
                             </Stack>
                             {analysisProgress && (
-                                <Typography variant="caption" sx={{ color: 'rgba(255,248,237,0.6)', display: 'block', mt: 2.4, position: 'relative', zIndex: 1 }}>
+                                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 1.6 }}>
                                     {analysisProgress}
                                 </Typography>
                             )}
-                        </Paper>
+                        </SectionCard>
 
                         <SectionCard
                             title="Interviewer Style"
-                            description="Choose the room you want to walk into. This should feel like a setting, not a form."
-                            sx={{ p: { xs: 2.2, md: 2.6 } }}
+                            description="Pick the vibe once; every session below uses it."
+                            action={<Chip size="small" label={`Active: ${activePersona.label}`} color="secondary" variant="outlined" />}
                         >
-                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.3 }}>
+                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.2 }}>
                                 {PERSONA_OPTIONS.map((persona) => {
                                     const Icon = persona.icon;
                                     const selected = selectedPersona === persona.id;
@@ -438,44 +353,27 @@ export default function InterviewsView() {
                                                 }
                                             }}
                                             sx={{
-                                                p: 1.8,
-                                                borderRadius: 4,
+                                                p: 1.5,
+                                                borderRadius: 3,
                                                 cursor: 'pointer',
-                                                bgcolor: selected
-                                                    ? (darkMode ? 'rgba(255,106,26,0.16)' : 'rgba(255,106,26,0.08)')
-                                                    : (darkMode ? 'rgba(255,255,255,0.035)' : 'rgba(255,255,255,0.72)'),
                                                 border: selected
-                                                    ? '1px solid rgba(255, 106, 26, 0.58)'
-                                                    : '1px solid rgba(24, 32, 44, 0.08)',
-                                                boxShadow: selected ? '0 18px 44px rgba(255,106,26,0.12)' : 'none',
+                                                    ? '1px solid rgba(245, 158, 11, 0.72)'
+                                                    : '1px solid rgba(245, 158, 11, 0.2)',
+                                                boxShadow: selected ? '0 0 0 1px rgba(245,158,11,0.25)' : undefined,
                                                 transition: 'transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease',
                                                 '&:hover': {
-                                                    transform: 'translateY(-2px)',
-                                                    borderColor: 'rgba(255, 106, 26, 0.5)',
+                                                    transform: 'translateY(-1px)',
+                                                    borderColor: 'rgba(245, 158, 11, 0.5)',
                                                 },
                                             }}
                                         >
-                                            <Stack direction="row" spacing={1.4} alignItems="center">
-                                                <Box
-                                                    sx={{
-                                                        width: 44,
-                                                        height: 44,
-                                                        borderRadius: 3,
-                                                        display: 'grid',
-                                                        placeItems: 'center',
-                                                        color: selected ? '#FFFFFF' : 'primary.main',
-                                                        background: selected
-                                                            ? 'linear-gradient(135deg, #18202C, #FF6A1A)'
-                                                            : (darkMode ? 'rgba(255,255,255,0.06)' : 'rgba(255,106,26,0.08)'),
-                                                    }}
-                                                >
-                                                    <Icon />
-                                                </Box>
+                                            <Stack direction="row" spacing={1} alignItems="center">
+                                                <Icon sx={{ color: selected ? 'primary.main' : 'text.secondary' }} />
                                                 <Box sx={{ minWidth: 0 }}>
-                                                    <Typography variant="subtitle1">
+                                                    <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                                                         {persona.label}
                                                     </Typography>
-                                                    <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.2 }}>
+                                                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
                                                         {persona.description}
                                                     </Typography>
                                                 </Box>
@@ -505,12 +403,11 @@ export default function InterviewsView() {
                         )}
 
                         {hasConfiguration && (
-                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: { xs: 1.6, md: 2 } }}>
+                            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.8 }}>
                                 {INTERVIEW_TYPES.map((type) => {
                                     const quickTypeMatch = QUICK_INTERVIEW_TYPES.find((item) => item.id === type.id);
                                     const Icon = quickTypeMatch?.icon;
                                     const isStarting = startingType === type.id;
-                                    const isRecommended = type.id === 'mixed';
                                     return (
                                         <Paper
                                             key={type.id}
@@ -524,67 +421,33 @@ export default function InterviewsView() {
                                                 }
                                             }}
                                             sx={{
-                                                p: { xs: 2.2, md: 2.8 },
-                                                minHeight: 260,
+                                                p: { xs: 2.2, md: 2.6 },
+                                                minHeight: 236,
                                                 display: 'flex',
                                                 flexDirection: 'column',
                                                 justifyContent: 'space-between',
                                                 cursor: isStarting || isAnalyzing ? 'default' : 'pointer',
-                                                position: 'relative',
-                                                overflow: 'hidden',
-                                                border: isRecommended
-                                                    ? '1px solid rgba(255, 106, 26, 0.38)'
-                                                    : '1px solid rgba(24, 32, 44, 0.08)',
-                                                bgcolor: darkMode ? 'rgba(255,255,255,0.035)' : 'rgba(255,255,255,0.68)',
-                                                transition: 'transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease, background 180ms ease',
-                                                '&::before': {
-                                                    content: '""',
-                                                    position: 'absolute',
-                                                    top: 0,
-                                                    left: 0,
-                                                    right: 0,
-                                                    height: 4,
-                                                    background: isRecommended
-                                                        ? 'linear-gradient(90deg, #FFD36A, #FF6A1A)'
-                                                        : 'linear-gradient(90deg, rgba(24,32,44,0.14), rgba(24,32,44,0.02))',
-                                                },
+                                                border: darkMode ? '1px solid rgba(255,255,255,0.08)' : '1px solid rgba(31,41,55,0.08)',
+                                                bgcolor: darkMode ? 'rgba(255,255,255,0.035)' : 'rgba(255,255,255,0.72)',
+                                                transition: 'transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease',
                                                 '&:hover': isStarting || isAnalyzing ? {} : {
-                                                    transform: 'translateY(-5px)',
-                                                    borderColor: 'rgba(255, 106, 26, 0.5)',
+                                                    transform: 'translateY(-3px)',
+                                                    borderColor: darkMode ? 'rgba(249, 115, 22, 0.38)' : 'rgba(31,41,55,0.18)',
                                                     boxShadow: darkMode
-                                                        ? '0 26px 60px rgba(0,0,0,0.42)'
-                                                        : '0 26px 60px rgba(80,52,22,0.13)',
+                                                        ? '0 18px 44px rgba(0,0,0,0.32)'
+                                                        : '0 18px 44px rgba(31,41,55,0.08)',
                                                 },
                                             }}
                                         >
                                             <Box>
-                                                <Stack direction="row" justifyContent="space-between" spacing={2} alignItems="flex-start" sx={{ mb: 2 }}>
-                                                    <Stack direction="row" spacing={1.25} alignItems="center">
-                                                        <Box
-                                                            sx={{
-                                                                width: 46,
-                                                                height: 46,
-                                                                borderRadius: 3,
-                                                                display: 'grid',
-                                                                placeItems: 'center',
-                                                                color: isRecommended ? '#FFFFFF' : 'primary.main',
-                                                                background: isRecommended
-                                                                    ? 'linear-gradient(135deg, #18202C, #FF6A1A)'
-                                                                    : (darkMode ? 'rgba(255,255,255,0.06)' : 'rgba(255,106,26,0.08)'),
-                                                            }}
-                                                        >
-                                                            {Icon ? <Icon /> : <PlayArrow />}
-                                                        </Box>
-                                                        <Typography variant="h6">{type.title}</Typography>
-                                                    </Stack>
-                                                    {isRecommended && (
-                                                        <Chip size="small" label="Recommended" color="primary" />
-                                                    )}
+                                                <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+                                                    {Icon ? <Icon sx={{ color: 'primary.main' }} /> : null}
+                                                    <Typography variant="h6">{type.title}</Typography>
                                                 </Stack>
-                                                <Typography variant="body2" sx={{ color: 'text.secondary', mb: 2 }}>
+                                                <Typography variant="body2" sx={{ color: 'text.secondary', mb: 1.6 }}>
                                                     {type.description}
                                                 </Typography>
-                                                <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap">
+                                                <Stack direction="row" spacing={0.8} useFlexGap flexWrap="wrap" sx={{ mb: 1.8 }}>
                                                     {type.tags.map((tag) => (
                                                         <Chip key={`${type.id}-${tag}`} size="small" label={tag} variant="outlined" />
                                                     ))}
@@ -602,7 +465,6 @@ export default function InterviewsView() {
                                                         handleStart(type);
                                                     }}
                                                     disabled={isStarting || isAnalyzing}
-                                                    sx={{ minWidth: 116 }}
                                                 >
                                                     {isStarting ? 'Starting...' : 'Begin'}
                                                 </Button>
@@ -625,7 +487,7 @@ export default function InterviewsView() {
                 <DialogTitle>
                     <Stack direction="row" justifyContent="space-between" alignItems="center">
                         <Stack direction="row" spacing={1} alignItems="center">
-                            <BoltOutlined sx={{ color: '#FF6A1A' }} />
+                            <BoltOutlined sx={{ color: '#6366f1' }} />
                             <span>Quick Interview</span>
                         </Stack>
                         <IconButton size="small" onClick={() => setQuickOpen(false)} disabled={quickStarting}>
@@ -649,10 +511,10 @@ export default function InterviewsView() {
                                     borderRadius: '50%',
                                     display: 'grid',
                                     placeItems: 'center',
-                                    background: 'linear-gradient(135deg, rgba(255,190,69,0.2), rgba(255,106,26,0.14))',
+                                    background: 'linear-gradient(135deg, rgba(99,102,241,0.18), rgba(139,92,246,0.12))',
                                 }}
                             >
-                                <CircularProgress size={32} sx={{ color: '#FF6A1A' }} />
+                                <CircularProgress size={32} sx={{ color: '#8b5cf6' }} />
                             </Box>
                             <Typography variant="h6" sx={{ fontWeight: 700 }}>
                                 Creating Interview…
@@ -748,8 +610,8 @@ export default function InterviewsView() {
                                 onClick={handleQuickStart}
                                 disabled={!quickRole.trim() || !quickJD.trim()}
                                 sx={{
-                                    background: 'linear-gradient(135deg, #18202C, #FF6A1A)',
-                                    '&:hover': { background: 'linear-gradient(135deg, #0F1723, #E1420B)' },
+                                    background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+                                    '&:hover': { background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' },
                                 }}
                             >
                                 Start Interview

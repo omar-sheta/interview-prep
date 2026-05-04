@@ -12,14 +12,9 @@ export default function SectionCard({
     return (
         <Paper
             sx={{
-                p: { xs: 2.4, md: 3.4 },
-                borderRadius: { xs: 4, md: 5 },
+                p: { xs: 2.25, md: 3 },
+                borderRadius: 4,
                 overflow: 'hidden',
-                position: 'relative',
-                background: (theme) => theme.palette.mode === 'dark'
-                    ? 'linear-gradient(145deg, rgba(18,21,27,0.92), rgba(18,21,27,0.76))'
-                    : 'linear-gradient(145deg, rgba(255,253,248,0.94), rgba(255,255,255,0.78))',
-                backdropFilter: 'blur(24px)',
                 ...sx,
             }}
         >
@@ -36,8 +31,8 @@ export default function SectionCard({
                             <Typography
                                 variant="overline"
                                 sx={{
-                                    color: 'primary.main',
-                                    letterSpacing: '0.18em',
+                                    color: 'text.secondary',
+                                    letterSpacing: '0.14em',
                                     fontWeight: 800,
                                 }}
                             >
@@ -52,7 +47,7 @@ export default function SectionCard({
                         {description && (
                             <Typography
                                 variant="body2"
-                                sx={{ color: 'text.secondary', mt: 0.85, maxWidth: 740 }}
+                                sx={{ color: 'text.secondary', mt: 0.7, maxWidth: 720 }}
                             >
                                 {description}
                             </Typography>

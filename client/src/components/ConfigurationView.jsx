@@ -545,43 +545,29 @@ export default function ConfigurationView() {
                     quickActionIcon={<BoltOutlined />}
                     onQuickAction={() => openQuickDialog('mixed')}
                 />
-                <Container maxWidth="xl" sx={{ pt: { xs: 2.5, md: 4 } }}>
+                <Container maxWidth="lg" sx={{ pt: { xs: 2.5, md: 4 } }}>
                     <Stack spacing={{ xs: 2.4, md: 3 }}>
                         <SectionCard
                             eyebrow="Profile"
-                            title="Build the interview brief."
-                            description="One clean workspace for the role, company context, resume signal, and session defaults."
-                            sx={{
-                                background: darkMode
-                                    ? 'linear-gradient(145deg, rgba(18,21,27,0.95), rgba(28,20,15,0.86))'
-                                    : 'linear-gradient(145deg, rgba(255,253,248,0.96), rgba(255,255,255,0.82))',
-                            }}
+                            title="Your Interview Workspace"
+                            description="Keep the essentials visible: target role, job description, resume, and interview defaults. Advanced audio controls stay tucked away until you need them."
                             action={(
-                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.1} sx={{ width: { xs: '100%', md: 'auto' } }}>
+                                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ width: { xs: '100%', md: 'auto' } }}>
                                     <Chip
                                         size="small"
                                         label={`Readiness ${readinessPercent}%`}
                                         sx={{
-                                            fontWeight: 800,
+                                            fontWeight: 700,
                                             alignSelf: { xs: 'stretch', sm: 'center' },
                                             justifyContent: 'center',
-                                            minHeight: 42,
-                                            px: 0.8,
-                                            background: darkMode
-                                                ? 'rgba(255,255,255,0.06)'
-                                                : 'rgba(24,32,44,0.06)',
+                                            minHeight: 40,
+                                            background: darkMode ? 'rgba(255,255,255,0.04)' : 'rgba(31,41,55,0.04)',
                                             color: 'text.primary',
-                                            borderColor: darkMode ? 'rgba(255,255,255,0.12)' : 'rgba(24,32,44,0.12)',
+                                            borderColor: darkMode ? 'rgba(255,255,255,0.12)' : 'rgba(31,41,55,0.12)',
                                             border: '1px solid',
                                         }}
                                     />
-                                    <Button
-                                        variant="outlined"
-                                        startIcon={<Save />}
-                                        onClick={saveConfig}
-                                        disabled={isAnalyzing}
-                                        sx={{ minHeight: 46, minWidth: { sm: 112 } }}
-                                    >
+                                    <Button variant="outlined" startIcon={<Save />} onClick={saveConfig} disabled={isAnalyzing}>
                                         Save
                                     </Button>
                                     <Button
@@ -589,7 +575,6 @@ export default function ConfigurationView() {
                                         startIcon={isAnalyzing ? <CircularProgress size={14} color="inherit" /> : <PlayArrow />}
                                         onClick={runAnalysis}
                                         disabled={isAnalyzing}
-                                        sx={{ minHeight: 46, minWidth: { sm: 148 } }}
                                     >
                                         {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
                                     </Button>

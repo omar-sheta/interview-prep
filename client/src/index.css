@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
-
 /* ============== Hive & Bees Theme Configuration ============== */
 :root {
   /* Orange Primary Palette */
@@ -51,7 +49,7 @@ body,
 }
 
 body {
-  font-family: 'Manrope', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   background: transparent;
   color: inherit;
   overflow-y: auto;

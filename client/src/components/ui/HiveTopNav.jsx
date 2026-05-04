@@ -98,22 +98,22 @@ export default function HiveTopNav({
             color="transparent"
             elevation={0}
             sx={{
-                backdropFilter: 'blur(22px)',
+                backdropFilter: 'blur(16px)',
                 borderBottom: darkMode
                     ? '1px solid rgba(255, 255, 255, 0.08)'
-                    : '1px solid rgba(24, 32, 44, 0.08)',
-                bgcolor: darkMode ? 'rgba(8, 10, 13, 0.72)' : 'rgba(255, 253, 248, 0.78)',
-                boxShadow: darkMode ? '0 10px 40px rgba(0, 0, 0, 0.45)' : '0 10px 40px rgba(80, 52, 22, 0.06)'
+                    : '1px solid rgba(0, 0, 0, 0.04)',
+                bgcolor: darkMode ? 'rgba(10, 10, 10, 0.75)' : 'rgba(255, 255, 255, 0.85)',
+                boxShadow: darkMode ? '0 4px 30px rgba(0, 0, 0, 0.6)' : '0 4px 30px rgba(0, 0, 0, 0.03)'
             }}
         >
-            <Container maxWidth="xl">
+            <Container maxWidth="lg">
                 <Stack
                     direction={{ xs: 'column', md: 'row' }}
                     alignItems="center"
                     justifyContent="space-between"
                     sx={{
-                        minHeight: 78,
-                        py: { xs: 1, md: 0.8 },
+                        minHeight: 64,
+                        py: { xs: 0.75, md: 0.5 },
                         gap: { xs: 1, md: 0 },
                     }}
                 >
@@ -127,25 +127,21 @@ export default function HiveTopNav({
                         {/* Brand */}
                         <Stack
                             direction="row"
-                            spacing={1.25}
+                            spacing={1.2}
                             alignItems="center"
                             sx={{ cursor: 'pointer', minWidth: 0, flexShrink: 1 }}
                             onClick={() => navigateWithGuard('/interviews')}
                         >
                             <Box
                                 sx={{
-                                    width: { xs: 34, md: 38 },
-                                    height: { xs: 34, md: 38 },
-                                    borderRadius: 3,
+                                    width: { xs: 30, md: 32 },
+                                    height: { xs: 30, md: 32 },
+                                    borderRadius: '50%',
                                     display: 'grid',
                                     placeItems: 'center',
-                                    background: darkMode
-                                        ? 'linear-gradient(135deg, #FF6A1A, #F6A100)'
-                                        : 'linear-gradient(135deg, #18202C, #FF6A1A)',
+                                    bgcolor: 'primary.main',
                                     color: '#fff',
-                                    boxShadow: darkMode
-                                        ? '0 12px 26px rgba(255, 106, 26, 0.28)'
-                                        : '0 12px 26px rgba(24, 32, 44, 0.18)'
+                                    boxShadow: '0 2px 8px rgba(249, 115, 22, 0.4)'
                                 }}
                             >
                                 <Hive sx={{ fontSize: { xs: 17, md: 18 } }} />
@@ -155,7 +151,7 @@ export default function HiveTopNav({
                                 sx={{
                                     lineHeight: 1,
                                     letterSpacing: '-0.02em',
-                                    fontSize: { xs: '1.02rem', sm: '1.1rem', md: '1.18rem' },
+                                    fontSize: { xs: '1.02rem', sm: '1.1rem', md: '1.2rem' },
                                     fontWeight: 800,
                                     color: 'text.primary',
                                     whiteSpace: 'nowrap',
@@ -166,17 +162,7 @@ export default function HiveTopNav({
                         </Stack>
 
                         {/* Desktop Navigation Links */}
-                        <Stack
-                            direction="row"
-                            spacing={0.25}
-                            sx={{
-                                display: { xs: 'none', md: 'flex' },
-                                p: 0.45,
-                                borderRadius: 999,
-                                bgcolor: darkMode ? 'rgba(255,255,255,0.055)' : 'rgba(24,32,44,0.055)',
-                                border: darkMode ? '1px solid rgba(255,255,255,0.08)' : '1px solid rgba(24,32,44,0.07)',
-                            }}
-                        >
+                        <Stack direction="row" spacing={0.5} sx={{ display: { xs: 'none', md: 'flex' } }}>
                             {navItems.map((item) => {
                                 const selected = normalizedActive === item.key;
                                 return (
@@ -186,26 +172,35 @@ export default function HiveTopNav({
                                         onClick={() => navigateWithGuard(item.path)}
                                         disableRipple
                                         sx={{
-                                            px: 1.75,
-                                            py: 0.9,
+                                            px: 1.5,
+                                            py: 1,
                                             minWidth: 'auto',
-                                            borderRadius: 999,
-                                            color: selected ? (darkMode ? '#111827' : '#FFFFFF') : 'text.secondary',
-                                            bgcolor: selected
-                                                ? (darkMode ? '#F8F4EC' : '#18202C')
-                                                : 'transparent',
-                                            fontWeight: selected ? 800 : 700,
+                                            color: selected ? (darkMode ? '#fed7aa' : '#c2410c') : 'text.secondary',
+                                            fontWeight: selected ? 700 : 500,
                                             textTransform: 'none',
-                                            fontSize: '0.92rem',
+                                            fontSize: '0.95rem',
                                             position: 'relative',
-                                            boxShadow: selected
-                                                ? (darkMode ? '0 8px 18px rgba(0,0,0,0.28)' : '0 10px 22px rgba(24,32,44,0.12)')
-                                                : 'none',
                                             '&:hover': {
-                                                bgcolor: selected
-                                                    ? (darkMode ? '#F8F4EC' : '#18202C')
-                                                    : (darkMode ? 'rgba(255,255,255,0.07)' : 'rgba(24,32,44,0.06)'),
-                                                color: selected ? (darkMode ? '#111827' : '#FFFFFF') : 'text.primary',
+                                                bgcolor: 'transparent',
+                                                color: darkMode ? '#ffedd5' : '#9a3412',
+                                            },
+                                            '&::after': {
+                                                content: '""',
+                                                position: 'absolute',
+                                                bottom: 4,
+                                                left: selected ? 12 : '50%',
+                                                right: selected ? 12 : '50%',
+                                                height: 2,
+                                                bgcolor: darkMode ? '#f97316' : '#ea580c',
+                                                transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+                                                opacity: selected ? 1 : 0,
+                                                borderRadius: 1,
+                                            },
+                                            '&:hover::after': {
+                                                left: 12,
+                                                right: 12,
+                                                opacity: 1,
+                                                bgcolor: darkMode ? '#fdba74' : '#c2410c',
                                             }
                                         }}
                                     >
@@ -232,27 +227,23 @@ export default function HiveTopNav({
                                 startIcon={quickActionIcon}
                                 onClick={onQuickAction}
                                 sx={{
-                                    borderRadius: 4,
+                                    borderRadius: 2.5,
                                     minWidth: 0,
-                                    px: { xs: 1.5, sm: 1.8, md: 2.2 },
-                                    py: { xs: 0.8, md: 1 },
+                                    px: { xs: 1.4, sm: 1.8, md: 2.2 },
+                                    py: { xs: 0.75, md: 0.85 },
                                     textTransform: 'none',
-                                    fontWeight: 850,
+                                    fontWeight: 800,
                                     letterSpacing: '-0.01em',
-                                    fontSize: { xs: '0.82rem', sm: '0.9rem' },
-                                    boxShadow: darkMode ? '0 12px 26px rgba(255, 106, 26, 0.22)' : '0 12px 26px rgba(255, 106, 26, 0.2)',
-                                    background: darkMode
-                                        ? 'linear-gradient(135deg, #F8F4EC 0%, #FF6A1A 100%)'
-                                        : 'linear-gradient(135deg, #18202C 0%, #FF6A1A 100%)',
+                                    fontSize: { xs: '0.8rem', sm: '0.875rem' },
+                                    boxShadow: darkMode ? '0 8px 18px rgba(249, 115, 22, 0.2)' : '0 8px 18px rgba(31, 41, 55, 0.12)',
+                                    background: darkMode ? '#f97316' : '#1f2937',
                                     '& .MuiButton-startIcon': {
                                         marginLeft: 0,
                                         marginRight: 0.75,
                                     },
                                     '&:hover': {
-                                        background: darkMode
-                                            ? 'linear-gradient(135deg, #FFFFFF 0%, #FF6A1A 100%)'
-                                            : 'linear-gradient(135deg, #0F1723 0%, #FF6A1A 100%)',
-                                        boxShadow: darkMode ? '0 16px 32px rgba(255, 106, 26, 0.3)' : '0 16px 32px rgba(255, 106, 26, 0.3)',
+                                        background: darkMode ? '#ea580c' : '#111827',
+                                        boxShadow: darkMode ? '0 10px 24px rgba(249, 115, 22, 0.28)' : '0 10px 24px rgba(31, 41, 55, 0.16)',
                                         transform: 'translateY(-1px)',
                                     },
                                     transition: 'all 0.2s ease',
@@ -269,9 +260,8 @@ export default function HiveTopNav({
                                     size="small"
                                     sx={{
                                         color: 'text.secondary',
-                                        bgcolor: darkMode ? 'rgba(255,255,255,0.05)' : 'rgba(24,32,44,0.055)',
                                         transition: 'all 0.2s',
-                                        '&:hover': { bgcolor: alpha('#ff6a1a', 0.1), color: '#FF6A1A', transform: 'rotate(12deg)' }
+                                        '&:hover': { bgcolor: alpha('#f97316', 0.1), color: '#f97316', transform: 'rotate(15deg)' }
                                     }}
                                 >
                                     {darkMode ? <LightMode fontSize="small" /> : <DarkMode fontSize="small" />}
@@ -284,7 +274,6 @@ export default function HiveTopNav({
                                         size="small"
                                         sx={{
                                             color: 'text.secondary',
-                                            bgcolor: darkMode ? 'rgba(255,255,255,0.05)' : 'rgba(24,32,44,0.055)',
                                             transition: 'all 0.2s',
                                             '&:hover': { bgcolor: alpha('#ef4444', 0.1), color: '#ef4444', transform: 'translateX(2px)' }
                                         }}
